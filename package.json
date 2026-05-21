@@ -1,0 +1,38 @@
+{
+  "name": "lgtm-buzzer",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Browser extension that quizzes you on the diff before letting you approve a PR.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/protocol",
+    "packages/core",
+    "packages/adapters/*",
+    "packages/host",
+    "packages/extension"
+  ],
+  "scripts": {
+    "build": "npm run build:libs",
+    "build:libs": "node scripts/build-libs.mjs",
+    "build:extension": "npm run build --workspace=@lgtm-buzzer/extension --if-present",
+    "typecheck": "node scripts/build-libs.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint . --no-error-on-unmatched-pattern",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "clean": "tsc -b --clean"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "eslint": "^10.4.0",
+    "prettier": "^3.8.3",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.4",
+    "vitest": "^4.1.7"
+  }
+}
