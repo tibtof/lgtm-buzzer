@@ -18,12 +18,12 @@ any path that lets non-diff PR text reach the quiz LLM.
    - `decisions.md` — ADRs for this issue.
    - The PR details:
      ```bash
-     gh pr view <number> --repo lgtm-buzzer/lgtm-buzzer --comments
-     gh pr diff <number> --repo lgtm-buzzer/lgtm-buzzer
+     gh pr view <number> --repo tibtof/lgtm-buzzer --comments
+     gh pr diff <number> --repo tibtof/lgtm-buzzer
      ```
    - The linked issue:
      ```bash
-     gh issue view <issue-number> --repo lgtm-buzzer/lgtm-buzzer --comments
+     gh issue view <issue-number> --repo tibtof/lgtm-buzzer --comments
      ```
 
 2. **Review the diff** systematically against the checklist below.
@@ -32,7 +32,7 @@ any path that lets non-diff PR text reach the quiz LLM.
    ```bash
    gh api \
      --method POST \
-     /repos/lgtm-buzzer/lgtm-buzzer/pulls/<pr-number>/comments \
+     /repos/tibtof/lgtm-buzzer/pulls/<pr-number>/comments \
      -f body="<comment>" \
      -f commit_id="<commit-sha>" \
      -f path="<file-path>" \
@@ -42,12 +42,12 @@ any path that lets non-diff PR text reach the quiz LLM.
 4. **Submit review** — approve or request changes:
    ```bash
    # Request changes
-   gh pr review <number> --repo lgtm-buzzer/lgtm-buzzer \
+   gh pr review <number> --repo tibtof/lgtm-buzzer \
      --request-changes \
      --body "<summary of issues found>"
 
    # Approve
-   gh pr review <number> --repo lgtm-buzzer/lgtm-buzzer \
+   gh pr review <number> --repo tibtof/lgtm-buzzer \
      --approve \
      --body "LGTM. <brief summary of what was reviewed>"
    ```
@@ -55,12 +55,12 @@ any path that lets non-diff PR text reach the quiz LLM.
 5. **Set issue status**:
    ```bash
    # If changes requested
-   gh issue comment <issue-number> --repo lgtm-buzzer/lgtm-buzzer \
+   gh issue comment <issue-number> --repo tibtof/lgtm-buzzer \
      --body "Status: CHANGES_REQUESTED
    <summary>"
 
    # If approved
-   gh issue comment <issue-number> --repo lgtm-buzzer/lgtm-buzzer \
+   gh issue comment <issue-number> --repo tibtof/lgtm-buzzer \
      --body "Status: APPROVED — ready for human review"
    ```
 

@@ -18,7 +18,7 @@ implement without ambiguity.
    - `decisions.md` (previous ADRs — never contradict a closed decision).
    - The GitHub issue assigned to you:
      ```bash
-     gh issue view <number> --repo lgtm-buzzer/lgtm-buzzer --comments
+     gh issue view <number> --repo tibtof/lgtm-buzzer --comments
      ```
    - Relevant existing code (`Glob`, `Grep` to understand current state).
      If the workspace skeleton does not yet exist, say so in the ADR and
@@ -28,7 +28,7 @@ implement without ambiguity.
    contradicts locked decisions, post a short comment on the issue and set
    status back to `NEEDS_CLARIFICATION`:
    ```bash
-   gh issue comment <number> --repo lgtm-buzzer/lgtm-buzzer \
+   gh issue comment <number> --repo tibtof/lgtm-buzzer \
      --body "Status: NEEDS_CLARIFICATION
 
    Blocking questions:
@@ -109,7 +109,7 @@ implement without ambiguity.
 
 6. **Post a short comment to the GitHub issue** — keep this brief:
    ```bash
-   gh issue comment <number> --repo lgtm-buzzer/lgtm-buzzer --body "Status: READY_FOR_DEV
+   gh issue comment <number> --repo tibtof/lgtm-buzzer --body "Status: READY_FOR_DEV
 
    Design: ADR-<N> in decisions.md
 

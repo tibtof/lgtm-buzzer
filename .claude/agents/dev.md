@@ -18,7 +18,7 @@ architecture with strict dependency direction.
    - `decisions.md` — all ADRs, especially the one for this issue.
    - The GitHub issue and all its comments:
      ```bash
-     gh issue view <number> --repo lgtm-buzzer/lgtm-buzzer --comments
+     gh issue view <number> --repo tibtof/lgtm-buzzer --comments
      ```
    - Existing code in the affected workspaces (`Glob`, `Grep`).
 
@@ -82,7 +82,7 @@ architecture with strict dependency direction.
    ```bash
    git push -u origin feat/<issue-number>-<short-slug>
    gh pr create \
-     --repo lgtm-buzzer/lgtm-buzzer \
+     --repo tibtof/lgtm-buzzer \
      --title "feat(<scope>): <description> (#<number>)" \
      --body "Closes #<number>
 
@@ -99,7 +99,7 @@ architecture with strict dependency direction.
 
 9. **Set issue status**:
    ```bash
-   gh issue comment <number> --repo lgtm-buzzer/lgtm-buzzer \
+   gh issue comment <number> --repo tibtof/lgtm-buzzer \
      --body "Status: READY_FOR_REVIEW
    PR: <pr-url>"
    ```

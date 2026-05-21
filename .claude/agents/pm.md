@@ -29,7 +29,7 @@ can execute without coming back to ask questions.
 
    ```bash
    gh issue create \
-     --repo lgtm-buzzer/lgtm-buzzer \
+     --repo tibtof/lgtm-buzzer \
      --title "..." \
      --body "..." \
      --label "milestone:..." \
@@ -42,7 +42,7 @@ can execute without coming back to ask questions.
 
 4. **Set status** — after creating or updating an issue, add a comment:
    ```bash
-   gh issue comment <number> --repo lgtm-buzzer/lgtm-buzzer \
+   gh issue comment <number> --repo tibtof/lgtm-buzzer \
      --body "Status: READY_FOR_ARCH"
    ```
 
