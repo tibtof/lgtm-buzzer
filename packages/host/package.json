@@ -1,0 +1,33 @@
+{
+  "name": "@lgtm-buzzer/host",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Native messaging host that wires adapters into @lgtm-buzzer/core and speaks the stdio JSON protocol with the browser extension.",
+  "license": "MIT",
+  "bin": {
+    "lgtm-buzzer-host": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@lgtm-buzzer/protocol": "*",
+    "@lgtm-buzzer/core": "*",
+    "@lgtm-buzzer/adapter-claude-cli": "*",
+    "@lgtm-buzzer/adapter-codex-cli": "*",
+    "@lgtm-buzzer/adapter-copilot-cli": "*",
+    "@lgtm-buzzer/adapter-github": "*",
+    "@lgtm-buzzer/adapter-ado": "*"
+  }
+}

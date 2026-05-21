@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "types": ["node"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["**/*.test.ts", "dist"],
+  "references": [
+    { "path": "../protocol" },
+    { "path": "../core" },
+    { "path": "../adapters/claude-cli" },
+    { "path": "../adapters/codex-cli" },
+    { "path": "../adapters/copilot-cli" },
+    { "path": "../adapters/github" },
+    { "path": "../adapters/ado" }
+  ]
+}

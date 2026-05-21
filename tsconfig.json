@@ -7,6 +7,7 @@
     { "path": "./packages/adapters/codex-cli" },
     { "path": "./packages/adapters/copilot-cli" },
     { "path": "./packages/adapters/github" },
-    { "path": "./packages/adapters/ado" }
+    { "path": "./packages/adapters/ado" },
+    { "path": "./packages/host" }
   ]
 }
