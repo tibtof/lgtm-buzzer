@@ -1,0 +1,24 @@
+{
+  "name": "@lgtm-buzzer/core",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Pure domain for LGTM-Buzzer: QuizSession, ReviewGate, ports (LLMProvider, VCSProvider, QuizPolicy). Zero I/O, zero Node/DOM deps. The list below is empty by design — see CLAUDE.md.",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@lgtm-buzzer/protocol": "*"
+  }
+}
