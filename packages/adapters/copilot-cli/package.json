@@ -1,0 +1,25 @@
+{
+  "name": "@lgtm-buzzer/adapter-copilot-cli",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Adapter that drives the gh copilot CLI to generate quizzes.",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "@lgtm-buzzer/protocol": "*",
+    "@lgtm-buzzer/core": "*"
+  }
+}

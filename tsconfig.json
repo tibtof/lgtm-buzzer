@@ -2,6 +2,11 @@
   "files": [],
   "references": [
     { "path": "./packages/protocol" },
-    { "path": "./packages/core" }
+    { "path": "./packages/core" },
+    { "path": "./packages/adapters/claude-cli" },
+    { "path": "./packages/adapters/codex-cli" },
+    { "path": "./packages/adapters/copilot-cli" },
+    { "path": "./packages/adapters/github" },
+    { "path": "./packages/adapters/ado" }
   ]
 }
