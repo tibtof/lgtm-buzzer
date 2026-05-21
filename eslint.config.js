@@ -68,6 +68,13 @@ export default tseslint.config(
       ],
     },
   },
+  // WXT entrypoints require default exports.
+  {
+    files: ["packages/extension/entrypoints/**/*.ts"],
+    rules: {
+      "no-restricted-syntax": "off",
+    },
+  },
   // Extension may not depend on host or adapters directly.
   {
     files: ["packages/extension/**/*.ts"],

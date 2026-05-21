@@ -16,7 +16,7 @@
     "packages/extension"
   ],
   "scripts": {
-    "build": "npm run build:libs",
+    "build": "npm run build:libs && npm run build:extension",
     "build:libs": "node scripts/build-libs.mjs",
     "build:extension": "npm run build --workspace=@lgtm-buzzer/extension --if-present",
     "typecheck": "node scripts/build-libs.mjs",
