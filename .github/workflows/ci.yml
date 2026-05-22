@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (saves minutes on rapid pushes).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default minimal permissions; jobs that need more grant explicitly.
+permissions:
+  contents: read
+
+jobs:
+  unit-and-build:
+    name: unit + build + lint + typecheck:tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run full check gate
+        run: npm run check
+
+      - name: Upload coverage on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.run_id }}
+          path: |
+            packages/*/coverage/
+            coverage/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  e2e:
+    name: extension e2e (xvfb + chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Chromium (with system deps for xvfb)
+        # --with-deps installs xvfb + libs even on cache hit (cheap apt step).
+        run: npx playwright install --with-deps chromium
+
+      - name: Build extension
+        run: npm run build:extension
+
+      - name: Run e2e under xvfb
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' npm --workspace=@lgtm-buzzer/extension run test:e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_id }}
+          path: |
+            packages/extension/playwright-report/
+            packages/extension/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
