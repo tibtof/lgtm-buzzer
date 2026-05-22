@@ -1,12 +1,6 @@
-import type { Either } from "monadyssey";
-import { Right } from "monadyssey";
-import { CORE_VERSION } from "@lgtm-buzzer/core";
-
-/** Stable identifier for the copilot-cli adapter. */
-export const ADAPTER_ID = "copilot-cli" as const;
-
-/** Smoke export: proves the monadyssey + core imports resolve. */
-export const adapterInfo = (): Either<
-  never,
-  { readonly id: typeof ADAPTER_ID; readonly coreVersion: typeof CORE_VERSION }
-> => Right.pure({ id: ADAPTER_ID, coreVersion: CORE_VERSION });
+export { createCopilotCliProvider, ADAPTER_ID } from "./provider.js";
+export type { CopilotCliConfig, CopilotCliDeps } from "./provider.js";
+export { defaultIdGenerator } from "./ids.js";
+export type { IdGenerator } from "./ids.js";
+export { buildPrompt, SYSTEM_PROMPT } from "./prompt.js";
+export { parseResponse, LlmQuestionSchema, LlmQuizSchema } from "./response.js";

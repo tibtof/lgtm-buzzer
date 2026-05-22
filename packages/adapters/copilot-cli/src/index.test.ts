@@ -1,15 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { ADAPTER_ID, adapterInfo } from "./index.js";
+import { ADAPTER_ID, createCopilotCliProvider } from "./index.js";
+import type { SpawnError, SpawnOutput, spawnIO as SpawnIOType } from "@lgtm-buzzer/adapter-shared";
+import { IO } from "monadyssey";
 
-describe("adapter-copilot-cli", () => {
-  it("has the expected adapter id", () => {
+describe("adapter-copilot-cli index barrel", () => {
+  it("has the expected adapter id constant", () => {
     expect(ADAPTER_ID).toBe("copilot-cli");
   });
 
-  it("adapterInfo reports core version", () => {
-    expect(adapterInfo().fold(() => null, (v) => v)).toEqual({
-      id: "copilot-cli",
-      coreVersion: "0.0.0",
-    });
+  it("createCopilotCliProvider factory is exported and returns a provider with the correct id", () => {
+    const fakeSpawn: typeof SpawnIOType = () =>
+      IO.lift<SpawnError, SpawnOutput>(() => ({
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+      }));
+    const provider = createCopilotCliProvider({ spawnIO: fakeSpawn });
+    expect(provider.id).toBe("copilot-cli");
   });
 });
