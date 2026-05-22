@@ -1,9 +1,9 @@
 {
-  "name": "@lgtm-buzzer/adapter-shared",
+  "name": "@lgtm-buzzer/adapter-claude-api",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Shared adapter primitives (spawnIO) used by all CLI adapters.",
+  "description": "LLM adapter calling the Anthropic Messages API with prompt caching.",
   "license": "MIT",
   "exports": {
     ".": {
@@ -21,9 +21,11 @@
     "clean": "tsc -b --clean"
   },
   "dependencies": {
+    "@lgtm-buzzer/adapter-shared": "*",
     "@lgtm-buzzer/core": "*",
     "@lgtm-buzzer/protocol": "*",
     "monadyssey": "2.0.1",
+    "monadyssey-fetch": "2.0.1",
     "zod": "^4.4.3"
   }
 }

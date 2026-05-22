@@ -9,6 +9,7 @@
     { "path": "./packages/adapters/copilot-cli" },
     { "path": "./packages/adapters/github" },
     { "path": "./packages/adapters/ado" },
+    { "path": "./packages/adapters/claude-api" },
     { "path": "./packages/host" }
   ]
 }

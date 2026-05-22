@@ -18,6 +18,7 @@ const TEST_PROJECTS = [
   "packages/adapters/copilot-cli/tsconfig.test.json",
   "packages/adapters/github/tsconfig.test.json",
   "packages/adapters/ado/tsconfig.test.json",
+  "packages/adapters/claude-api/tsconfig.test.json",
   "packages/host/tsconfig.test.json",
 ];
 
