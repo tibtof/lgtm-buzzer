@@ -2407,3 +2407,205 @@ Verification of the actual v2.0.1 behavior is already present in `packages/adapt
 - **If monadyssey ever fixes this upstream**, callers that already handle `Cancelled` separately remain correct; callers that also (defensively) match on `Err<SpawnError.cancelled>` start receiving real values there. Both shapes are forward-compatible.
 - **No security impact.** The PID-kill safety contract is unaffected.
 - **No reversibility concerns.** This is documentation only.
+
+---
+
+## ADR-11: `LLMProvider` port + Quiz domain types in `core` (with type-only `IO` allowed in `core/src/ports/`)
+**Date**: 2026-05-22
+**Issue**: #33
+**Status**: Accepted (amends ADR-4 §Blocklist by addition)
+
+### Context
+
+M2's first vertical slice needs a stable, side-effect-free interface binding every LLM adapter (#36, #45, #46, #59) to a single contract. ADR-9's `spawnIO` gives CLI adapters `IO<SpawnError, SpawnOutput>`; this ADR sits one layer up.
+
+Three constraints collide:
+1. Port lives with the domain (hexagonal, CLAUDE.md §Architecture principles).
+2. Side effects return `IO<E, A>` (idiom #2).
+3. `IO`/`Schedule` forbidden in `core` (ADR-4).
+
+Four resolutions considered: (a) erase IO from port (loses type safety), (b) move to protocol (protocol bans monadyssey too), (c) allow type-only IO in `core/src/ports/**`, (d) port returns `Promise<Either<...>>` (round-trips through everything).
+
+**Decision: (c).** Ports describe effectful shapes; the project's effect type is `IO`. `import type { IO }` is zero-runtime — ADR-4's actual intent (no IO runtime usage in domain logic) is preserved. Narrow the ESLint rule via a `packages/core/src/ports/**` override that adds `allowTypeImports: true` on the `IO` entry while keeping every other ban intact.
+
+### Decision
+
+#### 1. `LLMProvider` port surface
+
+```ts
+// packages/core/src/ports/llm-provider.ts
+import type { IO } from "monadyssey";
+import type { Quiz } from "../quiz/quiz.js";
+import type { LLMProviderError } from "../quiz/errors.js";
+
+/** Unified-diff payload. Placeholder until #34 (VCSProvider). */
+export type Diff = string;
+
+/**
+ * Diff-only invariant (binding per CLAUDE.md §Key differentiator).
+ * Exactly two fields. No slot for PR description, title, commits,
+ * labels, comments. Reviewer rejects any change that adds one.
+ */
+export type GenerateQuizInput = {
+  readonly diff: Diff;
+  readonly questionCount: number;
+};
+
+export type LLMProvider = {
+  readonly id: string;
+  readonly generateQuiz: (input: GenerateQuizInput) => IO<LLMProviderError, Quiz>;
+};
+```
+
+#### 2. Quiz domain types
+
+```ts
+// packages/core/src/quiz/quiz.ts
+import type { NonEmptyList } from "monadyssey";
+
+export type QuestionId = string & { readonly __brand: "QuestionId" };
+export type ChoiceId = string & { readonly __brand: "ChoiceId" };
+export type QuizId = string & { readonly __brand: "QuizId" };
+
+export type Choice = { readonly id: ChoiceId; readonly label: string };
+
+export type MultipleChoiceQuestion = {
+  readonly type: "multiple-choice";
+  readonly id: QuestionId;
+  readonly prompt: string;
+  readonly choices: NonEmptyList<Choice>;
+  readonly correctChoiceId: ChoiceId;
+  readonly explanation?: string;
+};
+
+export type Question = MultipleChoiceQuestion;
+export type Quiz = { readonly id: QuizId; readonly questions: NonEmptyList<Question> };
+```
+
+Multiple-choice only for v1: exact-match scoring, no LLM-graded disputes, deterministic UX. `type: "multiple-choice"` discriminant reserves space for future free-text variant. The Quiz does NOT carry the diff — privacy + prevents round-trip vectors.
+
+Branded IDs prevent crossing tokens; `NonEmptyList` makes empty quizzes / empty choice lists unrepresentable.
+
+#### 3. `GenerateQuizInput` minimal v1 shape
+
+`{ diff, questionCount }`. No `model`, `temperature`, `language` — those are adapter-internal factory config, not per-call inputs. `QuizPolicy` (richer policy from #38) may additively expand this; required-field additions need a new ADR.
+
+#### 4. `LLMProviderError` (5 variants)
+
+```ts
+// packages/core/src/quiz/errors.ts
+export type LLMProviderError =
+  | { readonly kind: "subprocess"; readonly reason: "spawn-failed" | "process-failed";
+      readonly exitCode?: number; readonly stderr?: string; readonly detail: string }
+  | { readonly kind: "transport"; readonly status?: number; readonly detail: string }
+  | { readonly kind: "malformed-response"; readonly detail: string; readonly raw?: string }
+  | { readonly kind: "timeout"; readonly afterMs: number }
+  | { readonly kind: "cancelled" };
+```
+
+Source-mapping (binding for every adapter):
+
+| Underlying | Maps to |
+|---|---|
+| `SpawnError.spawn-failed` | `subprocess { reason: "spawn-failed" }` |
+| `SpawnError.process-failed` | `subprocess { reason: "process-failed", exitCode, stderr }` |
+| `SpawnError.cancelled` (unreachable at monadyssey@2.0.1 per ADR-10) | `cancelled` (kept for forward-compat) |
+| HTTP non-2xx | `transport { status, detail }` |
+| HTTP network/TLS failure | `transport { detail }` (no status) |
+| Subprocess stdout / HTTP body fails zod parse | `malformed-response { detail, raw? }` |
+| Adapter wall-clock budget exceeded | `timeout { afterMs }` |
+| Fiber cancelled by caller | `Cancelled` (runtime), NOT `Err`. Variant kept for type contract + forward-compat. |
+
+`timeout` is its own variant (not under `subprocess`/`transport`) because the aggregate's retry policy treats it differently. `cancelled` stays defined despite ADR-10 — forward-compat with a future monadyssey that surfaces it via `Err`.
+
+#### 5. Diff-only invariant (KEY DIFFERENTIATOR)
+
+Encoded at three layers:
+1. **Type** — `GenerateQuizInput` has exactly two fields. No slot for non-diff text.
+2. **TSDoc** — `GenerateQuizInput` and `LLMProvider` comments state the rule.
+3. **Adapter implementation** — every adapter's prompt construction MUST reference `input.diff` and `input.questionCount` only. Reviewer enforces.
+
+The `Quiz` value also does NOT carry the diff — prevents round-trip leakage if a `Quiz` were ever re-fed into regeneration.
+
+#### 6. Narrow ADR-4's `IO` ban for `core/src/ports/**`
+
+ESLint's `no-restricted-imports` supports `allowTypeImports: true` per-entry. Pick **(β)** of two options: keep the existing `packages/core/**/*.ts` block blocking IO outright; add a new override block scoped to `packages/core/src/ports/**/*.ts` whose `IO` entry has `allowTypeImports: true`. Implementation files stay pure; ports get the carve-out.
+
+The ports-scoped block must **restate all** `paths` and `patterns` from the parent core block — ESLint flat-config replaces, not merges, per ADR-4. Omitting Node-API patterns would silently re-enable them in `ports/`. The Test strategy below pins regression coverage.
+
+### Affected workspaces
+
+Only `packages/core` (5 new source + test files, 1 modified barrel); `eslint.config.js` (1 new override block).
+
+### Types / Functions
+
+(Per Decisions 1, 2, 4 above.) The port is a type alias; no functions. Adapter factories live in `packages/adapters/<name>/`.
+
+### File layout
+
+New (5):
+- `packages/core/src/ports/llm-provider.ts`
+- `packages/core/src/ports/llm-provider.test.ts`
+- `packages/core/src/quiz/quiz.ts`
+- `packages/core/src/quiz/errors.ts`
+- `packages/core/src/quiz/quiz.test.ts`
+
+Modified (2):
+- `packages/core/src/index.ts` — re-exports.
+- `eslint.config.js` — new override block for `packages/core/src/ports/**/*.ts`.
+
+Re-exports to add to `packages/core/src/index.ts`:
+
+```ts
+export type { Diff, GenerateQuizInput, LLMProvider } from "./ports/llm-provider.js";
+export type {
+  Choice, ChoiceId, MultipleChoiceQuestion, Question,
+  QuestionId, Quiz, QuizId,
+} from "./quiz/quiz.js";
+export type { LLMProviderError } from "./quiz/errors.js";
+```
+
+No `quiz/index.ts` barrel — direct module imports keep the call graph explicit.
+
+### Sequence
+
+Type-definition + lint narrowing only. Conceptual downstream flow:
+1. `QuizSession` (#38) receives `Diff` + `LLMProvider` instance.
+2. Calls `provider.generateQuiz({ diff, questionCount })` → `IO<LLMProviderError, Quiz>`.
+3. Composes with `Schedule` retries (retry `malformed-response`/`timeout`; not `subprocess.spawn-failed`).
+4. Runs via `IO.fork()` → Fiber → `join()` → `Ok|Err|Cancelled` (per ADR-10).
+5. Host serializes Quiz into wire-format DTO (separate concern).
+
+### Error cases
+
+Per §Decision 4 source-mapping table. No `throw` introduced — throws reserved for invariant violations (e.g., a `MultipleChoiceQuestion` whose `correctChoiceId` isn't in `choices` — adapter's job to enforce before constructing the Quiz).
+
+### Test strategy
+
+**`packages/core/src/ports/llm-provider.test.ts`** — type-only smoke. Constructs a noop fake `LLMProvider` matching the port type; ensures the port file is in the test compile graph. ~10 lines.
+
+**`packages/core/src/quiz/quiz.test.ts`** — structural smoke. Constructs a multiple-choice quiz and one instance of each `LLMProviderError` variant; asserts the variant array has 7 entries (counting variants × distinguishable shapes). Catches rename-but-don't-update-test gotchas.
+
+**ESLint regression recipe** (dev runs, pastes results into PR `## Verification`):
+
+1. `npm run lint` — exit 0 baseline.
+2. Add `import { IO } from "monadyssey";` (value, not type-only) to `packages/core/src/quiz/quiz.ts`. `npm run lint` — exit ≠ 0 (parent core block still bans). Revert.
+3. `import type { IO } from "monadyssey";` already exists in `ports/llm-provider.ts`; `npm run lint` exits 0 (the carve-out).
+4. Add `import { IO } from "monadyssey";` (value import) to `ports/llm-provider.ts`. `npm run lint` — expect exit ≠ 0 (carve-out is type-only, not value). Revert.
+5. Add `import { spawn } from "node:child_process";` to `ports/llm-provider.ts`. `npm run lint` — expect exit ≠ 0 (Node-API patterns preserved in the override block). Revert.
+
+Step 5 is the critical regression: pins the "don't drop Node-API ban when splitting the rule" failure mode.
+
+Behavioral tests live in adapter PRs (#36 et al.) — this ADR introduces only types + lint narrowing.
+
+### Consequences
+
+- **Ports may now type-import `IO` in `core/src/ports/**`.** ADR-4 amended by addition; value-imports of `IO` and all other forbidden symbols remain banned everywhere.
+- **`Diff` is a placeholder string alias** until #34 (VCSProvider) lands the canonical type. The dev for #34 handles the rename.
+- **`QuizPolicy` expansion path open.** #38 may add optional fields to `GenerateQuizInput`; required-field additions need a new ADR.
+- **Diff-only invariant** enforced at type + TSDoc + reviewer levels. Reviewer rejects any future PR adding a non-diff slot to `GenerateQuizInput`.
+- **Multiple-choice-only v1** limits scoring complexity. Free-text would need LLM-graded comparator or fuzzy-match. v2 may revisit via the `"free-text"` discriminant slot already reserved.
+- **No new runtime deps.** `NonEmptyList` already on ADR-4's allowlist; `IO` type-only under `ports/`.
+- **`LLMProviderError.cancelled` is unreachable via `Err` at monadyssey@2.0.1** (ADR-10). Adapters MUST NOT construct this variant from `SpawnError.cancelled` — runtime delivers `Cancelled`. Variant kept for type contract and forward-compat.
+- **Reversibility high.** If multiple-choice-only is wrong, additive free-text via the discriminant. If type-only IO in `ports/` is wrong, switch to option (d) — one method signature changes per adapter.
+- **Binding for #36, #45, #46, #59.** Every LLM adapter implements this port; every prompt construction takes `input.diff` as its only PR-derived input.
