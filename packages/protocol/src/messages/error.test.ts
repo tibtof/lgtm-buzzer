@@ -13,6 +13,7 @@ describe("ErrorFrameSchema", () => {
     "unknown-message",
     "version-mismatch",
     "internal",
+    "unknown-quiz-id",
   ] as const;
 
   for (const reason of reasons) {
