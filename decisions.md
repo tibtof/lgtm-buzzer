@@ -1143,3 +1143,177 @@ Regression recipe:
 - `Reader` is on the blocklist defensively; cheap to revert.
 - Namespace-import hole acknowledged; reviewer agent is the second line of defense.
 - No new runtime deps. No security implications. Fully reversible.
+
+---
+
+## ADR-5: Replace placeholder `Result<T, E>` with monadyssey's `Either<E, A>` across the FP-enabled workspaces
+**Date**: 2026-05-22
+**Issue**: #4
+**Status**: Accepted
+
+### Context
+
+The scaffold shipped a hand-written `Result<T, E>` discriminated union plus `ok` and `err` helpers in `packages/protocol/src/index.ts`, used by the smoke surfaces in `core` and the five adapters. CLAUDE.md locks `Either<E, A>` (from `monadyssey`) as the project's single error type for pure code and forbids `monadyssey` from `protocol` (per-package policy: protocol's only runtime dep is `zod`).
+
+ADR-1 installed `monadyssey@2.0.1` (exact-pinned) in `core` and the five adapters and `host`. ADR-3 added the forbidden-FP-libraries lint. ADR-4 forbade the `IO`/`Schedule` surface of monadyssey from `core` but explicitly allows `Either`, `Left`, `Right`, `Option` — the identifiers this ADR introduces are on the allowlist by construction.
+
+Verified against `node_modules/monadyssey/dist/monadyssey.d.ts` (v2.0.1):
+
+- `Either<A, B>` has **Left first** (`abstract class Either<A, B>`, where `A` is the Left/error type and `B` is the Right/success type).
+- `Right.pure<B>(value: B): Right<B>` is the public success constructor.
+- `Left.of(error)` is the idiomatic project Left constructor.
+
+**Critical type-parameter swap reminder.** `Result<T, E>` is "Success first, Error second"; monadyssey's `Either<A, B>` is "Left/Error first, Right/Success second". A naive search-and-replace will reverse the type arguments. Every callsite migration must swap order — `Result<X, never>` becomes `Either<never, X>`, not `Either<X, never>`.
+
+Three call-graph properties confirmed by `grep` over `packages/`:
+
+1. **Only 14 files** touch `Result`, `ok`, or `err` in source: the protocol definition + test (2 files), and 12 files across `core` and the five adapters.
+2. **`host` and `extension` are clean** — no `Result`/`ok`/`err` imports today.
+3. **No adapter or core file uses anything from `protocol` besides `Result`/`ok`/`err`.** After this migration, `core` and the adapters do not import from `@lgtm-buzzer/protocol` at all until issue #5+ adds zod schemas there.
+
+### Decision
+
+Big-bang migration in a single PR: `protocol` deletes `Result`, `ok`, and `err` from `src/index.ts` and deletes `src/index.test.ts` in the same commit that rewrites every callsite in `core` and the five adapters.
+
+#### Type-signature mapping (binding)
+
+| Placeholder type        | monadyssey equivalent  |
+|-------------------------|------------------------|
+| `Result<X, Y>`          | `Either<Y, X>`         |
+| `Result<X, never>`      | `Either<never, X>`     |
+
+**Always swap the parameter order.** `Result` is `<Success, Error>`; `Either` is `<Error, Success>`.
+
+#### Constructor mapping (binding)
+
+| Placeholder call      | monadyssey equivalent | Source module               |
+|-----------------------|-----------------------|-----------------------------|
+| `ok(value)`           | `Right.pure(value)`   | `monadyssey`                |
+| `err(error)`          | `Left.of(error)`      | `monadyssey`                |
+| `import { ok, err }`  | `import { Right, Left }` | `monadyssey`             |
+| `import type { Result }` | `import type { Either }` | `monadyssey`           |
+
+**Follow-up nit (out of scope, flag for orchestrator):** CLAUDE.md idiom #1 reads `Right.of(input)`; monadyssey v2.0.1 only exposes `Right.pure(value)`. Do not touch CLAUDE.md as part of this ADR.
+
+#### Affected workspaces
+
+| Workspace                          | Source change | Test change |
+|------------------------------------|:-------------:|:-----------:|
+| `packages/protocol`                |     yes       |  delete file|
+| `packages/core`                    |     yes       |     yes     |
+| `packages/adapters/claude-cli`     |     yes       |     yes     |
+| `packages/adapters/codex-cli`      |     yes       |     yes     |
+| `packages/adapters/copilot-cli`    |     yes       |     yes     |
+| `packages/adapters/github`         |     yes       |     yes     |
+| `packages/adapters/ado`            |     yes       |     yes     |
+| `packages/host`                    |     no        |     no      |
+| `packages/extension`               |     no        |     no      |
+
+#### Types
+
+- **`Result<T, E>`** — **deleted** from `packages/protocol/src/index.ts`.
+- **`Either<A, B>`** — used directly from `monadyssey` everywhere a pure function can fail. Not re-exported from `protocol`.
+
+Post-migration entry-point signatures:
+
+```ts
+// packages/core/src/index.ts
+export const ready = (): Either<never, typeof CORE_VERSION> =>
+  Right.pure(CORE_VERSION);
+```
+
+```ts
+// packages/adapters/<name>/src/index.ts
+export const adapterInfo = (): Either<
+  never,
+  { readonly id: typeof ADAPTER_ID; readonly coreVersion: typeof CORE_VERSION }
+> => Right.pure({ id: ADAPTER_ID, coreVersion: CORE_VERSION });
+```
+
+#### Functions and methods
+
+Test assertion shape changes — the dev uses `.fold(...)` per CLAUDE.md idiom #6:
+
+```ts
+// packages/core/src/index.test.ts (post-migration)
+expect(ready().fold((_l) => "left", (v) => v)).toBe("0.0.0");
+```
+
+```ts
+// packages/adapters/<name>/src/index.test.ts (post-migration)
+expect(adapterInfo().fold((_l) => null, (v) => v))
+  .toEqual({ id: "<name>", coreVersion: "0.0.0" });
+```
+
+#### File layout
+
+Modified files (13):
+
+- `packages/protocol/src/index.ts` — replace contents with TSDoc-only stub (see below).
+- `packages/core/src/index.ts`, `packages/core/src/index.test.ts`
+- `packages/adapters/{claude-cli,codex-cli,copilot-cli,github,ado}/src/index.ts`
+- `packages/adapters/{claude-cli,codex-cli,copilot-cli,github,ado}/src/index.test.ts`
+
+Deleted files (1):
+
+- `packages/protocol/src/index.test.ts` — the only thing it tests is `ok`/`err`, both gone.
+
+##### Contents of the new `packages/protocol/src/index.ts`
+
+```ts
+/**
+ * `@lgtm-buzzer/protocol` — shared wire-format and domain DTO surface.
+ *
+ * This package will host zod schemas for native-messaging frames and
+ * domain DTOs (issue #5 and the M1 wire-format issues #7/#8). For now
+ * the file is intentionally empty: the placeholder Result type was
+ * removed in ADR-5 in favour of the FP foundation's Either (from
+ * `monadyssey`) used directly by `core` and the adapters.
+ *
+ * `protocol` must remain reusable from any FP stack and therefore
+ * does not import `monadyssey` (per CLAUDE.md per-package policy).
+ */
+export {};
+```
+
+#### Sequence
+
+1. Replace `packages/protocol/src/index.ts` contents with the stub above.
+2. `git rm packages/protocol/src/index.test.ts`.
+3. **`packages/core/src/index.ts`**: replace protocol imports with `import { Either, Right } from "monadyssey";`. Change `ready` return type to `Either<never, typeof CORE_VERSION>` (**swap order**). Change body to `Right.pure(CORE_VERSION)`.
+4. **`packages/core/src/index.test.ts`**: rewrite the assertion to `.fold((_l) => "left", (v) => v)` form.
+5–14. For each of the five adapters (claude-cli, codex-cli, copilot-cli, github, ado): apply the same shape change to `src/index.ts` and `src/index.test.ts`.
+15. Run the verification gate (see Test strategy).
+16. Commit and push. Branch: `refactor/4-result-to-either`. Commit title: `refactor(protocol): replace Result<T,E> with monadyssey's Either<E,A> (#4)`.
+
+#### Error cases
+
+- **Reversed type-param order** — TS2322 at typecheck. `npm run typecheck:tests` catches in tests; `npm run build` catches in production files.
+- **Missed callsite** — `npm run build` fails (symbol gone) plus the grep gate catches it.
+- **Trying to use `Right.of`** — TS2339 ("Property 'of' does not exist on type 'typeof Right'"). Always `Right.pure`.
+- **Assertion shape not updated** — runtime test failure under `npm test`. Migrate test in lock-step with its source file to keep diagnostics tight.
+
+#### Test strategy
+
+**Grep gate**:
+
+```bash
+grep -RnE "(Result<|\bok\(|\berr\()" packages --include="*.ts"
+```
+
+Expected output: zero hits under `packages/*/src` (the stub TSDoc avoids naming `Result<>` to keep this clean).
+
+**Standard gate**: `npm run build && npm test && npm run lint && npm run typecheck:tests` — all four green. Test count drops by exactly 2 (the deleted protocol tests); the 6 rewritten `index.test.ts` files retain their existing assertion count.
+
+The dev pastes both the grep-gate output and the four gate command outputs into a `## Verification` section in the PR body.
+
+### Consequences
+
+- First end-to-end exercise of the FP foundation passes.
+- `protocol` is reduced to a TSDoc-only stub until issue #5 lands zod schemas.
+- `Result` is gone from the codebase; no backward-compat alias.
+- No new runtime deps. License diff: none.
+- Idiom-#6 (`.fold` over manual narrowing) is now exercised in the smoke tests.
+- **Follow-up nit flagged for the orchestrator**: CLAUDE.md idiom #1 reads `Right.of(input)`; should be `Right.pure(value)` to match v2.0.1.
+- Security posture unchanged.
+- Reversibility: bounded blast radius — 7 source + 6 test files, 2-3 line edits each.
