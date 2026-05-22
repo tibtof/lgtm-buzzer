@@ -1838,3 +1838,239 @@ export { parseFrame } from "./parse.js";
 - **Security posture**: improves. Every byte from stdin will (post-#10) pass through `parseFrame`. Error envelope provides structured failure response without crashing.
 - **Key-differentiator posture**: schemas don't carry PR text. `ErrorPayload.message`/`details` flagged as redaction-required in TSDoc.
 - **Reversibility**: high. Single workspace, no consumers yet, no data persisted.
+
+---
+
+## ADR-8: Length-prefixed native-messaging stdio framing in `host` (reader + writer, absorbs #11)
+**Date**: 2026-05-22
+**Issue**: #10 (also absorbs #11)
+**Status**: Accepted
+
+### Context
+
+The host and the MV3 extension communicate over Chrome's native messaging stdio channel. Every message is a JSON payload preceded by a 4-byte little-endian uint32 declaring the payload's byte length. Chrome enforces a 1 MB cap per frame. Direction: extension → host on stdin, host → extension on stdout. EOF on stdin = extension disconnected.
+
+ADR-6 §Constraint 1 declared stdout sacred (every byte must be a frame, no log leaks). ADR-7 produced `FrameSchema` + `parseFrame` in protocol. ADR-8 is the codec layer that turns stdin bytes into validated `Frame` values and `Frame` values back into framed stdout bytes.
+
+**Why absorb #11**: reader and writer are codec halves of the same wire format. Endianness, 1 MB cap, JSON↔bytes boundary, DecodeError/WriteError split — single source of truth.
+
+Open PM questions resolved here:
+- Reader API: `AsyncIterable<Either<DecodeError, Frame>>` wrapped in `IO<never, ...>`.
+- Termination per error variant: see Decision 8.
+- Back-pressure: YAGNI for v1.
+- Logger integration: yes, injected. `warn` for recoverable decode errors, `error` for stream-fatal + premature-eof.
+- Endianness: uint32 **little-endian** (Chrome spec).
+
+### Decision
+
+Add a `framing/` submodule to `packages/host/src/` containing a reader factory, a writer factory, and a shared errors module. Stream and logger injected via deps (testable against `PassThrough`).
+
+#### Decision 1 — Reader API
+
+`createFrameReader(deps): IO<never, AsyncIterable<Either<DecodeError, Frame>>>`. Caller does `for await (const result of frames) result.fold(...)`. Outer IO carries stream attachment; per-element Either carries decode result.
+
+#### Decision 2 — Writer API
+
+`createFrameWriter(deps): (frame: Frame) => IO<WriteError, void>`. Per-call IO, no queue, no auto-reply.
+
+#### Decision 3 — Module layout
+
+`packages/host/src/framing/`:
+- `errors.ts` — `DecodeError`, `WriteError`, `MAX_FRAME_BYTES`, `HEADER_BYTES`.
+- `reader.ts` — `createFrameReader`.
+- `writer.ts` — `createFrameWriter`.
+- `index.ts` — barrel re-export.
+Plus two test files.
+
+#### Decision 4 — Logger integration
+
+Reader factory takes a `Logger`. Levels:
+
+| Event | Level |
+|---|---|
+| `length-overflow` | `error` |
+| `invalid-json` | `warn` |
+| `schema-violation` | `warn` |
+| `stream-error` | `error` |
+| `premature-eof` | `error` |
+
+Writer factory takes a `Logger`. Levels:
+
+| Event | Level |
+|---|---|
+| `size-overflow` | `error` |
+| `stream-closed` | `warn` |
+| `stream-error` | `error` |
+
+**Framing-layer code MUST NOT include payload bytes in log bindings.** Pass `{ kind, correlationId }` only. ADR-6 §Constraint 4 redaction list is the backstop.
+
+#### Decision 5 — No auto-reply from the reader
+
+Reader yields `Left<DecodeError>` but does NOT call the writer. Dispatcher (future issue) wires `reader.fold(decodeError → writer(toErrorFrame(...)), frame → handle(frame))`.
+
+#### Decision 6 — Cancellation
+
+Reader's internal pump uses `IO.cancellable` with an `AbortSignal`. On abort: remove `data`/`end`/`error` listeners from source, resolve iterator end-sentinel cleanly. **Do NOT call `source.destroy()`** — source is host's own stdin which the runtime owns. Writer: in-flight `write()` resolves naturally; subsequent calls after cancellation return `IO.fail<WriteError>({ kind: "stream-closed" })`.
+
+#### Decision 7 — Back-pressure (YAGNI for v1)
+
+Pump runs in flow mode. Worst case: ~1 MB in-flight + one decoded `Frame`. Revisit if concurrent dispatch lands OR production shows sustained 1 MB-frame bursts.
+
+#### Decision 8 — Validation order and termination policy
+
+Per frame:
+1. Read 4 bytes. EOF mid-header with ≥1 byte consumed → `premature-eof`, end iterator. Clean EOF with 0 bytes → iterator ends, no error yielded.
+2. Decode LE uint32 → declared length `n`.
+3. If `n > 1_048_576` → `length-overflow`, **end iterator** (wire desynced).
+4. Read exactly `n` bytes. EOF mid-payload → `premature-eof`, end.
+5. UTF-8 decode + `JSON.parse`. Throws → `invalid-json`, **continue** (frame boundary preserved).
+6. `parseFrame(parsed)`. Fails → `schema-violation`, **continue**. Succeeds → yield `Right(Frame)`.
+7. Loop.
+
+Stream `'error'` at any point → `stream-error`, **end iterator**.
+
+Termination summary:
+| Variant | Continue? |
+|---|---|
+| `length-overflow` | no |
+| `invalid-json` | yes |
+| `schema-violation` | yes |
+| `stream-error` | no |
+| `premature-eof` | no |
+
+#### Decision 9 — Writer header endianness
+
+uint32 **little-endian** (`Buffer.writeUInt32LE(n, 0)`). The 1 MB cap enforced **before** any bytes touch the sink. Header + payload written in a single `sink.write(combined)` call.
+
+#### Decision 10 — Error variants
+
+The five DecodeError + three WriteError variants from PM scope are sufficient. No additions.
+
+### Affected workspaces
+
+`packages/host` only. New imports: `node:stream`. Existing imports used: `@lgtm-buzzer/protocol` (FrameSchema, Frame, parseFrame), `@lgtm-buzzer/core` (Logger), `monadyssey` (IO, Either, Left, Right).
+
+### Types
+
+`packages/host/src/framing/errors.ts`:
+
+```ts
+import type { z } from "zod";
+
+export type DecodeError =
+  | { readonly kind: "length-overflow"; readonly declared: number }
+  | { readonly kind: "invalid-json"; readonly reason: string }
+  | { readonly kind: "schema-violation"; readonly issues: readonly z.ZodIssue[] }
+  | { readonly kind: "stream-error"; readonly reason: string }
+  | { readonly kind: "premature-eof" };
+
+export type WriteError =
+  | { readonly kind: "stream-closed" }
+  | { readonly kind: "stream-error"; readonly reason: string }
+  | { readonly kind: "size-overflow"; readonly bytes: number };
+
+export const MAX_FRAME_BYTES = 1_048_576 as const;
+export const HEADER_BYTES = 4 as const;
+```
+
+`packages/host/src/framing/reader.ts`:
+
+```ts
+export type FrameReaderDeps = { readonly source: Readable; readonly logger: Logger };
+export type FrameReader = AsyncIterable<Either<DecodeError, Frame>>;
+export const createFrameReader = (deps: FrameReaderDeps): IO<never, FrameReader>;
+```
+
+`packages/host/src/framing/writer.ts`:
+
+```ts
+export type FrameWriterDeps = { readonly sink: Writable; readonly logger: Logger };
+export type FrameWriter = (frame: Frame) => IO<WriteError, void>;
+export const createFrameWriter = (deps: FrameWriterDeps): FrameWriter;
+```
+
+Note: `createFrameWriter` returns the `FrameWriter` function **synchronously** (not wrapped in IO). Factory construction has no side effects beyond capturing dep refs.
+
+### Functions
+
+**`readExactly(source, n, signal)`** (internal in reader.ts): pulls exactly `n` bytes from source. Returns `Buffer | "eof" | { error: string } | "cancelled"`.
+
+**`decodeOneFrame(source, signal)`** (internal): runs steps 1–6 from Decision 8.
+
+**`encodeFrame(frame)`** (internal in writer.ts): `JSON.stringify` → length check → 4-byte LE header → `Buffer.concat([header, payload])`. Returns `{ ok: true; bytes } | { ok: false; error: WriteError }`.
+
+**Writer returned closure** maps Node's write callback errors:
+- `EPIPE` / `ERR_STREAM_DESTROYED` / `ERR_STREAM_WRITE_AFTER_END` → `stream-closed`.
+- Other errors → `stream-error`.
+
+### File layout
+
+New files (6): `errors.ts`, `reader.ts`, `reader.test.ts`, `writer.ts`, `writer.test.ts`, `index.ts` — all under `packages/host/src/framing/`. Modified files: none. The dispatcher that wires reader + writer into `cli.ts` is a follow-up issue.
+
+### Sequence
+
+1. Create `framing/errors.ts`.
+2. Create `framing/writer.ts` (simpler half — no streaming state machine).
+3. Create `framing/writer.test.ts` (5 cases per Test strategy).
+4. `npm test -- writer` — must be green.
+5. Create `framing/reader.ts` — `readExactly` first, then `decodeOneFrame`, then the iterator wrapper.
+6. Create `framing/reader.test.ts` (12 cases per Test strategy).
+7. Create `framing/index.ts` barrel.
+8. `npm run check` — all four stages green.
+9. Commit on branch `feat/10-host-stdio-framing`. Title: `feat(host): length-prefixed native-messaging stdio framing (#10, absorbs #11)`.
+
+**The dev does NOT wire reader/writer into cli.ts or dev-harness.ts.** That is dispatcher work in a follow-up issue. ADR-8 ships pure codec.
+
+### Error cases
+
+Reader-side (full table in Decision 8). Stream cleanly ended between frames → iterator ends, no Left yielded, NOT logged as error (clean disconnect is the normal exit path).
+
+Writer-side:
+
+| Variant | Returned | Logger level |
+|---|---|---|
+| Payload > 1 MB | `IO.fail<WriteError>({ kind: "size-overflow", bytes })` | `error` |
+| EPIPE / stream destroyed / write-after-end | `IO.fail<WriteError>({ kind: "stream-closed" })` | `warn` |
+| Other write error | `IO.fail<WriteError>({ kind: "stream-error", reason })` | `error` |
+
+`throw` reserved for invariant violations only.
+
+### Test strategy
+
+`writer.test.ts` (5 binding cases):
+1. Happy path — pong frame, raw-bytes assertion (LE header + JSON.parse round trip).
+2. Size overflow → IO failed, zero bytes written.
+3. Stream closed (sink.end() pre-call) → `stream-closed`.
+4. Stream error (custom Writable with non-EPIPE error) → `stream-error`.
+5. Logger calls per error case, bindings never contain payload data.
+
+`reader.test.ts` (12 binding cases):
+1. Happy path — single ping frame.
+2. Two valid frames back-to-back.
+3. Length overflow (declared 2_000_000) → end iterator, logger.error once.
+4. Invalid JSON then valid frame → continue past, logger.warn once.
+5. Schema violation then valid frame → continue past, logger.warn once.
+6. Premature EOF in header.
+7. Premature EOF in payload.
+8. Clean EOF between frames → iterator completes, no error, no logger.error.
+9. Stream error → end iterator.
+10. Cancellation mid-flight → clean resolve, `source.listenerCount("data") === 0`, source NOT destroyed.
+11. Logger payload safety — a `SECRET_DIFF_BYTES` string in a schema-violation payload must NOT appear in any logger bindings.
+12. Round-trip property — 8 hand-crafted Frame fixtures (ping with/without nonce, pong with/without nonce, 4 error variants) survive writer → PassThrough → reader unchanged.
+
+Vitest harness uses `PassThrough` from `node:stream`. No mocking framework. Inject fake `Logger` (object with `info`/`warn`/`error` capturing arrays + `child` returning self).
+
+Coverage target: branch coverage of every `DecodeError` and `WriteError` variant.
+
+### Consequences
+
+- ~250 LoC across 6 new files. No new dependencies.
+- **Reader does not auto-reply** — dispatcher responsibility, hard constraint (Decision 5).
+- **Back-pressure is YAGNI for v1** (Decision 7). Triggers for revisiting: concurrent dispatch, sustained 1 MB-frame bursts.
+- **Cancellation is intentionally minimal** (Decision 6) — host owns its own fds; OS reclaims them.
+- **`length-overflow`, `stream-error`, `premature-eof` end the iterator.** `invalid-json`, `schema-violation` are recoverable.
+- **Endianness documented inline** so a future contributor can't silently break wire compatibility.
+- **The writer's `IO` boundary is the only `Promise → IO` site in framing** (idiom #2 reaffirmed).
+- **Security posture**: every byte from stdin passes through `parseFrame` (ADR-7) before any domain code sees it. The framing layer is the boundary CLAUDE.md §Functional idioms #7 requires.
+- **Reversibility**: high. Single workspace, no external consumers yet, no persisted data.
+- **#11 absorbed** — dev lands both #10 and #11 in a single PR.
