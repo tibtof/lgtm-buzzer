@@ -7,6 +7,7 @@ import {
   type QuizResultEventDetail,
   type QuizSubmitEventDetail,
   type QuizCancelEventDetail,
+  type QuizRetryEventDetail,
 } from "./dom-events.js";
 
 // ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ const selectFirstChoice = (shadow: ShadowRoot, questionIndex = 0): void => {
 };
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — Original backward-compat suite (ADR-18, ADR-19, ADR-23)
 // ---------------------------------------------------------------------------
 
 describe("createQuizModal", () => {
@@ -125,10 +126,13 @@ describe("createQuizModal", () => {
   afterEach(() => {
     dispose?.();
     dispose = null;
-    // Clean up any stale host nodes that survived the dispose.
     document
       .querySelectorAll("[data-lgtm-modal-host]")
       .forEach((n) => n.remove());
+  });
+
+  beforeEach(() => {
+    document.body.innerHTML = "";
   });
 
   // 1. Mount on first quiz-request event
@@ -143,8 +147,8 @@ describe("createQuizModal", () => {
     expect(document.querySelector("[data-lgtm-modal-host]")).not.toBeNull();
   });
 
-  // 2. Loading state shown immediately on quiz-request
-  it("shows a loading state immediately after quiz-request", () => {
+  // 2. Loading / generating state shown immediately on quiz-request
+  it("shows a generating state (spinner) immediately after quiz-request", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
@@ -166,12 +170,13 @@ describe("createQuizModal", () => {
 
     const shadow = getShadow(document);
     expect(shadow).not.toBeNull();
-    const questionBlocks = shadow!.querySelectorAll(".question-block");
-    expect(questionBlocks.length).toBe(2);
+    // In ADR-24 state machine, quiz-active is now "ready" and uses <fieldset>
+    const fieldsets = shadow!.querySelectorAll("fieldset");
+    expect(fieldsets.length).toBe(2);
   });
 
-  // 4. Radio buttons grouped per question
-  it("groups radio buttons by question using unique name attributes", () => {
+  // 4. Radio buttons grouped per question (via <fieldset>)
+  it("groups radio buttons by question using unique name attributes inside fieldsets", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
@@ -202,7 +207,6 @@ describe("createQuizModal", () => {
 
     const shadow = getShadow(document)!;
 
-    // Select one choice per question.
     selectFirstChoice(shadow, 0);
     selectFirstChoice(shadow, 1);
 
@@ -218,7 +222,6 @@ describe("createQuizModal", () => {
     expect(submitted.answers).toHaveLength(2);
     expect(submitted.answers[0]!.chosenChoiceId).toBe("a");
 
-    // Cleanup (addEventListener returns void, not a dispose fn — remove manually).
     document.removeEventListener(DOM_EVENTS.quizSubmit, cleanup as unknown as EventListener);
   });
 
@@ -233,37 +236,30 @@ describe("createQuizModal", () => {
     const shadow = getShadow(document)!;
     const submitBtn = shadow.querySelector<HTMLButtonElement>(".btn-primary");
     expect(submitBtn).not.toBeNull();
-
-    // Initially disabled.
     expect(submitBtn!.disabled).toBe(true);
 
-    // Select only the first question's answer.
     selectFirstChoice(shadow, 0);
     expect(submitBtn!.disabled).toBe(true);
 
-    // Select second question too.
     selectFirstChoice(shadow, 1);
     expect(submitBtn!.disabled).toBe(false);
   });
 
-  // 7. quiz-passed outcome closes the modal
-  it("closes the modal on quiz-passed outcome", () => {
+  // 7. quiz-passed outcome shows pass result
+  it("shows pass result banner on quiz-passed outcome", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
     fireQuizRequest(document);
     fireQuizReady(document);
 
-    // Simulate submit flow: select answers and submit.
     const shadow = getShadow(document)!;
     selectFirstChoice(shadow, 0);
     selectFirstChoice(shadow, 1);
     shadow.querySelector<HTMLButtonElement>(".btn-primary")!.click();
 
-    // Now fire quiz-passed.
     fireQuizPassed(document);
 
-    // The modal should show the result state (pass banner visible, backdrop still there).
     const shadow2 = getShadow(document)!;
     const backdrop = shadow2.querySelector(".backdrop");
     expect(backdrop).not.toBeNull();
@@ -271,7 +267,7 @@ describe("createQuizModal", () => {
     expect(passBanner).not.toBeNull();
   });
 
-  // 7b. quiz-passed dismiss button closes the modal completely
+  // 7b. quiz-passed dismiss button closes the modal
   it("dismiss button on pass result closes the modal", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
@@ -284,7 +280,6 @@ describe("createQuizModal", () => {
     expect(dismissBtn).not.toBeNull();
     dismissBtn!.click();
 
-    // Modal is idle — backdrop removed.
     const shadow2 = getShadow(document)!;
     expect(shadow2.querySelector(".backdrop")).toBeNull();
   });
@@ -311,35 +306,34 @@ describe("createQuizModal", () => {
     const perQuestionItems = shadow2.querySelectorAll(".per-question-item");
     expect(perQuestionItems.length).toBe(2);
 
-    // Each item has a red X icon.
     perQuestionItems.forEach((item) => {
       expect(item.querySelector(".pq-icon")?.textContent).toBe("❌");
     });
   });
 
-  // 9. error outcome shows error message + dismiss button
-  it("shows error message and dismiss button on error outcome", () => {
+  // 9. error outcome shows error title/body + dismiss button
+  it("shows error title, body, and dismiss button on error outcome", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
     fireQuizRequest(document);
-    fireQuizError(document, "req-1", "LLM timeout after 30s");
+    fireQuizError(document, "req-1", "host did not respond");
 
     const shadow = getShadow(document)!;
     const errorBanner = shadow.querySelector(".result-error");
     expect(errorBanner).not.toBeNull();
 
-    const errorMsg = shadow.querySelector(".error-msg");
-    expect(errorMsg).not.toBeNull();
-    // textContent must match the error message (no innerHTML risk).
-    expect(errorMsg!.textContent).toBe("LLM timeout after 30s");
+    // error-classes.ts maps "host did not respond" → host-timeout → "Host didn't respond"
+    const errorTitle = shadow.querySelector(".error-title");
+    expect(errorTitle).not.toBeNull();
+    expect(errorTitle!.textContent).toContain("Host didn't respond");
 
     const dismissBtn = shadow.querySelector<HTMLButtonElement>(".btn-secondary");
     expect(dismissBtn).not.toBeNull();
   });
 
-  // 10. Dismiss / Esc emits lgtm-buzzer:quiz-cancel
-  it("Esc key emits quiz-cancel and closes the modal", () => {
+  // 10. Esc key emits quiz-cancel and closes modal (non-idle, non-passed states)
+  it("Esc key emits quiz-cancel and closes the modal in generating state", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
@@ -350,14 +344,11 @@ describe("createQuizModal", () => {
     document.addEventListener(DOM_EVENTS.quizCancel, handler);
 
     fireQuizRequest(document, "req-esc");
-
-    // Fire Escape key.
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
 
     expect(cancelEvents).toHaveLength(1);
     expect(cancelEvents[0]!.requestId).toBe("req-esc");
 
-    // Modal should be idle.
     const shadow = getShadow(document)!;
     expect(shadow.querySelector(".backdrop")).toBeNull();
 
@@ -386,7 +377,7 @@ describe("createQuizModal", () => {
     document.removeEventListener(DOM_EVENTS.quizCancel, handler);
   });
 
-  // 11. Idempotent mount: second quiz-request does not double-mount
+  // 11. Idempotent mount
   it("does not mount a second host element on a second quiz-request", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
@@ -398,21 +389,19 @@ describe("createQuizModal", () => {
     expect(hosts.length).toBe(1);
   });
 
-  // 12. Shadow DOM isolation: modal styles do not bleed to the document
+  // 12. Shadow DOM isolation
   it("applies styles inside the shadow root, not the document", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
     fireQuizRequest(document);
 
-    // No <style> elements in the document head.
     const docStyles = document.querySelectorAll("head style");
     const lgtmStyles = Array.from(docStyles).filter(
       (s) => s.textContent?.includes("lgtm-fadein"),
     );
     expect(lgtmStyles.length).toBe(0);
 
-    // The style IS inside the shadow root.
     const shadow = getShadow(document)!;
     const shadowStyles = shadow.querySelectorAll("style");
     const hasCss = Array.from(shadowStyles).some(
@@ -421,7 +410,7 @@ describe("createQuizModal", () => {
     expect(hasCss).toBe(true);
   });
 
-  // 13. User-controlled text rendered via textContent (XSS safety)
+  // 13. XSS safety (textContent only)
   it("renders LLM-generated question text via textContent only", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
@@ -449,15 +438,13 @@ describe("createQuizModal", () => {
     emitDOMEvent(document, DOM_EVENTS.quizResult, maliciousDetail);
 
     const shadow = getShadow(document)!;
-    // The img tag must NOT have been created as an element.
     expect(shadow.querySelector("img")).toBeNull();
-    // The text content must be present as-is (escaped, not executed).
-    const prompt = shadow.querySelector(".question-prompt");
-    expect(prompt?.textContent).toBe(xssAttempt);
+    const legend = shadow.querySelector("legend");
+    expect(legend?.textContent).toBe(xssAttempt);
   });
 
-  // 14. Cancel button in loading state emits quiz-cancel
-  it("cancel button in loading state emits quiz-cancel and closes modal", () => {
+  // 14. Cancel button in generating state emits quiz-cancel
+  it("cancel button in generating state emits quiz-cancel and closes modal", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
@@ -467,7 +454,7 @@ describe("createQuizModal", () => {
     };
     document.addEventListener(DOM_EVENTS.quizCancel, handler);
 
-    fireQuizRequest(document, "req-cancel-loading");
+    fireQuizRequest(document, "req-cancel-generating");
 
     const shadow = getShadow(document)!;
     const cancelBtn = shadow.querySelector<HTMLButtonElement>(".btn-secondary");
@@ -475,13 +462,13 @@ describe("createQuizModal", () => {
     cancelBtn!.click();
 
     expect(cancelEvents).toHaveLength(1);
-    expect(cancelEvents[0]!.requestId).toBe("req-cancel-loading");
+    expect(cancelEvents[0]!.requestId).toBe("req-cancel-generating");
     expect(shadow.querySelector(".backdrop")).toBeNull();
 
     document.removeEventListener(DOM_EVENTS.quizCancel, handler);
   });
 
-  // 15. data-testid contract (ADR-19 §7) — all five attributes must be present
+  // 15. data-testid attributes (ADR-19 §7)
   it("sets data-testid='lgtm-buzzer-quiz-modal' on the modal host element", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
@@ -493,29 +480,27 @@ describe("createQuizModal", () => {
     expect(host!.getAttribute("data-testid")).toBe("lgtm-buzzer-quiz-modal");
   });
 
-  it("sets data-question on each question container and data-choice on each radio", () => {
+  it("sets data-question on each fieldset and data-choice on each radio", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
     fireQuizRequest(document);
-    fireQuizReady(document); // transitions to quiz-active with 2 questions
+    fireQuizReady(document);
 
     const shadow = getShadow(document)!;
 
-    // data-question attributes
     const q1Block = shadow.querySelector("[data-question='q1']");
     const q2Block = shadow.querySelector("[data-question='q2']");
     expect(q1Block).not.toBeNull();
     expect(q2Block).not.toBeNull();
 
-    // data-choice attributes inside q1
     const c1Radio = q1Block!.querySelector("[data-choice='a']");
     const c2Radio = q1Block!.querySelector("[data-choice='b']");
     expect(c1Radio).not.toBeNull();
     expect(c2Radio).not.toBeNull();
   });
 
-  it("sets data-testid='lgtm-buzzer-quiz-submit' on the submit button in quiz-active state", () => {
+  it("sets data-testid='lgtm-buzzer-quiz-submit' on the submit button in ready state", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
@@ -528,24 +513,11 @@ describe("createQuizModal", () => {
     expect(submitBtn!.tagName.toLowerCase()).toBe("button");
   });
 
-  it("sets data-testid='lgtm-buzzer-quiz-cancel' on the cancel button in loading state", () => {
-    const modal = createQuizModal({ doc: document });
-    dispose = modal.start();
-
-    fireQuizRequest(document); // loading state
-
-    const shadow = getShadow(document)!;
-    const cancelBtn = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-cancel']");
-    expect(cancelBtn).not.toBeNull();
-    expect(cancelBtn!.tagName.toLowerCase()).toBe("button");
-  });
-
-  it("sets data-testid='lgtm-buzzer-quiz-cancel' on the cancel button in quiz-active state", () => {
+  it("sets data-testid='lgtm-buzzer-quiz-cancel' on the cancel button in generating state", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
     fireQuizRequest(document);
-    fireQuizReady(document); // quiz-active state
 
     const shadow = getShadow(document)!;
     const cancelBtn = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-cancel']");
@@ -553,8 +525,21 @@ describe("createQuizModal", () => {
     expect(cancelBtn!.tagName.toLowerCase()).toBe("button");
   });
 
-  // ADR-23: missing-credentials renders "Configure in options" link
-  it("missing-credentials error renders 'Configure in options' link (ADR-23)", () => {
+  it("sets data-testid='lgtm-buzzer-quiz-cancel' on the cancel button in ready state", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    const cancelBtn = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-cancel']");
+    expect(cancelBtn).not.toBeNull();
+    expect(cancelBtn!.tagName.toLowerCase()).toBe("button");
+  });
+
+  // ADR-23 backward-compat: missing-credentials → openOptionsPage
+  it("missing-credentials error renders 'Open options' CTA button (ADR-23 backward-compat)", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
@@ -562,13 +547,14 @@ describe("createQuizModal", () => {
     fireQuizError(document, "req-mc", "credentials required", "missing-credentials");
 
     const shadow = getShadow(document)!;
-    const configLink = shadow.querySelector("[data-testid='lgtm-buzzer-configure-options']");
-    expect(configLink).not.toBeNull();
-    expect(configLink!.textContent).toContain("Configure credentials");
+    // ADR-24: the CTA button now uses data-testid="lgtm-buzzer-configure-options"
+    const configBtn = shadow.querySelector("[data-testid='lgtm-buzzer-configure-options']");
+    expect(configBtn).not.toBeNull();
+    expect(configBtn!.textContent).toContain("Open options");
   });
 
-  // ADR-23: clicking the "Configure in options" link emits the openOptions DOM event
-  it("clicking configure-options link emits lgtm-buzzer:open-options event", () => {
+  // ADR-23: clicking the "Open options" CTA emits lgtm-buzzer:open-options event
+  it("clicking open-options CTA emits lgtm-buzzer:open-options event", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
@@ -580,19 +566,444 @@ describe("createQuizModal", () => {
     fireQuizError(document, "req-oo", "credentials required", "missing-credentials");
 
     const shadow = getShadow(document)!;
-    const configLink = shadow.querySelector<HTMLAnchorElement>(
+    const configBtn = shadow.querySelector<HTMLButtonElement>(
       "[data-testid='lgtm-buzzer-configure-options']",
     );
-    expect(configLink).not.toBeNull();
-    configLink!.click();
+    expect(configBtn).not.toBeNull();
+    configBtn!.click();
 
     expect(openOptionsEvents).toHaveLength(1);
 
     document.removeEventListener("lgtm-buzzer:open-options", handler);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — ADR-24 new state machine + accessibility + error UX
+// ---------------------------------------------------------------------------
+
+describe("createQuizModal — ADR-24 state machine", () => {
+  let dispose: (() => void) | null = null;
 
   beforeEach(() => {
-    // Ensure a fresh document.body for each test.
     document.body.innerHTML = "";
+  });
+
+  afterEach(() => {
+    dispose?.();
+    dispose = null;
+    document.querySelectorAll("[data-lgtm-modal-host]").forEach((n) => n.remove());
+  });
+
+  // 1. idle → generating: skeleton + spinner + Cancel button
+  it("1. idle→generating shows skeleton + spinner + Cancel button", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    const shadow = getShadow(document)!;
+    expect(shadow.querySelector(".spinner")).not.toBeNull();
+    expect(shadow.querySelector(".skeleton-group")).not.toBeNull();
+    expect(shadow.querySelector("[data-testid='lgtm-buzzer-quiz-cancel']")).not.toBeNull();
+  });
+
+  // 2. Generating→ready: fieldsets rendered
+  it("2. generating→ready renders fieldsets with legends", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    const fieldsets = shadow.querySelectorAll("fieldset");
+    expect(fieldsets.length).toBe(2);
+
+    const legends = shadow.querySelectorAll("legend");
+    expect(legends.length).toBe(2);
+    expect(legends[0]?.textContent).toBe("Question 1: What changed?");
+  });
+
+  // 3. Ready→submitting: spinner shown, Cancel present
+  it("3. ready→submitting shows spinner and Cancel button in submitting state", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    selectFirstChoice(shadow, 0);
+    selectFirstChoice(shadow, 1);
+    shadow.querySelector<HTMLButtonElement>("[data-testid='lgtm-buzzer-quiz-submit']")!.click();
+
+    const shadow2 = getShadow(document)!;
+    expect(shadow2.querySelector(".spinner")).not.toBeNull();
+    expect(shadow2.querySelector("[data-testid='lgtm-buzzer-quiz-cancel']")).not.toBeNull();
+  });
+
+  // 4. Submitting→passed: green banner
+  it("4. submitting→passed: green banner visible", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizPassed(document);
+
+    const shadow = getShadow(document)!;
+    expect(shadow.querySelector(".result-pass")).not.toBeNull();
+  });
+
+  // 5. Submitting→failed: red banner + Try Again button
+  it("5. submitting→failed: red banner and Try Again button", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizFailed(document);
+
+    const shadow = getShadow(document)!;
+    expect(shadow.querySelector(".result-fail")).not.toBeNull();
+    const tryAgainBtn = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-retry']");
+    expect(tryAgainBtn).not.toBeNull();
+    expect(tryAgainBtn!.textContent).toContain("Try Again");
+  });
+
+  // 6. Failed→generating: Try Again emits quiz-retry
+  it("6. failed→generating: Try Again click emits quiz-retry", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    const retryEvents: QuizRetryEventDetail[] = [];
+    const handler = (e: Event): void => {
+      retryEvents.push((e as CustomEvent).detail as QuizRetryEventDetail);
+    };
+    document.addEventListener(DOM_EVENTS.quizRetry, handler);
+
+    fireQuizRequest(document, "req-retry");
+    fireQuizFailed(document, "req-retry");
+
+    const shadow = getShadow(document)!;
+    shadow.querySelector<HTMLButtonElement>("[data-testid='lgtm-buzzer-quiz-retry']")!.click();
+
+    expect(retryEvents).toHaveLength(1);
+    expect(retryEvents[0]!.requestId).toBe("req-retry");
+
+    document.removeEventListener(DOM_EVENTS.quizRetry, handler);
+  });
+
+  // 7. Error bad-credentials → "Credentials rejected" + Open options CTA
+  it("7. bad-credentials error → 'Credentials rejected' title + Open options", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document, "req-bc");
+    fireQuizError(document, "req-bc", "rejected", "bad-credentials");
+
+    const shadow = getShadow(document)!;
+    const title = shadow.querySelector(".error-title");
+    expect(title?.textContent).toBe("Credentials rejected");
+    expect(shadow.querySelector("[data-testid='lgtm-buzzer-configure-options']")).not.toBeNull();
+  });
+
+  // 8. Error host-unreachable (synthesised from "host disconnected") → install-host CTA
+  it("8. 'host disconnected' message → 'Native host not installed' + Install host", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document, "req-unreachable");
+    fireQuizError(document, "req-unreachable", "host disconnected", "internal");
+
+    const shadow = getShadow(document)!;
+    const title = shadow.querySelector(".error-title");
+    expect(title?.textContent).toBe("Native host not installed");
+    const installLink = shadow.querySelector("[data-testid='lgtm-buzzer-install-host']");
+    expect(installLink).not.toBeNull();
+  });
+
+  // 9. Error host-timeout (synthesised from "host did not respond") → Retry CTA
+  it("9. 'host did not respond' message → 'Host didn't respond' + Retry", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document, "req-timeout");
+    fireQuizError(document, "req-timeout", "host did not respond", "internal");
+
+    const shadow = getShadow(document)!;
+    const title = shadow.querySelector(".error-title");
+    expect(title?.textContent).toBe("Host didn't respond");
+    const retryBtn = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-retry']");
+    expect(retryBtn).not.toBeNull();
+    expect(retryBtn!.textContent).toBe("Retry");
+  });
+
+  // 10. Error version-mismatch → "Protocol version mismatch" + Install host
+  it("10. version-mismatch → 'Protocol version mismatch' + Install host", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document, "req-vm");
+    const detail: QuizResultEventDetail = {
+      requestId: "req-vm",
+      outcome: { kind: "error", reason: "version-mismatch", message: "version mismatch" },
+    };
+    emitDOMEvent(document, DOM_EVENTS.quizResult, detail);
+
+    const shadow = getShadow(document)!;
+    const title = shadow.querySelector(".error-title");
+    expect(title?.textContent).toBe("Protocol version mismatch");
+    const installLink = shadow.querySelector("[data-testid='lgtm-buzzer-install-host']");
+    expect(installLink).not.toBeNull();
+  });
+
+  // 11. aria-live region announces "Generating quiz" on entering generating
+  it("11. aria-live region announces generating state", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    const shadow = getShadow(document)!;
+    const liveRegion = shadow.querySelector("[aria-live='polite']");
+    expect(liveRegion).not.toBeNull();
+    expect(liveRegion!.textContent).toContain("Generating quiz");
+  });
+
+  // 12. aria-live announces "Quiz ready, 2 questions" on entering ready
+  it("12. aria-live announces quiz ready with question count", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    const liveRegion = shadow.querySelector("[aria-live='polite']");
+    expect(liveRegion).not.toBeNull();
+    expect(liveRegion!.textContent).toContain("Quiz ready");
+    expect(liveRegion!.textContent).toContain("2 question");
+  });
+
+  // 13. Each question in fieldset with legend
+  it("13. each question is wrapped in <fieldset> with a <legend> containing the prompt", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    const fieldsets = shadow.querySelectorAll("fieldset");
+    expect(fieldsets.length).toBe(2);
+
+    fieldsets.forEach((fs, i) => {
+      const legend = fs.querySelector("legend");
+      expect(legend).not.toBeNull();
+      expect(legend!.textContent).toBe(`Question ${i + 1}: What changed?`);
+    });
+  });
+
+  // 14. aria-labelledby on backdrop points to h2
+  it("14. aria-labelledby on backdrop points to modal title h2", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    const shadow = getShadow(document)!;
+    const backdrop = shadow.querySelector(".backdrop");
+    expect(backdrop).not.toBeNull();
+    const labelId = backdrop!.getAttribute("aria-labelledby");
+    expect(labelId).not.toBeNull();
+
+    const heading = shadow.querySelector(`#${labelId}`);
+    expect(heading).not.toBeNull();
+    expect(heading!.tagName.toLowerCase()).toBe("h2");
+  });
+
+  // 15. Retry CTA in error state emits quiz-retry { requestId }
+  it("15. Retry CTA in error state emits quiz-retry with requestId", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    const retryEvents: QuizRetryEventDetail[] = [];
+    const handler = (e: Event): void => {
+      retryEvents.push((e as CustomEvent).detail as QuizRetryEventDetail);
+    };
+    document.addEventListener(DOM_EVENTS.quizRetry, handler);
+
+    fireQuizRequest(document, "req-retry-err");
+    fireQuizError(document, "req-retry-err", "host did not respond", "internal");
+
+    const shadow = getShadow(document)!;
+    const retryBtn = shadow.querySelector<HTMLButtonElement>("[data-testid='lgtm-buzzer-quiz-retry']");
+    expect(retryBtn).not.toBeNull();
+    retryBtn!.click();
+
+    expect(retryEvents).toHaveLength(1);
+    expect(retryEvents[0]!.requestId).toBe("req-retry-err");
+
+    document.removeEventListener(DOM_EVENTS.quizRetry, handler);
+  });
+
+  // 16. aria-busy=true in generating state, false in ready state
+  it("16. aria-busy='true' in generating; 'false' in ready", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    let shadow = getShadow(document)!;
+    let backdrop = shadow.querySelector(".backdrop");
+    expect(backdrop?.getAttribute("aria-busy")).toBe("true");
+
+    fireQuizReady(document);
+
+    shadow = getShadow(document)!;
+    backdrop = shadow.querySelector(".backdrop");
+    expect(backdrop?.getAttribute("aria-busy")).toBe("false");
+  });
+
+  // 17. aria-busy=true in submitting
+  it("17. aria-busy='true' in submitting state", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    selectFirstChoice(shadow, 0);
+    selectFirstChoice(shadow, 1);
+    shadow.querySelector<HTMLButtonElement>("[data-testid='lgtm-buzzer-quiz-submit']")!.click();
+
+    const shadow2 = getShadow(document)!;
+    const backdrop = shadow2.querySelector(".backdrop");
+    expect(backdrop?.getAttribute("aria-busy")).toBe("true");
+  });
+
+  // 18. Esc in passed state closes WITHOUT emitting quiz-cancel
+  it("18. Esc in passed state closes WITHOUT emitting quiz-cancel", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    const cancelEvents: QuizCancelEventDetail[] = [];
+    const handler = (e: Event): void => {
+      cancelEvents.push((e as CustomEvent).detail as QuizCancelEventDetail);
+    };
+    document.addEventListener(DOM_EVENTS.quizCancel, handler);
+
+    fireQuizRequest(document, "req-passed-esc");
+    fireQuizPassed(document, "req-passed-esc");
+
+    // Verify we're in passed state.
+    const shadow = getShadow(document)!;
+    expect(shadow.querySelector(".result-pass")).not.toBeNull();
+
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+
+    // Should close the modal.
+    const shadow2 = getShadow(document)!;
+    expect(shadow2.querySelector(".backdrop")).toBeNull();
+
+    // Must NOT have emitted quiz-cancel.
+    expect(cancelEvents).toHaveLength(0);
+
+    document.removeEventListener(DOM_EVENTS.quizCancel, handler);
+  });
+
+  // 19. Esc in error state emits quiz-cancel
+  it("19. Esc in error state emits quiz-cancel", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    const cancelEvents: QuizCancelEventDetail[] = [];
+    const handler = (e: Event): void => {
+      cancelEvents.push((e as CustomEvent).detail as QuizCancelEventDetail);
+    };
+    document.addEventListener(DOM_EVENTS.quizCancel, handler);
+
+    fireQuizRequest(document, "req-err-esc");
+    fireQuizError(document, "req-err-esc", "boom");
+
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+
+    expect(cancelEvents).toHaveLength(1);
+    expect(cancelEvents[0]!.requestId).toBe("req-err-esc");
+
+    document.removeEventListener(DOM_EVENTS.quizCancel, handler);
+  });
+
+  // 20. Cancel in submitting state (new) emits quiz-cancel
+  it("20. Cancel button in submitting state emits quiz-cancel", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    const cancelEvents: QuizCancelEventDetail[] = [];
+    const handler = (e: Event): void => {
+      cancelEvents.push((e as CustomEvent).detail as QuizCancelEventDetail);
+    };
+    document.addEventListener(DOM_EVENTS.quizCancel, handler);
+
+    fireQuizRequest(document, "req-sub-cancel");
+    fireQuizReady(document, "req-sub-cancel");
+
+    const shadow = getShadow(document)!;
+    selectFirstChoice(shadow, 0);
+    selectFirstChoice(shadow, 1);
+    shadow.querySelector<HTMLButtonElement>("[data-testid='lgtm-buzzer-quiz-submit']")!.click();
+
+    const shadow2 = getShadow(document)!;
+    const cancelBtn = shadow2.querySelector<HTMLButtonElement>("[data-testid='lgtm-buzzer-quiz-cancel']");
+    expect(cancelBtn).not.toBeNull();
+    cancelBtn!.click();
+
+    expect(cancelEvents).toHaveLength(1);
+    expect(cancelEvents[0]!.requestId).toBe("req-sub-cancel");
+
+    document.removeEventListener(DOM_EVENTS.quizCancel, handler);
+  });
+
+  // 21. aria-live announces "Quiz passed" on passed state
+  it("21. aria-live announces 'Quiz passed' in passed state", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizPassed(document);
+
+    const shadow = getShadow(document)!;
+    const liveRegion = shadow.querySelector("[aria-live='polite']");
+    expect(liveRegion?.textContent).toContain("Quiz passed");
+  });
+
+  // 22. aria-live announces error title in error state
+  it("22. aria-live announces 'Error: <title>' in error state", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizError(document, "req-1", "host did not respond");
+
+    const shadow = getShadow(document)!;
+    const liveRegion = shadow.querySelector("[aria-live='polite']");
+    expect(liveRegion?.textContent).toContain("Error:");
+    expect(liveRegion?.textContent).toContain("Host didn't respond");
+  });
+
+  // 23. install-host CTA has correct testid
+  it("23. install-host CTA has data-testid='lgtm-buzzer-install-host'", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document, "req-install");
+    fireQuizError(document, "req-install", "host disconnected", "internal");
+
+    const shadow = getShadow(document)!;
+    const installLink = shadow.querySelector("[data-testid='lgtm-buzzer-install-host']");
+    expect(installLink).not.toBeNull();
+    expect(installLink!.tagName.toLowerCase()).toBe("a");
+    expect(installLink!.getAttribute("href")).toContain("github.com/tibtof/lgtm-buzzer");
   });
 });

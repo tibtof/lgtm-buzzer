@@ -11,15 +11,16 @@ import {
  * Namespaced DOM event name constants for the CS ↔ modal pub/sub channel.
  *
  * All events carry a zod-validated `detail` object. The modal subscribes to
- * `quizRequest` and `quizResult`; the CS listens for `quizSubmit` and
- * `quizCancel`. This decoupling means #42 (CS) and #43 (modal) ship
- * independently.
+ * `quizRequest` and `quizResult`; the CS listens for `quizSubmit`,
+ * `quizCancel`, and `quizRetry`. This decoupling means #42 (CS) and #43
+ * (modal) ship independently.
  */
 export const DOM_EVENTS = {
   quizRequest: "lgtm-buzzer:quiz-request",
   quizResult: "lgtm-buzzer:quiz-result",
   quizSubmit: "lgtm-buzzer:quiz-submit",
   quizCancel: "lgtm-buzzer:quiz-cancel",
+  quizRetry: "lgtm-buzzer:quiz-retry",
 } as const;
 
 /**
@@ -93,6 +94,20 @@ export const QuizCancelEventDetailSchema = z.object({
 
 /** The detail object for a `lgtm-buzzer:quiz-cancel` custom event. */
 export type QuizCancelEventDetail = z.infer<typeof QuizCancelEventDetailSchema>;
+
+/**
+ * Detail carried by `lgtm-buzzer:quiz-retry` (modal → CS).
+ *
+ * Fired when the user clicks Retry in `error` state or Try Again in
+ * `failed` state. The CS re-emits a fresh `quiz-request` with a new
+ * requestId and correlationId, so the old correlation map slot is not reused.
+ */
+export const QuizRetryEventDetailSchema = z.object({
+  requestId: z.string().min(1),
+});
+
+/** The detail object for a `lgtm-buzzer:quiz-retry` custom event. */
+export type QuizRetryEventDetail = z.infer<typeof QuizRetryEventDetailSchema>;
 
 /**
  * Emits a `CustomEvent` with the given name and detail on `doc`.

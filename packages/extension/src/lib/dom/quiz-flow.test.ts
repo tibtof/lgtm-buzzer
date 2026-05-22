@@ -1002,4 +1002,175 @@ describe("createQuizFlowController", () => {
 
     elementClickSpy.mockRestore();
   });
+
+  // -------------------------------------------------------------------------
+  // ADR-24: quiz-retry tests
+  // -------------------------------------------------------------------------
+
+  // ADR-24 Test 1: quiz-retry for a known requestId where pending is alive
+  it("ADR-24: quiz-retry with alive pending emits a new quiz-request with fresh correlationId", async () => {
+    // We need pending to stay alive (error path usually drops it, but here we
+    // manually fire quiz-retry before the error drops pending by using a
+    // custom sendFrame that never resolves for the first call).
+    let firstCallResolve!: (f: Frame) => void;
+    let callCount = 0;
+
+    const sentFrames: Frame[] = [];
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      sentFrames.push(frame);
+      callCount++;
+      if (callCount === 1) {
+        // First quiz-request — hold it so pending stays alive.
+        return new Promise<Frame>((resolve) => { firstCallResolve = resolve; });
+      }
+      // Second quiz-request (retry) — resolve immediately.
+      return makeQuizResponseFrame(frame.correlationId ?? "null");
+    });
+
+    const { events: requestEvents, dispose: disposeRequests } = collectRequestEvents();
+    const { events: resultEvents, dispose: disposeResult } = collectResultEvents();
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    // Trigger first Approve → creates pending req-1 / corr-1.
+    fireSubmit(form);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+
+    // req-1 is pending; fire quiz-retry while it is still alive.
+    document.dispatchEvent(
+      new CustomEvent(DOM_EVENTS.quizRetry, { detail: { requestId: "req-1" } }),
+    );
+
+    // Wait for the retry's quiz-request and quiz-ready to arrive.
+    await vi.waitFor(() => requestEvents.length >= 2);
+    await vi.waitFor(() => resultEvents.length >= 1);
+
+    // The retry should have emitted a NEW quiz-request DOM event.
+    const retryRequest = requestEvents[1];
+    expect(retryRequest).toBeDefined();
+    // The retry uses a fresh requestId (counter-based: req-2).
+    expect(retryRequest!.requestId).toBe("req-2");
+    // The retry's correlationId is fresh too.
+    expect(retryRequest!.correlationId).not.toBe(requestEvents[0]!.correlationId);
+
+    // Let the first pending frame resolve (it's orphaned now).
+    firstCallResolve(makeQuizResponseFrame("corr-1"));
+
+    disposeRequests();
+    disposeResult();
+  });
+
+  // ADR-24 Test 2: quiz-retry with dropped pending but currentPR set
+  it("ADR-24: quiz-retry with dropped pending (error path) but currentPR set — fresh quiz-request", async () => {
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      if (frame.kind === "quiz-request") {
+        // First call: return error to drop pending; second call (retry): return quiz-ready.
+        const count = (sendFrame.mock.calls.length);
+        if (count === 1) {
+          return makeErrorFrame(frame.correlationId ?? "null");
+        }
+        return makeQuizResponseFrame(frame.correlationId ?? "null");
+      }
+      return makeErrorFrame(frame.correlationId ?? "null");
+    });
+
+    const { events: requestEvents, dispose: disposeRequests } = collectRequestEvents();
+    const { events: resultEvents, dispose: disposeResult } = collectResultEvents();
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    // Trigger Approve → req-1 → error frame → pending dropped.
+    fireSubmit(form);
+    await vi.waitFor(() => resultEvents.length >= 1);
+    expect(resultEvents[0]?.outcome.kind).toBe("error");
+
+    // Now fire quiz-retry for the dropped req-1.
+    document.dispatchEvent(
+      new CustomEvent(DOM_EVENTS.quizRetry, { detail: { requestId: "req-1" } }),
+    );
+
+    // A fresh quiz-request should be emitted with a new requestId.
+    await vi.waitFor(() => requestEvents.length >= 2);
+
+    const retryRequest = requestEvents[1];
+    expect(retryRequest).toBeDefined();
+    expect(retryRequest!.requestId).toBe("req-2"); // fresh requestId
+
+    // And a quiz-ready should arrive.
+    await vi.waitFor(() => resultEvents.length >= 2);
+    expect(resultEvents[1]?.outcome.kind).toBe("quiz-ready");
+
+    disposeRequests();
+    disposeResult();
+  });
+
+  // ADR-24 Test 3: quiz-retry when currentPR is null → error emitted
+  it("ADR-24: quiz-retry when currentPR is null emits error 'no active PR'", async () => {
+    const sendFrame = vi.fn((): Promise<Frame> => new Promise(() => { /* never */ }));
+
+    const { events: resultEvents, dispose: disposeResult } = collectResultEvents();
+    const warnCalls: string[] = [];
+
+    // Use a navigation watcher so we can trigger onDidNavigate programmatically.
+    const navWatcher = makeTurboNavigationWatcher();
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: navWatcher,
+      logger: { warn: (msg) => { warnCalls.push(msg); } },
+    });
+    controller.start();
+
+    // Navigate to a non-PR page so currentPR becomes null.
+    Object.defineProperty(window, "location", {
+      value: { ...window.location, href: "https://github.com/tibtof" },
+      writable: true,
+      configurable: true,
+    });
+    navWatcher.fireWillNavigate();
+    navWatcher.fireDidNavigate(); // updates currentPR = null
+
+    // Fire quiz-retry for a requestId that never existed.
+    document.dispatchEvent(
+      new CustomEvent(DOM_EVENTS.quizRetry, { detail: { requestId: "req-phantom" } }),
+    );
+
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+
+    // Should have emitted an error result.
+    expect(resultEvents.length).toBe(1);
+    const errorOutcome = resultEvents[0]?.outcome;
+    expect(errorOutcome?.kind).toBe("error");
+    if (errorOutcome?.kind === "error") {
+      expect(errorOutcome.message).toBe("no active PR");
+    }
+
+    // Should have warned.
+    expect(warnCalls.some((w) => w.includes("no active PR"))).toBe(true);
+
+    // sendFrame must NOT have been called (no frame sent).
+    expect(sendFrame).not.toHaveBeenCalled();
+
+    disposeResult();
+  });
 });

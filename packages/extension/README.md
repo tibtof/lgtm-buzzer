@@ -30,3 +30,42 @@ The options storage layer (`src/lib/options/storage.ts`) uses `Either<StorageErr
 ### Planned future ADR
 
 OS-keychain integration (e.g., macOS Keychain, SecretService on Linux) for encrypted credential storage. The `StorageArea` port in `storage.ts` is the injection point — swapping the backend requires no changes to the domain logic.
+
+## Quiz modal (ADR-24)
+
+### Accessibility commitments (WCAG AA)
+
+The quiz modal (`src/lib/dom/modal.ts`) meets WCAG 2.1 Level AA:
+
+- `role="dialog"` + `aria-modal="true"` on the backdrop.
+- `aria-labelledby` pointing to the modal `<h2>` heading.
+- Focus trap (`src/lib/dom/focus-trap.ts`): Tab / Shift+Tab confined to modal panel; focus restored on close.
+- `aria-live="polite"` region announces every state transition to screen readers.
+- `<fieldset>` + `<legend>` per question (replaces bespoke `role="radiogroup"`).
+- `aria-busy="true"` on the panel during `generating` and `submitting` states.
+- Esc closes in all non-idle states; in `passed` state Esc dismisses without
+  emitting `quiz-cancel` (the approval is already through).
+- Animations (`lgtm-fadein`, `lgtm-spin`, skeleton pulse) are wrapped in
+  `@media (prefers-reduced-motion: no-preference)`.
+
+WCAG AAA is aspirational and may motivate a follow-up issue.
+
+### Cancel during generation (Option A limitation)
+
+When the user clicks Cancel while the modal is in `generating` state, the modal
+emits `quiz-cancel` and drops local pending state. The native host continues
+generating and the eventual reply is discarded by the CS. This wastes LLM cycles.
+
+**Follow-up**: Issue #96 tracks Option B — adding a `quiz-cancel-request` wire
+frame so the host can abort the in-flight fiber and stop billing LLM tokens.
+
+### Error UX
+
+Each wire-level `ErrorReason` and each extension-internal transport failure maps
+to a `DisplayErrorClass` in `src/lib/dom/error-classes.ts`, which in turn maps
+to a (title, body, CTA) `ErrorUISpec`. CTAs are:
+
+- `retry` — emits `quiz-retry`; CS re-fetches the quiz.
+- `open-options` — opens the options page so the user can fix credentials.
+- `install-host` — opens the project README install section in a new tab.
+- `dismiss` — closes the modal.

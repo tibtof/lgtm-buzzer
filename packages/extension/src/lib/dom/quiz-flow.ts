@@ -4,9 +4,34 @@ import {
   DOM_EVENTS,
   QuizSubmitEventDetailSchema,
   QuizCancelEventDetailSchema,
+  QuizRetryEventDetailSchema,
   emitDOMEvent,
   addDOMEventListener,
 } from "./dom-events.js";
+
+// ---------------------------------------------------------------------------
+// Error marker strings (exported for use in error-classes.ts — ADR-24)
+// Consumers import these to avoid string-literal drift.
+// ---------------------------------------------------------------------------
+
+/**
+ * Marker strings emitted by `createQuizFlowController` as error frame messages.
+ *
+ * `classifyError` in `error-classes.ts` imports these to recognise
+ * transport failures without duplicating the string literals.
+ */
+export const QUIZ_FLOW_ERROR_MARKERS = {
+  /** Emitted when the SW responds with a frame that fails CSResponseSchema. */
+  invalidSwResponse: "invalid SW response",
+  /** Prefix for unexpected frame kinds returned to quiz-request. */
+  unexpectedReplyKindPrefix: "Unexpected reply kind:",
+  /** Prefix emitted when sendFrame itself throws (should never happen per ADR-17). */
+  sendFrameThrewPrefix: "sendFrame threw:",
+  /** Prefix emitted when replayApprove throws. */
+  replayFailedPrefix: "replay failed:",
+  /** Emitted when quiz-retry fires but there is no active PR. */
+  noActivePr: "no active PR",
+} as const;
 import { detectPRPage } from "./page-detection.js";
 import type { InterceptedApproveEvent } from "./approve-intercept.js";
 import type { NavigationWatcher } from "./navigation.js";
@@ -387,6 +412,88 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   };
 
   // ---------------------------------------------------------------------------
+  // Quiz-retry handler (modal → CS) — ADR-24
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Handles the quiz-retry DOM event emitted by the modal when the user
+   * clicks "Retry" (in error state) or "Try Again" (in failed state).
+   *
+   * Looks up the existing pending Approve for `requestId`. If still alive,
+   * re-uses its `blocked` event and `pr`. If already dropped (the error path
+   * calls `dropPending`), falls back to `currentPR` to synthesise a fresh
+   * `PendingApprove` without a new approve interception.
+   *
+   * A new `requestId` and `correlationId` are allocated in all cases so the
+   * modal and correlation map stay consistent.
+   */
+  const onQuizRetry = (detail: { requestId: string }): void => {
+    const { requestId: oldRequestId } = detail;
+
+    // The old pending entry is usually already dropped by the error handler.
+    // If somehow it is still alive, preserve the blocked event.
+    const oldPending = dropPending(oldRequestId);
+
+    // Determine the PR to query. Retry is a re-fetch of the quiz only —
+    // the user is already past the Approve click.
+    let pr: PRIdentifier | null = null;
+    const blocked: PendingApprove["blocked"] | undefined = oldPending?.blocked;
+
+    if (oldPending !== undefined) {
+      pr = oldPending.pr;
+    } else if (currentPR !== null) {
+      pr = currentPR;
+      // No `blocked` event — a retry never re-replays the approve action
+      // directly. The fresh quiz-passed path handles replay normally.
+    }
+
+    if (pr === null) {
+      logger?.warn("[lgtm-buzzer:cs] quiz-retry fired but no active PR — cannot retry", {
+        oldRequestId,
+      });
+      emitDOMEvent(doc, DOM_EVENTS.quizResult, {
+        requestId: oldRequestId,
+        outcome: {
+          kind: "error",
+          reason: "internal",
+          message: "no active PR",
+        },
+      });
+      return;
+    }
+
+    // Allocate fresh identifiers.
+    const freshRequestId = newRequestId();
+    const correlationId = newCorrelationId();
+
+    const freshPending: PendingApprove = {
+      requestId: freshRequestId,
+      // If we had an old blocked event, carry it forward so pass → replay works.
+      blocked: blocked ?? {
+        // Minimal stub — kind = github so replayApprove has something to call.
+        // The actual replay only fires on quiz-passed; if the blocked event is
+        // gone we cannot replay, but we still want the quiz to proceed.
+        kind: "github",
+        pr,
+        form: doc.createElement("form"),
+        submitter: null,
+      },
+      pr,
+    };
+    pending.set(freshRequestId, freshPending);
+
+    // Emit the quiz-request DOM event so the modal transitions to generating.
+    emitDOMEvent(doc, DOM_EVENTS.quizRequest, {
+      requestId: freshRequestId,
+      correlationId,
+      pr,
+    });
+
+    // Kick off the async frame round-trip.
+    void sendQuizRequest(freshRequestId, freshPending, correlationId);
+  };
+
+  // ---------------------------------------------------------------------------
   // Navigation handlers (platform-agnostic via NavigationWatcher)
   // ---------------------------------------------------------------------------
 
@@ -445,7 +552,14 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
         onQuizCancel,
         logger,
       );
-      disposers.push(disposeSubmit, disposeCancel);
+      const disposeRetry = addDOMEventListener(
+        doc,
+        DOM_EVENTS.quizRetry,
+        QuizRetryEventDetailSchema,
+        onQuizRetry,
+        logger,
+      );
+      disposers.push(disposeSubmit, disposeCancel, disposeRetry);
     },
 
     stop: (): void => {
