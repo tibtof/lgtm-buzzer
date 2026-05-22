@@ -18,12 +18,14 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "clean": "tsc -b --clean"
+    "clean": "tsc -b --clean",
+    "record:ado": "httptape record --upstream https://dev.azure.com --fixtures ./fixtures --config ./httptape.sanitize.json"
   },
   "dependencies": {
     "@lgtm-buzzer/core": "*",
     "@lgtm-buzzer/protocol": "*",
     "monadyssey": "2.0.1",
-    "monadyssey-fetch": "2.0.1"
+    "monadyssey-fetch": "2.0.1",
+    "zod": "4.4.3"
   }
 }
