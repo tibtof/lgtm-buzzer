@@ -1,0 +1,42 @@
+diff --git a/src/cache.rs b/src/cache.rs
+--- a/src/cache.rs
++++ b/src/cache.rs
+@@ -12,14 +12,14 @@ pub struct Cache<'a> {
+     store: &'a HashMap<String, Vec<u8>>,
+ }
+
+-impl<'a> Cache<'a> {
++impl<'cache> Cache<'cache> {
+     /// Look up a key and return a borrowed slice of the stored bytes.
+     ///
+     /// Returns `None` if the key is not present.
+-    pub fn get(&self, key: &str) -> Option<&[u8]> {
++    pub fn get<'key>(&'cache self, key: &'key str) -> Option<&'cache [u8]> {
+         self.store.get(key).map(|v| v.as_slice())
+     }
+ }
+diff --git a/src/cache_test.rs b/src/cache_test.rs
+--- a/src/cache_test.rs
++++ b/src/cache_test.rs
+@@ -0,0 +1,22 @@
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::HashMap;
++
++    #[test]
++    fn test_get_returns_none_for_missing_key() {
++        let store = HashMap::new();
++        let cache = Cache { store: &store };
++        assert!(cache.get("missing").is_none());
++    }
++
++    #[test]
++    fn test_get_returns_bytes_for_present_key() {
++        let mut store = HashMap::new();
++        store.insert("hello".to_string(), b"world".to_vec());
++        let cache = Cache { store: &store };
++        let result = cache.get("hello");
++        assert_eq!(result, Some(b"world".as_ref()));
++    }
++}

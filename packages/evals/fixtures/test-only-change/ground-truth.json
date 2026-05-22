@@ -1,0 +1,11 @@
+{
+  "expectedSymbols": [
+    "parseCsv",
+    "CRLF",
+    "trailing newline",
+    "quoted fields",
+    "csv-parser.test.ts",
+    "header-only"
+  ],
+  "notes": "Tests added, source untouched. The quiz should reference the specific edge cases tested (CRLF, trailing newline, quoted commas, empty input, header-only). It must not hallucinate source changes."
+}

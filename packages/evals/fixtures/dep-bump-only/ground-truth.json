@@ -1,0 +1,10 @@
+{
+  "expectedSymbols": [
+    "zod",
+    "3.22.4",
+    "4.0.0",
+    "package.json",
+    "package-lock.json"
+  ],
+  "notes": "Edge case: almost no semantic content. The quiz should mention the specific library (zod), the old version (3.22.4), and the new version (4.0.0). A major-version bump has breaking-change implications — at least one question should probe that."
+}

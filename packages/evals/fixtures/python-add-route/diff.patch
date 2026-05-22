@@ -1,0 +1,62 @@
+diff --git a/app/routes/orders.py b/app/routes/orders.py
+--- a/app/routes/orders.py
++++ b/app/routes/orders.py
+@@ -1,6 +1,9 @@
+ from flask import Blueprint, request, jsonify
++from app.services.order_service import create_order, OrderValidationError
+ from app.auth import require_auth
+
+ orders_bp = Blueprint("orders", __name__, url_prefix="/api/v1/orders")
+
++@orders_bp.route("", methods=["POST"])
++@require_auth
++def create_order_route():
++    """Create a new order. Requires authentication."""
++    data = request.get_json(silent=True)
++    if data is None:
++        return jsonify({"error": "invalid JSON body"}), 400
++
++    try:
++        order = create_order(
++            user_id=request.user_id,
++            items=data.get("items", []),
++            shipping_address=data.get("shipping_address"),
++        )
++        return jsonify(order.to_dict()), 201
++    except OrderValidationError as exc:
++        return jsonify({"error": str(exc), "code": "validation_failed"}), 422
+diff --git a/app/routes/orders_test.py b/app/routes/orders_test.py
+new file mode 100644
+--- /dev/null
++++ b/app/routes/orders_test.py
+@@ -0,0 +1,30 @@
++import pytest
++from app import create_app
++
++@pytest.fixture
++def client():
++    app = create_app(testing=True)
++    with app.test_client() as c:
++        yield c
++
++def test_create_order_requires_auth(client):
++    resp = client.post("/api/v1/orders", json={"items": []})
++    assert resp.status_code == 401
++
++def test_create_order_rejects_invalid_json(client, auth_headers):
++    resp = client.post(
++        "/api/v1/orders",
++        data="not-json",
++        content_type="text/plain",
++        headers=auth_headers,
++    )
++    assert resp.status_code == 400
++
++def test_create_order_returns_422_on_validation_error(client, auth_headers, mocker):
++    mocker.patch(
++        "app.routes.orders.create_order",
++        side_effect=OrderValidationError("items must not be empty"),
++    )
++    resp = client.post("/api/v1/orders", json={"items": []}, headers=auth_headers)
++    assert resp.status_code == 422
++    assert resp.json["code"] == "validation_failed"

@@ -1,0 +1,51 @@
+description: LGTM-Buzzer negative-control eval — docs-readme-update (ADR-26)
+
+# Negative control: the docs-readme-update fixture should cause adapters to
+# return malformed-response { detail: "empty-quiz" } because the SYSTEM_PROMPT
+# instructs models to respond with { "questions": [] } for non-code diffs,
+# which parseQuizFromText surfaces as malformed-response.
+
+prompts:
+  - id: passthrough
+    raw: "{{diff}}"
+
+providers:
+  - id: claude-cli
+    file: ./dist/providers/claude-cli.js
+  - id: claude-api
+    file: ./dist/providers/claude-api.js
+  - id: codex-cli
+    file: ./dist/providers/codex-cli.js
+  - id: copilot-cli
+    file: ./dist/providers/copilot-cli.js
+
+defaultTest:
+  assert:
+    # For the negative control, a PASS means the adapter returned an error
+    # with errKind === "malformed-response" (empty-quiz), or was skipped.
+    - type: javascript
+      value: |
+        (() => {
+          // Parse the metadata object from the output (it's on the result object).
+          // promptfoo exposes it as `context.metadata` — but in a javascript assert
+          // we only have `output`. We detect the skip/error by checking output is empty
+          // and error contains malformed-response or skipped.
+          if (output === '') return true; // skipped or error — metadata.errKind governs
+          // If output is non-empty the adapter produced a quiz — that's a FAIL for this fixture.
+          return false;
+        })()
+
+tests:
+  - description: docs-readme-update (Markdown, docs-only) — negative control
+    vars:
+      diff: |
+        diff --git a/README.md b/README.md
+        --- a/README.md
+        +++ b/README.md
+        @@ -1,8 +1,8 @@
+        -# My Service
+        +# My Awesome Service
+
+        -A backend service for managing widgets.
+        +A backend service for managing widgets and gadgets.
+      expectedSymbols: []

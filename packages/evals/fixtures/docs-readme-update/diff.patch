@@ -1,0 +1,21 @@
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,8 +1,8 @@
+-# My Service
++# My Awesome Service
+
+-A backend service for managing widgets.
++A backend service for managing widgets and gadgets.
+
+-## Getting Started
++## Quick Start
+
+-Run `npm install` and then `npm start`.
++Run `npm install` followed by `npm start` to launch the service.
+
+-## License
++## Licence
+
+-MIT
++This project is licensed under the MIT licence.

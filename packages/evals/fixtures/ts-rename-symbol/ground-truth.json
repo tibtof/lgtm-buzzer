@@ -1,0 +1,12 @@
+{
+  "expectedSymbols": [
+    "gateReview",
+    "assessReview",
+    "checkApproval",
+    "evaluateApproval",
+    "review-gate",
+    "approval-checker",
+    "dispatcher"
+  ],
+  "notes": "A pure rename across four files. The quiz should probe which symbols were renamed and in how many files, to detect whether the reviewer tracked the cross-file change."
+}

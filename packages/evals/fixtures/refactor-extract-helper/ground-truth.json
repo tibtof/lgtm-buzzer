@@ -1,0 +1,12 @@
+{
+  "expectedSymbols": [
+    "formatDate",
+    "generateReport",
+    "report-generator",
+    "format-date",
+    "padStart",
+    "getMonth",
+    "createdAt"
+  ],
+  "notes": "Pure refactor: no behaviour change. The quiz should probe that the behaviour is preserved (same YYYY-MM-DD format, same local time), that the function was moved to a new module, and why extraction was done (reuse). A shallow quiz might only note 'a function was moved' without addressing the no-behaviour-change invariant."
+}

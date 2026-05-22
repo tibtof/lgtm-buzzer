@@ -1,0 +1,4 @@
+# Ignore all generated eval result files except the committed baseline.
+*
+!.gitignore
+!baseline.json

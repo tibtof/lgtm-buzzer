@@ -1,0 +1,12 @@
+{
+  "expectedSymbols": [
+    "Cache",
+    "'cache",
+    "'key",
+    "get",
+    "Option<&'cache [u8]>",
+    "store",
+    "as_slice"
+  ],
+  "notes": "Refactors lifetime annotations on a Cache struct's impl block and get method. The new lifetimes explicitly separate the cache lifetime from the key lifetime, preventing borrowck issues. Quiz should probe what the lifetime rename achieves and what the return type's lifetime guarantee means."
+}

@@ -1,0 +1,57 @@
+description: LGTM-Buzzer quiz-quality evals (v1, ADR-26)
+
+# The prompt is a passthrough: the diff is forwarded verbatim to the provider's
+# callApi. The actual SYSTEM_PROMPT is injected by each adapter's factory, not here.
+# This keeps the eval measuring the adapter-as-deployed, not a reconstructed prompt.
+prompts:
+  - id: passthrough
+    raw: "{{diff}}"
+
+providers:
+  - id: claude-cli
+    file: ./dist/providers/claude-cli.js
+  - id: claude-api
+    file: ./dist/providers/claude-api.js
+  - id: codex-cli
+    file: ./dist/providers/codex-cli.js
+  - id: copilot-cli
+    file: ./dist/providers/copilot-cli.js
+
+defaultTest:
+  assert:
+    # 1. Output is valid JSON (or empty for skipped cells).
+    - type: javascript
+      value: "output === '' || (() => { try { JSON.parse(output); return true; } catch { return false; } })()"
+
+    # 2. Schema conformance: LlmQuizSchema.safeParse passes; correctChoiceIndex in bounds.
+    - type: javascript
+      value: file://./dist/asserts/schema-conformance.js
+
+    # 3. Symbol grounding: at least one expectedSymbol appears in the output.
+    - type: javascript
+      value: |
+        (() => {
+          if (output === '') return true; // skipped cells pass
+          const syms = vars.expectedSymbols;
+          if (!Array.isArray(syms) || syms.length === 0) return true;
+          return syms.some(s => output.includes(s));
+        })()
+
+    # 4. LLM rubric: relevance / difficulty / discrimination scored 1-5.
+    #    Average >= 3.5 AND per-axis minimum >= 2.
+    #    Uses claude-sonnet-4-6 as judge. Advisory in v1 — failures surface in
+    #    the report but do not block the run (threshold: 0 means always pass).
+    - type: llm-rubric
+      provider: anthropic:messages:claude-sonnet-4-6
+      value: file://./src/asserts/rubric.md
+      threshold: 0
+
+    # 5. Latency advisory (90s for CLI adapters; API adapters use 20s timeout in provider).
+    - type: javascript
+      value: "true"
+      # Real latency check: uncomment after baseline is established.
+      # - type: latency
+      #   threshold: 90000
+
+# Tests are generated at run time by scripts/generate-tests.mjs.
+tests: file://./tests.generated.json

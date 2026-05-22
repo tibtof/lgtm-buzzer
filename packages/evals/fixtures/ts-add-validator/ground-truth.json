@@ -1,0 +1,12 @@
+{
+  "expectedSymbols": [
+    "validateEmail",
+    "EmailValidationError",
+    "MAX_EMAIL_LENGTH",
+    "EMAIL_REGEX",
+    "too-long",
+    "format",
+    "trimmed.toLowerCase"
+  ],
+  "notes": "The diff adds a pure validation function with three discriminated error variants. A quiz should probe the normalisation (lowercase), the 254-char limit, and which error kind maps to each failure mode."
+}

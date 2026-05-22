@@ -1,0 +1,15 @@
+{
+  "expectedSymbols": [
+    "create_order_route",
+    "OrderValidationError",
+    "create_order",
+    "require_auth",
+    "shipping_address",
+    "validation_failed",
+    "/api/v1/orders",
+    "silent=True",
+    "201",
+    "422"
+  ],
+  "notes": "New Flask POST route with auth decorator. Quiz should probe status codes, auth requirement, invalid-JSON handling, and the 422 path with OrderValidationError."
+}

@@ -1,0 +1,64 @@
+{
+  "fixtures": [
+    {
+      "slug": "ts-add-validator",
+      "language": "TypeScript",
+      "shape": "new-function",
+      "expectedSymbols": ["validateEmail", "EmailValidationError", "MAX_EMAIL_LENGTH", "EMAIL_REGEX", "too-long", "format", "trimmed.toLowerCase"]
+    },
+    {
+      "slug": "ts-rename-symbol",
+      "language": "TypeScript",
+      "shape": "rename",
+      "expectedSymbols": ["gateReview", "assessReview", "checkApproval", "evaluateApproval", "review-gate", "approval-checker", "dispatcher"]
+    },
+    {
+      "slug": "go-fix-nil-deref",
+      "language": "Go",
+      "shape": "bug-fix",
+      "expectedSymbols": ["GetByID", "ErrUserNotFound", "UserStore", "user == nil", "store: user not found", "TestGetByID_NilUser"]
+    },
+    {
+      "slug": "python-add-route",
+      "language": "Python",
+      "shape": "new-route",
+      "expectedSymbols": ["create_order_route", "OrderValidationError", "create_order", "require_auth", "shipping_address", "validation_failed", "/api/v1/orders", "silent=True", "201", "422"]
+    },
+    {
+      "slug": "rust-borrow-fix",
+      "language": "Rust",
+      "shape": "lifetime-fix",
+      "expectedSymbols": ["Cache", "'cache", "'key", "get", "Option<&'cache [u8]>", "store", "as_slice"]
+    },
+    {
+      "slug": "sql-migration",
+      "language": "SQL",
+      "shape": "migration",
+      "expectedSymbols": ["orders_set_updated_at", "orders_updated_at", "created_at", "updated_at", "BEFORE UPDATE", "TIMESTAMPTZ", "1970-01-01", "orders"]
+    },
+    {
+      "slug": "dep-bump-only",
+      "language": "n/a",
+      "shape": "dep-bump",
+      "expectedSymbols": ["zod", "3.22.4", "4.0.0", "package.json", "package-lock.json"]
+    },
+    {
+      "slug": "refactor-extract-helper",
+      "language": "TypeScript",
+      "shape": "refactor",
+      "expectedSymbols": ["formatDate", "generateReport", "report-generator", "format-date", "padStart", "getMonth", "createdAt"]
+    },
+    {
+      "slug": "test-only-change",
+      "language": "TypeScript",
+      "shape": "test-only",
+      "expectedSymbols": ["parseCsv", "CRLF", "trailing newline", "quoted fields", "csv-parser.test.ts", "header-only"]
+    }
+  ],
+  "negativeControl": {
+    "slug": "docs-readme-update",
+    "language": "Markdown",
+    "shape": "docs-only",
+    "expectedErrKind": "malformed-response"
+  }
+}

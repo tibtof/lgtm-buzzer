@@ -1,0 +1,39 @@
+diff --git a/src/parser/csv-parser.test.ts b/src/parser/csv-parser.test.ts
+--- a/src/parser/csv-parser.test.ts
++++ b/src/parser/csv-parser.test.ts
+@@ -1,6 +1,37 @@
+ import { describe, it, expect } from "vitest";
+ import { parseCsv } from "./csv-parser.js";
+
++describe("parseCsv — edge cases added in this PR", () => {
++  it("handles CRLF line endings", () => {
++    const input = "name,age\r\nAlice,30\r\nBob,25\r\n";
++    const result = parseCsv(input);
++    expect(result).toEqual([
++      { name: "Alice", age: "30" },
++      { name: "Bob", age: "25" },
++    ]);
++  });
++
++  it("handles a trailing newline without producing an extra empty row", () => {
++    const input = "id,val\n1,a\n2,b\n";
++    const result = parseCsv(input);
++    expect(result).toHaveLength(2);
++  });
++
++  it("returns an empty array for an empty string", () => {
++    expect(parseCsv("")).toEqual([]);
++  });
++
++  it("handles quoted fields with embedded commas", () => {
++    const input = `col1,col2\n"hello, world",42`;
++    const result = parseCsv(input);
++    expect(result).toEqual([{ col1: "hello, world", col2: "42" }]);
++  });
++
++  it("handles a header-only file with no data rows", () => {
++    const input = "a,b,c\n";
++    const result = parseCsv(input);
++    expect(result).toHaveLength(0);
++  });
++});

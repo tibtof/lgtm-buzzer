@@ -1,0 +1,41 @@
+diff --git a/src/domain/review-gate.ts b/src/domain/review-gate.ts
+--- a/src/domain/review-gate.ts
++++ b/src/domain/review-gate.ts
+@@ -1,10 +1,10 @@
+-import { checkApproval } from "./approval-checker.js";
++import { evaluateApproval } from "./approval-checker.js";
+ import type { ReviewContext } from "./types.js";
+
+-export const gateReview = (ctx: ReviewContext): boolean => {
+-  return checkApproval(ctx);
++export const assessReview = (ctx: ReviewContext): boolean => {
++  return evaluateApproval(ctx);
+ };
+diff --git a/src/domain/approval-checker.ts b/src/domain/approval-checker.ts
+--- a/src/domain/approval-checker.ts
++++ b/src/domain/approval-checker.ts
+@@ -1,7 +1,7 @@
+ import type { ReviewContext } from "./types.js";
+
+-export const checkApproval = (ctx: ReviewContext): boolean => {
++export const evaluateApproval = (ctx: ReviewContext): boolean => {
+   return ctx.score >= ctx.threshold;
+ };
+diff --git a/src/host/dispatcher.ts b/src/host/dispatcher.ts
+--- a/src/host/dispatcher.ts
++++ b/src/host/dispatcher.ts
+@@ -3,7 +3,7 @@
+-import { gateReview } from "../domain/review-gate.js";
++import { assessReview } from "../domain/review-gate.js";
+
+-  const result = gateReview(context);
++  const result = assessReview(context);
+diff --git a/src/host/dispatcher.test.ts b/src/host/dispatcher.test.ts
+--- a/src/host/dispatcher.test.ts
++++ b/src/host/dispatcher.test.ts
+@@ -5,6 +5,6 @@
+-import { gateReview } from "../domain/review-gate.js";
++import { assessReview } from "../domain/review-gate.js";
+
+-  vi.spyOn(reviewGate, "gateReview");
++  vi.spyOn(reviewGate, "assessReview");

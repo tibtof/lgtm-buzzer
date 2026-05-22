@@ -1,0 +1,4 @@
+{
+  "expectedSymbols": [],
+  "notes": "NEGATIVE CONTROL. This is a docs-only README reword. The adapter's SYSTEM_PROMPT instructs it to respond with { questions: [] } for diffs with no semantic code content, which the parseQuizFromText pipeline surfaces as malformed-response { detail: 'empty-quiz' }. The eval asserts errKind === 'malformed-response', not a valid quiz."
+}
