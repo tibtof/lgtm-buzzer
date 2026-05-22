@@ -2145,3 +2145,207 @@ Coverage target: branch coverage of every `DecodeError` and `WriteError` variant
 - **Security posture**: every byte from stdin passes through `parseFrame` (ADR-7) before any domain code sees it. The framing layer is the boundary CLAUDE.md §Functional idioms #7 requires.
 - **Reversibility**: high. Single workspace, no external consumers yet, no persisted data.
 - **#11 absorbed** — dev lands both #10 and #11 in a single PR.
+
+---
+
+## ADR-9: `spawnIO` helper in a new `adapter-shared` workspace, with bounded SIGTERM→SIGKILL cancellation
+**Date**: 2026-05-22
+**Issue**: #32
+**Status**: Accepted
+
+### Context
+
+CLAUDE.md §"spawnIO contract" already specifies the binding signature, semantics, and three-variant error model for the helper that every LLM-CLI adapter (#36, #45, #46) composes on top of. Idiom #4 narrows the implementation choice: only the file defining `spawnIO` may import `execa` or `node:child_process`. M2 cannot land an LLM adapter without this primitive — get cancellation wrong and a forgotten child process holding an LLM connection is a release-blocker bug.
+
+Six open questions the contract doesn't pre-decide:
+
+1. **Where the helper lives** — single CLI adapter can't own it (sibling-import inversion).
+2. **`execa` vs `node:child_process.spawn`** — both allowed by idiom #4.
+3. **How cancellation flows through monadyssey** — `IO.cancellable` exists; we need cancellation reified into `SpawnError`, not surfaced as `Cancelled`.
+4. **SIGTERM→grace→SIGKILL choreography** — including double-kill avoidance.
+5. **`spawn-failed` vs `process-failed` distinction** — different Node events.
+6. **Args mutability defense in depth** — TS `readonly` blocks compile-time only.
+
+### Decision
+
+#### Decision 1 — New `packages/adapters/_shared/` workspace
+
+Create `@lgtm-buzzer/adapter-shared` as a sibling of `claude-cli`, `codex-cli`, etc. Exports `spawnIO` + types.
+
+Why not inside `claude-cli`: inverts the "siblings independent" reading.
+Why not under `core`: core forbidden from monadyssey IO + `node:*`.
+Why a sibling not a parent: the existing `packages/adapters/*` workspaces glob + ESLint scope pick it up with zero config edits.
+Naming: leading underscore (`_shared`) signals "internal primitive, not an adapter."
+
+Dep direction reaffirmed: `protocol ← core ← adapter-shared ← {claude-cli, codex-cli, copilot-cli, github, ado} ← host`. The "one dep set per adapter — no sibling pollution" rule reads as "no leaking CLI-specific deps into siblings," not "every CLI adapter must reimplement spawnIO."
+
+#### Decision 2 — `node:child_process.spawn` (not execa)
+
+Zero unique value for v1's three Unix-targeted LLM CLIs:
+- Never need shell expansion (idiom #5 of the contract: `shell: false` always).
+- The careful SIGTERM→grace→SIGKILL choreography we want is *more* precise than execa's default "kill on cancel".
+- One fewer transitive dep.
+- Windows out of scope for v1 (Chrome-first, locked decision).
+
+`adapter-shared` declares only `monadyssey@2.0.1`.
+
+#### Decision 3 — `IO.cancellable` + sentinel-tagged-throw bridge
+
+```ts
+const THROWN_SENTINEL = Symbol.for("@lgtm-buzzer/adapter-shared/spawn-thrown");
+
+type ThrownSpawnError = { readonly [THROWN_SENTINEL]: true; readonly error: SpawnError };
+
+export const spawnIO = (
+  command: string,
+  args: readonly string[],
+  stdin?: string,
+  options?: { readonly graceMs?: number },
+): IO<SpawnError, SpawnOutput> =>
+  IO.cancellable<SpawnError, SpawnOutput>(
+    (signal) => runChildProcess(command, [...args], stdin, options?.graceMs ?? 5000, signal),
+    liftSpawnError,
+  );
+```
+
+The inner promise rejects with `ThrownSpawnError(SpawnError{...})`; `liftSpawnError` unwraps. Cancellation is reified into `SpawnError.cancelled` — callers never see a runtime `Cancelled` outcome from this helper.
+
+#### Decision 4 — SIGTERM→grace→SIGKILL choreography
+
+- On abort: `child.kill("SIGTERM")`, `setTimeout(graceMs, () => child.kill("SIGKILL"))`.
+- On natural exit: `clearTimeout(killTimer)` to avoid double-kill on PID reuse.
+- `onAbort` is `{ once: true }`; removed on exit.
+- `signal.aborted` check precedes `code` check (cancellation invariant beats lucky-completion).
+- Default `graceMs = 5000`. Negative/non-finite values fall back to 5000.
+- `shell: false` hardcoded; no `options.shell` exposed.
+
+#### Decision 5 — `spawn-failed` vs `process-failed`
+
+| Node event | Surfaces as |
+|---|---|
+| `'error'` (`ENOENT`/`EACCES`/`EPERM`) | `{ kind: "spawn-failed", reason: "${code}: ${msg}" }` |
+| `'exit'` with code !== 0 (not aborted) | `{ kind: "process-failed", exitCode, stderr }` |
+| `signal.aborted` set | `{ kind: "cancelled", signal: "SIGTERM" \| "SIGKILL" }` |
+
+`spawn-failed` = configuration error; `process-failed` = retry/input fix.
+
+#### Decision 6 — Defensive args copy
+
+`readonly string[]` at the type level; internal `[...args]` immediately before spawn defends against type-stripped callers mutating after construction.
+
+### Affected workspaces
+
+`packages/adapters/_shared/` (new). Root config edits: `tsconfig.json` (references), `vitest.config.ts` (alias), `scripts/typecheck-tests.mjs` (test project).
+
+No edits to `core`, `protocol`, `host`, `extension`, or existing adapters. ESLint's existing `packages/adapters/**/*.ts` scope covers the new workspace.
+
+### Types
+
+`packages/adapters/_shared/src/errors.ts`:
+
+```ts
+export type SpawnError =
+  | { readonly kind: "spawn-failed"; readonly reason: string }
+  | { readonly kind: "process-failed"; readonly exitCode: number; readonly stderr: string }
+  | { readonly kind: "cancelled"; readonly signal: "SIGTERM" | "SIGKILL" };
+
+export type SpawnOutput = {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number;
+};
+```
+
+`packages/adapters/_shared/src/spawn-io.ts`:
+
+```ts
+export type SpawnOptions = {
+  readonly graceMs?: number;  // default 5000; non-finite/negative → 5000
+};
+
+export declare const spawnIO: (
+  command: string,
+  args: readonly string[],
+  stdin?: string,
+  options?: SpawnOptions,
+) => IO<SpawnError, SpawnOutput>;
+```
+
+`packages/adapters/_shared/src/index.ts` (barrel):
+
+```ts
+export { spawnIO } from "./spawn-io.js";
+export type { SpawnError, SpawnOutput, SpawnOptions } from "./spawn-io.js";
+```
+
+### File layout
+
+New files (all in `packages/adapters/_shared/`):
+
+```
+package.json          # name: @lgtm-buzzer/adapter-shared, dep: monadyssey@2.0.1 (exact)
+tsconfig.json         # extends ../../../tsconfig.base.json, types: ["node"]
+tsconfig.test.json    # noEmit test type-check
+src/index.ts          # barrel
+src/errors.ts         # SpawnError, SpawnOutput
+src/spawn-io.ts       # spawnIO + internal helpers (only file importing node:child_process)
+src/spawn-io.test.ts  # 8 binding test cases
+```
+
+Modified files (root):
+
+```
+tsconfig.json         # +1 reference entry
+vitest.config.ts      # +1 alias entry (@lgtm-buzzer/adapter-shared)
+scripts/typecheck-tests.mjs  # +1 TEST_PROJECTS entry
+```
+
+### Sequence
+
+Per-call sequence:
+
+1. Construction returns `IO<SpawnError, SpawnOutput>` (no subprocess yet).
+2. On `IO.cancellable` invocation, spawn the child with `shell: false`, `stdio: ["pipe", "pipe", "pipe"]`.
+3. Attach `signal.addEventListener("abort", onAbort, { once: true })`, stdout/stderr `'data'` collectors, `child.once("error", ...)`, `child.once("exit", ...)`.
+4. If `stdin` provided: `child.stdin.write(stdin); child.stdin.end()`. Otherwise: `child.stdin.end()` (EOF immediately).
+5a. Natural exit code 0 → resolve `{ stdout, stderr, exitCode: 0 }`.
+5b. Natural exit code !== 0 → reject `thrown(process-failed)`.
+5c. `error` event → reject `thrown(spawn-failed)`.
+5d. Cancellation, child cooperates → SIGTERM fires, exit follows within grace, reject `thrown(cancelled SIGTERM)`.
+5e. Cancellation, child ignores SIGTERM → grace elapses, SIGKILL fires, exit follows, reject `thrown(cancelled SIGKILL)`.
+6. `liftSpawnError` unwraps sentinel into IO's `Err` channel.
+
+### Error cases
+
+All five rows in Decision 5 + a fallback `{ kind: "spawn-failed", reason: "unexpected: ..." }` for the (should-not-happen) untagged-throw path.
+
+`throw` is never used in control flow. Every failure rejects an internal Promise with sentinel-tagged `SpawnError`.
+
+### Test strategy
+
+Eight binding `it()` blocks in `src/spawn-io.test.ts`, using `process.execPath` for portability:
+
+1. Happy path stdout: `["-e", "process.stdout.write('hello')"]` → `Ok { stdout: "hello", exitCode: 0 }`.
+2. Non-zero exit: `["-e", "process.exit(7)"]` → `Err process-failed { exitCode: 7 }`.
+3. stderr capture: `["-e", "process.stderr.write('nope'); process.exit(1)"]` → `Err process-failed { exitCode: 1, stderr: "nope" }`.
+4. Spawn failure: `"definitely-not-a-real-command-..."` → `Err spawn-failed` with `reason` containing `"ENOENT"`.
+5. Cancellation, cooperative: `["-e", "setInterval(()=>{},1e9)"]`, cancel immediately → `Err cancelled SIGTERM`; PID gone via `process.kill(pid, 0)` ESRCH.
+6. Cancellation, stubborn child: `["-e", "process.on('SIGTERM',()=>{}); setInterval(()=>{},1e9)"]` with `graceMs: 100` → `Err cancelled SIGKILL` within ~500ms; PID gone.
+7. Stdin single-shot: `spawnIO("cat", [], "hello\n")` → stdout `"hello\n"`. (POSIX cat; macOS+Linux only per locked decision.)
+8. No stdin → child sees EOF on first read.
+
+Optional ninth (recommended): defensive-copy test — mutate args after construction, assert subprocess saw original values.
+
+Total suite budget: under 5s. Per-test budget: 500ms (1000ms for test #6).
+
+Coverage target: every `SpawnError` variant has at least one forcing test.
+
+### Consequences
+
+- One new workspace (~150 LoC impl + ~200 LoC tests). No `execa`. Only `monadyssey@2.0.1` runtime dep.
+- Cancellation correctness is type-enforced: IO interpreter never sees `Cancelled` from this helper; reified into `SpawnError`.
+- Dep direction reads cleanly: every CLI adapter has one upstream sibling (`adapter-shared`); no CLI-to-CLI imports.
+- Future-extensibility deferred: no streaming stdout, no multi-write stdin, no `cwd`/`env` options. `SpawnOptions` shape allows adding them without breaking the signature.
+- Security: this primitive doesn't touch PR text; the diff-only invariant is enforced at each LLM adapter (one layer up).
+- Reversibility: high. If `IO.cancellable` semantics change or we want `execa` (Windows), only `spawn-io.ts` changes — public types, tests, callers stay identical.
+- Binding for #36/#45/#46: every LLM-CLI adapter delegates ALL subprocess lifecycle here. If cancellation is wrong, all three adapters are wrong. The 8 tests above ARE the contract.
