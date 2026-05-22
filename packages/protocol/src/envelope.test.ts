@@ -22,6 +22,52 @@ const VALID_ERROR = {
   payload: { reason: "internal", message: "something went wrong" },
 };
 
+const VALID_QUIZ_REQUEST = {
+  v: 1,
+  kind: "quiz-request",
+  correlationId: "cid-004",
+  payload: {
+    pr: { kind: "github", owner: "acme", repo: "api", number: 1 },
+    questionCount: 3,
+  },
+};
+
+const VALID_QUIZ_RESPONSE = {
+  v: 1,
+  kind: "quiz-response",
+  correlationId: "cid-005",
+  payload: {
+    quiz: {
+      id: "quiz-001",
+      questions: [
+        {
+          type: "multiple-choice",
+          id: "q1",
+          prompt: "What does this return?",
+          choices: [{ id: "c1", label: "null" }],
+        },
+      ],
+    },
+  },
+};
+
+const VALID_QUIZ_SUBMIT = {
+  v: 1,
+  kind: "quiz-submit",
+  correlationId: "cid-006",
+  payload: {
+    quizId: "quiz-001",
+    answers: [{ questionId: "q1", chosenChoiceId: "c1" }],
+  },
+};
+
+const VALID_QUIZ_RESULT = {
+  v: 1,
+  kind: "quiz-result",
+  correlationId: "cid-007",
+  payload: { passed: true, correct: 1, total: 1 },
+};
+
 describe("FrameSchema", () => {
   it("parses a well-formed ping frame", () => {
     const result = FrameSchema.safeParse(VALID_PING);
@@ -77,5 +123,37 @@ describe("FrameSchema", () => {
   it("rejects a frame with empty-string correlationId", () => {
     const result = FrameSchema.safeParse({ ...VALID_PING, correlationId: "" });
     expect(result.success).toBe(false);
+  });
+
+  it("parses a well-formed quiz-request frame", () => {
+    const result = FrameSchema.safeParse(VALID_QUIZ_REQUEST);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("quiz-request");
+    }
+  });
+
+  it("parses a well-formed quiz-response frame", () => {
+    const result = FrameSchema.safeParse(VALID_QUIZ_RESPONSE);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("quiz-response");
+    }
+  });
+
+  it("parses a well-formed quiz-submit frame", () => {
+    const result = FrameSchema.safeParse(VALID_QUIZ_SUBMIT);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("quiz-submit");
+    }
+  });
+
+  it("parses a well-formed quiz-result frame", () => {
+    const result = FrameSchema.safeParse(VALID_QUIZ_RESULT);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("quiz-result");
+    }
   });
 });

@@ -7,6 +7,7 @@ export const ErrorReasonSchema = z.enum([
   "unknown-message",
   "version-mismatch",
   "internal",
+  "unknown-quiz-id",
 ]);
 
 /** Discriminated reason for a wire-level error. */

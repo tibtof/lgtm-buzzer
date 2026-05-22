@@ -2,6 +2,10 @@ import { z } from "zod";
 import { PingFrameSchema } from "./messages/ping.js";
 import { PongFrameSchema } from "./messages/pong.js";
 import { ErrorFrameSchema } from "./messages/error.js";
+import { QuizRequestFrameSchema } from "./messages/quiz-request.js";
+import { QuizResponseFrameSchema } from "./messages/quiz-response.js";
+import { QuizSubmitFrameSchema } from "./messages/quiz-submit.js";
+import { QuizResultFrameSchema } from "./messages/quiz-result.js";
 
 export { PROTOCOL_VERSION, EnvelopeBase } from "./base.js";
 
@@ -10,6 +14,10 @@ export const FrameSchema = z.discriminatedUnion("kind", [
   PingFrameSchema,
   PongFrameSchema,
   ErrorFrameSchema,
+  QuizRequestFrameSchema,
+  QuizResponseFrameSchema,
+  QuizSubmitFrameSchema,
+  QuizResultFrameSchema,
 ]);
 
 /** A well-formed native-messaging frame after parsing. */
