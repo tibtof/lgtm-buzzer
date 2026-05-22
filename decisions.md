@@ -52,6 +52,43 @@ No issue in M0 or M1 routes non-diff PR text (description, title, commit message
 
 All twelve issues marked `Status: READY_FOR_ARCH` via comment. Awaiting architect.
 
+### 2026-05-22 — Verification-gate gap surfaced by PR #13
+
+**Issue created — M0 (FP foundation)**
+
+- #14 `chore(tooling): type-check test files in the verification gate` —
+  Areas: tooling. Depends on: nothing upstream. Likely **blocks #6**
+  (CI gate) unless the architect folds this work into #6.
+
+**Why filed**
+
+PR #13's review uncovered that the current gate (`npm run build &&
+npm test && npm run lint`) does not catch TypeScript type errors in
+`*.test.ts` files. `tsc -b` excludes test files via every workspace's
+`tsconfig.json`; Vitest's esbuild pipeline strips types without
+checking them; typescript-eslint's recommended rules are syntactic.
+Seven type-broken smoke tests nearly merged — and ADR-1's own
+smoke-test code sample inherited the same bug shape, which is the
+clearest possible signal that the gate must enforce this, not human
+review. The reviewer agent's ad-hoc `tsc --noEmit` sweep is a
+workaround, not a gate.
+
+**Open question flagged for the architect**
+
+Two implementation paths, both viable; architect must pick:
+(a) per-workspace `tsconfig.test.json` + `typecheck:tests` running
+`tsc --noEmit`, or (b) Vitest's built-in `--typecheck` mode. Plus a
+sequencing call: land #14 before #6, or fold #14 into #6.
+
+**Security posture**
+
+Not security-sensitive. Build/test tooling only; no path handling PR
+text, diffs, or LLM prompts is touched.
+
+**Status**
+
+#14 marked `Status: READY_FOR_ARCH` via comment. Awaiting architect.
+
 ## ADRs
 
 ## ADR-1: Install the FP foundation (monadyssey + monadyssey-fetch) at exact-pinned versions
