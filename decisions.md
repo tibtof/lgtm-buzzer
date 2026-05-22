@@ -89,6 +89,77 @@ text, diffs, or LLM prompts is touched.
 
 #14 marked `Status: READY_FOR_ARCH` via comment. Awaiting architect.
 
+### 2026-05-22 — M2/M3 backlog filed
+
+**Milestones touched**
+
+- Renamed M2 (#3) from `M2: spawnIO + first LLM adapter (claude-cli)` to `M2: First vertical slice (Chrome + claude-cli + GitHub)` to match the broader end-to-end vertical-slice scope. Description updated. `milestone:M2` label description updated.
+- Created M3 (#4): `M3: Functioning product (multi-LLM, ADO, polish, evals)`. New label `milestone:M3` created. New area labels created where missing: `area:docs`, `area:evals`, `area:e2e`. (`area:tooling` and `area:security-sensitive` already existed.)
+
+**Issues created — M2 (First vertical slice; Chrome + claude-cli + GitHub)**
+
+- #32 `feat(adapters): spawnIO helper that wraps subprocess execution in IO with bounded cancellation` — Areas: adapters. Depends on: nothing. The M2 kickoff and the single foundational adapter primitive per CLAUDE.md §spawnIO contract.
+- #33 `feat(core): LLMProvider port + Quiz domain types for diff-only quiz generation` — Areas: core, protocol, security-sensitive. Depends on: nothing within M2.
+- #34 `feat(core): VCSProvider port + PR-identifier and Diff domain types` — Areas: core, protocol, security-sensitive. Depends on: nothing within M2.
+- #35 `feat(protocol): quiz-request / quiz-response / quiz-submit / quiz-result wire-format messages` — Areas: protocol, security-sensitive. Depends on: #33, #34.
+- #36 `feat(adapters/claude-cli): first LLMProvider implementation that shells out to the claude CLI` — Areas: adapters, security-sensitive. Depends on: #32, #33.
+- #37 `feat(adapters/github): VCSProvider implementation that fetches PR diff bytes from the GitHub API` — Areas: adapters, security-sensitive. Depends on: #34.
+- #38 `feat(core): QuizSession aggregate composing VCSProvider + LLMProvider into the gate decision` — Areas: core, security-sensitive. Depends on: #33, #34.
+- #39 `feat(host): dispatcher routes quiz-request / quiz-submit to the QuizSession aggregate` — Areas: host, security-sensitive. Depends on: #35, #36, #37, #38.
+- #40 `feat(host): install script writes the Chrome native-messaging manifest to the per-OS path` — Areas: host, tooling, docs. Depends on: nothing.
+- #41 `feat(extension): service worker maintains a native-messaging port to the host and routes quiz frames` — Areas: extension, security-sensitive. Depends on: #35.
+- #42 `feat(extension): content script intercepts the Approve button on github.com PR review pages` — Areas: extension, security-sensitive. Depends on: #41, #43.
+- #43 `feat(extension): minimal viable quiz modal UI (questions, answers, submit, pass/fail)` — Areas: extension. Depends on: #41, #42.
+- #44 `docs: getting-started walkthrough for the M2 vertical slice (install, load, gate a real PR)` — Areas: docs, tooling. Depends on: #32–#43. M2 closer.
+
+**Issues created — M3 (Functioning product; multi-LLM, ADO, polish, evals)**
+
+- #45 `feat(adapters/codex-cli): second LLMProvider implementation backed by the codex CLI` — Areas: adapters, security-sensitive. Depends on: #32, #33, #36.
+- #46 `feat(adapters/copilot-cli): third LLMProvider implementation backed by gh copilot` — Areas: adapters, security-sensitive. Depends on: #32, #33, #36.
+- #47 `feat(adapters/ado): VCSProvider implementation that fetches PR diff bytes from Azure DevOps` — Areas: adapters, security-sensitive. Depends on: #34, #37.
+- #48 `feat(extension): content script intercepts Approve on dev.azure.com PRs` — Areas: extension, security-sensitive. Depends on: #42, #47.
+- #49 `feat(host): pick the active LLM and VCS adapters at runtime from user configuration` — Areas: host, adapters. Depends on: #45, #46, #47.
+- #50 `feat(extension): options page for picking LLM adapter and per-adapter settings` — Areas: extension. Depends on: #49.
+- #51 `test(extension): first Playwright e2e covering the happy-path quiz gate` — Areas: e2e, extension. Depends on: #44.
+- #52 `test(evals): promptfoo workspace with the first quiz-quality eval suite` — Areas: evals, security-sensitive. Depends on: #36.
+- #53 `feat(extension): quiz modal polish — error states, retry on transient errors, accessibility pass` — Areas: extension. Depends on: #41, #43.
+- #54 `chore(tooling): GitHub Actions workflow running npm run check on push and PR` — Areas: tooling. Depends on: nothing.
+- #55 `chore(tooling): packaging script produces extension zip + host tarball with install script` — Areas: tooling, host, extension. Depends on: #40, #54 (recommended).
+- #56 `docs: README + getting-started usable by an outside user` — Areas: docs. Depends on: every other M3 issue. M3 closer.
+
+**Recommended first M2 issue for the architect**
+
+#32 — the spawnIO helper. CLAUDE.md §spawnIO contract calls it out as the most important adapter primitive and the first thing the dev agent should scaffold. It has no upstream dependencies, every LLM adapter composes on top of it, and its cancellation tests are non-trivial enough that they deserve the first ADR of M2 to themselves.
+
+**Security posture (KEY DIFFERENTIATOR — diff-only invariant)**
+
+Twelve of the 25 new issues carry `area:security-sensitive` because they touch the LLM-prompt construction path, the diff-fetching path, or the wire-format messages that travel between the page (which can see non-diff PR text) and the host (which feeds the LLM):
+
+- M2: #33, #34, #35, #36, #37, #38, #39, #41, #42.
+- M3: #45, #46, #47, #48, #52.
+
+Each spec body explicitly forbids routing PR description / title / commit messages / labels / comments into the LLM prompt and calls out the binding rule from CLAUDE.md §Key differentiator. The architect must enforce this invariant in every ADR; the reviewer must reject any later change that adds such a field to the relevant port, adapter, or wire-format schema.
+
+**Out-of-scope (explicitly deferred past M3)**
+
+Safari port (locked decision: Safari is the "later browser" wrapped via the Xcode converter post-v1.0). Multi-user / team policy server. Telemetry of any kind. Server-side LLM. Persistent quiz/result analytics. Self-hosted ADO Server is best-effort only via #48.
+
+**Open questions surfaced (none block the architect; flagged for ADRs to resolve)**
+
+- #33 — question representation (multiple-choice / free-text / both); affects #43 and #52.
+- #33 / #34 — whether DTOs live in protocol vs. core, and the exact composition with session tokens (#35).
+- #34 — whether Diff is a single string or per-file list; affects prompt construction in #36 / #45 / #46.
+- #36 — exact prompt template wording; reviewer eyeballs for prompt-injection robustness.
+- #40 — Linux/Windows installer scope (recommend macOS + Linux for v1; Windows deferred).
+- #41 — MV3 service-worker lifecycle: keep the native port open vs. open per quiz.
+- #49 — config transport: chrome.storage round-trip via wire message vs. host-side config file.
+- #51 — stub host vs. in-process LLMProvider fake for Playwright.
+- #55 — single-file bundled host binary vs. shipping the workspace and relying on node.
+
+**Status**
+
+All 25 new issues (#32–#56) marked `Status: READY_FOR_ARCH` via comment. Awaiting architect; per CLAUDE.md sub-agent routing, dispatch sequentially starting with #32.
+
 ## ADRs
 
 ## ADR-1: Install the FP foundation (monadyssey + monadyssey-fetch) at exact-pinned versions
