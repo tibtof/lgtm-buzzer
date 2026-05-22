@@ -2813,3 +2813,307 @@ Coverage: `parsePRIdentifier` table-driven cases push the helper to ≥95%.
 - **`VCSProviderError.cancelled` unreachable via `Err` at v2.0.1** per ADR-10; kept for type contract + forward-compat.
 - **Reversibility high.** Brand drop is one type edit; identifier shape changes are additive.
 - **Binding for #37, #39, #43, #47.**
+
+---
+
+## ADR-13: Quiz wire-format messages (`quiz-request` / `quiz-response` / `quiz-submit` / `quiz-result`) in `protocol`
+**Date**: 2026-05-22
+**Issue**: #35
+**Status**: Accepted
+
+### Context
+
+ADR-7 shipped the envelope + ping/pong/error. ADR-11/12 shipped Quiz/PRIdentifier/Diff in `core`. M2 still needs the four payload-carrying frames that move the quiz across native messaging — without them, dispatcher (#39), service worker (#41), and modal UI (#43) have no shared vocabulary.
+
+Constraints:
+
+1. **`protocol` purity**: zod only. No `monadyssey`, no `core` imports. Branded IDs (`QuizId`/etc.) and `NonEmptyList` from core mirror to plain `z.string().min(1)` and `z.array(...).min(1)` on the wire.
+2. **Diff-only invariant**: no message DTO may carry PR description/title/commits/labels/comments. The diff itself isn't on the wire either — extension never sees diff bytes (host fetches via VCS adapter).
+3. **Gate integrity**: `quiz-response` flows host→extension on a channel the extension JS can inspect at will. The wire-format Quiz MUST NOT carry `correctChoiceId`. The host keeps correct answers server-side keyed by quiz ID and scores on submit.
+
+### Decision
+
+Four new frame schemas + one shared `PRIdentifier` DTO + one additive `ErrorReasonSchema` entry. No new runtime deps. No envelope structural change.
+
+#### Wire-shape choices (binding)
+
+| Choice | Decision |
+|---|---|
+| PR identifier transport | Parsed `PRIdentifierSchema` (discriminated union mirror); extension calls `parsePRIdentifier` first |
+| `quiz-request.questionCount` bounds | `z.number().int().min(1).max(10)` |
+| Branded IDs on the wire | `z.string().min(1)` |
+| `correctChoiceId` in `quiz-response` | **ABSENT** (binding for gate integrity) |
+| Session correlation | Host-side `Map<QuizId, ...>`; wire carries IDs only |
+| Unknown quiz ID on submit | New `ErrorReasonSchema` variant `"unknown-quiz-id"` |
+| `perQuestion` in `quiz-result` | Optional; present when host has feedback |
+
+#### Schemas
+
+**`packages/protocol/src/messages/pr-identifier.ts`**:
+
+```ts
+import { z } from "zod";
+
+export const GitHubPRIdentifierSchema = z.object({
+  kind: z.literal("github"),
+  owner: z.string().min(1),
+  repo: z.string().min(1),
+  number: z.number().int().positive(),
+});
+
+export const AdoPRIdentifierSchema = z.object({
+  kind: z.literal("ado"),
+  org: z.string().min(1),
+  project: z.string().min(1),
+  repo: z.string().min(1),
+  pullRequestId: z.number().int().positive(),
+});
+
+export const PRIdentifierSchema = z.discriminatedUnion("kind", [
+  GitHubPRIdentifierSchema,
+  AdoPRIdentifierSchema,
+]);
+
+export type PRIdentifierDTO = z.infer<typeof PRIdentifierSchema>;
+```
+
+TSDoc: reaffirms diff-only invariant — MUST NOT extend with description/title/comment fields without a dedicated ADR.
+
+**`packages/protocol/src/messages/quiz-request.ts`**:
+
+```ts
+export const QuizRequestPayloadSchema = z.object({
+  pr: PRIdentifierSchema,
+  questionCount: z.number().int().min(1).max(10),
+});
+
+export const QuizRequestFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("quiz-request"),
+  payload: QuizRequestPayloadSchema,
+});
+```
+
+Payload deliberately contains ONLY `pr` and `questionCount`. No description/title/comments — diff-only at the type level.
+
+**`packages/protocol/src/messages/quiz-response.ts`**:
+
+```ts
+export const ChoiceDTOSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+});
+
+export const QuestionDTOSchema = z.object({
+  type: z.literal("multiple-choice"),
+  id: z.string().min(1),
+  prompt: z.string().min(1),
+  choices: z.array(ChoiceDTOSchema).min(1),
+  explanation: z.string().min(1).optional(),
+});
+
+export const QuizDTOSchema = z.object({
+  id: z.string().min(1),
+  questions: z.array(QuestionDTOSchema).min(1),
+});
+
+export const QuizResponsePayloadSchema = z.object({
+  quiz: QuizDTOSchema,
+});
+
+export const QuizResponseFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("quiz-response"),
+  payload: QuizResponsePayloadSchema,
+});
+```
+
+**Binding (reviewer-enforced)**: `QuestionDTOSchema` has no `correctChoiceId` field. Adding one defeats the gate (extension JS can read frame payloads).
+
+`type: "multiple-choice"` discriminant matches `core.Question`'s v1 shape; reserves the slot for v2 free-text.
+
+The `explanation` field is post-submit display copy; NOT the correct-answer key. Reviewer confirms on the implementation PR that the host doesn't populate it with correct-choice giveaways.
+
+**`packages/protocol/src/messages/quiz-submit.ts`**:
+
+```ts
+export const SubmittedAnswerSchema = z.object({
+  questionId: z.string().min(1),
+  chosenChoiceId: z.string().min(1),
+});
+
+export const QuizSubmitPayloadSchema = z.object({
+  quizId: z.string().min(1),
+  answers: z.array(SubmittedAnswerSchema).min(1),
+});
+
+export const QuizSubmitFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("quiz-submit"),
+  payload: QuizSubmitPayloadSchema,
+});
+```
+
+`quizId` correlates back to the issued Quiz. If the host doesn't recognize it → `ErrorFrame { reason: "unknown-quiz-id" }`. Partial submits (fewer answers than questions) are allowed at the wire level; whether the host accepts them is policy.
+
+**`packages/protocol/src/messages/quiz-result.ts`**:
+
+```ts
+export const PerQuestionResultSchema = z.object({
+  questionId: z.string().min(1),
+  correct: z.boolean(),
+  explanation: z.string().min(1).optional(),
+});
+
+export const QuizResultPayloadSchema = z.object({
+  passed: z.boolean(),
+  correct: z.number().int().nonnegative(),
+  total: z.number().int().positive(),
+  perQuestion: z.array(PerQuestionResultSchema).optional(),
+});
+
+export const QuizResultFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("quiz-result"),
+  payload: QuizResultPayloadSchema,
+});
+```
+
+Reviewer note: `perQuestion[].explanation` is the LLM's own output; do NOT vary based on submitted answer (would let attackers diff explanations to deduce correct answers).
+
+**`packages/protocol/src/messages/error.ts`** (additive change):
+
+```ts
+export const ErrorReasonSchema = z.enum([
+  "schema-violation",
+  "unknown-message",
+  "version-mismatch",
+  "internal",
+  "unknown-quiz-id",
+]);
+```
+
+**`packages/protocol/src/envelope.ts`** (modified — extended `FrameSchema` union):
+
+```ts
+export const FrameSchema = z.discriminatedUnion("kind", [
+  PingFrameSchema,
+  PongFrameSchema,
+  ErrorFrameSchema,
+  QuizRequestFrameSchema,
+  QuizResponseFrameSchema,
+  QuizSubmitFrameSchema,
+  QuizResultFrameSchema,
+]);
+```
+
+`parseFrame` (ADR-7) automatically covers the new kinds — no signature change, no behavior change beyond the wider type.
+
+#### Affected workspaces
+
+`packages/protocol` only.
+
+#### File layout
+
+**New (10)**: 5 source + 5 test files under `packages/protocol/src/messages/`:
+- `pr-identifier.ts` + `.test.ts`
+- `quiz-request.ts` + `.test.ts`
+- `quiz-response.ts` + `.test.ts`
+- `quiz-submit.ts` + `.test.ts`
+- `quiz-result.ts` + `.test.ts`
+
+**Modified (5)**:
+- `envelope.ts` — extend FrameSchema union.
+- `messages/error.ts` — add `"unknown-quiz-id"` to enum.
+- `index.ts` — re-export new schemas + types.
+- `envelope.test.ts` — new happy-path cases for the four new kinds.
+- `parse.test.ts` — new round-trip cases.
+- `messages/error.test.ts` — case for new enum value.
+
+(6 files modified counting the two test updates as separate.)
+
+`index.ts` re-export block adds: `PRIdentifierSchema`, `GitHubPRIdentifierSchema`, `AdoPRIdentifierSchema`, all four QuizXFrameSchema/PayloadSchema pairs, `ChoiceDTOSchema`, `QuestionDTOSchema`, `QuizDTOSchema`, `SubmittedAnswerSchema`, `PerQuestionResultSchema`, plus all inferred types.
+
+#### Sequence
+
+End-to-end (lands across #38, #39, #41-area, #43-area):
+
+1. Content script detects Approve click, calls `parsePRIdentifier(url)`. Left → toast + abort. Right → forward to service worker.
+2. Service worker wraps in `QuizRequestFrame` (fresh UUID `correlationId`, `questionCount` from settings/default 3). Posts via native messaging.
+3. Host dispatcher runs `parseFrame`. Success + kind `"quiz-request"` → dispatches by `pr.kind`.
+4. VCS adapter fetches diff (`IO<VCSProviderError, Diff>`).
+5. `QuizSession.start` feeds diff + count to LLMProvider; receives `Quiz` (with `correctChoiceId`).
+6. **Host strips `correctChoiceId`** while building `QuizResponseFrame`. Simultaneously stores `Map<QuizId, Map<QuestionId, ChoiceId>>` in process memory keyed by quiz ID. Sends.
+7. Modal renders questions; user answers.
+8. Service worker sends `QuizSubmitFrame` with fresh `correlationId`.
+9. Host looks up answer map. Missing → `ErrorFrame { reason: "unknown-quiz-id" }`. Present → score, send `QuizResultFrame`, drop map entry (no replay).
+10. Extension: `passed: true` → remove gate, synthetic Approve click. `passed: false` → show per-question feedback, re-arm gate.
+
+**Diff-flow audit (KEY DIFFERENTIATOR)**: diff bytes leave the host only at step 5 (LLM CLI stdin via `spawnIO`). Wire frames in this ADR never carry diff bytes; extension never sees them.
+
+#### Error cases
+
+| Failure | ErrorFrame `reason` |
+|---|---|
+| Missing/out-of-bounds fields on `quiz-request` | `schema-violation` |
+| Malformed `PRIdentifier` (unknown kind) | `schema-violation` |
+| `quiz-submit` unknown `quizId` | `unknown-quiz-id` |
+| `quiz-submit` answers reference questions not in original quiz | `schema-violation` |
+| Unknown future `kind` | `unknown-message` |
+| LLM adapter failure | `internal` (with VCS/LLM error kind in `details`; no diff fragments, no URLs with query strings) |
+
+`parseFrame` total over `unknown`; `safeParse` doesn't throw.
+
+#### Test strategy
+
+**Per-message test files** (5 new):
+- `pr-identifier.test.ts` (8 cases): both happy paths; missing/unknown kind; missing/empty string fields; non-positive ints.
+- `quiz-request.test.ts` (6 cases): happy with each PR kind; out-of-bounds questionCount; missing pr; malformed nested PRIdentifier.
+- `quiz-response.test.ts` (8 cases): happy with 1 and N questions; empty questions/choices fails; missing discriminant fails; **`correctChoiceId` round-trip assertion (gate-integrity binding)**; missing `id` fails; explanation optional present/absent.
+- `quiz-submit.test.ts` (5 cases): 1 answer / N answers; empty fails; missing quizId/IDs; empty-string IDs.
+- `quiz-result.test.ts` (7 cases): pass + fail happy; with/without perQuestion; negative correct fails; total: 0 fails; per-question with explanation.
+
+**Existing test updates**:
+- `envelope.test.ts` — 4 new happy-path cases (one per new kind).
+- `parse.test.ts` — 4 new round-trip cases with TS narrowing.
+- `messages/error.test.ts` — add `"unknown-quiz-id"` case.
+
+**Gate integrity binding** in `quiz-response.test.ts`:
+
+```ts
+it("rejects or strips correctChoiceId on questions (gate integrity)", () => {
+  const payload = {
+    quiz: {
+      id: "q1",
+      questions: [{
+        type: "multiple-choice",
+        id: "qq1",
+        prompt: "?",
+        choices: [{ id: "c1", label: "a" }],
+        correctChoiceId: "c1", // MUST NOT survive
+      }],
+    },
+  };
+  const result = QuizResponsePayloadSchema.safeParse(payload);
+  if (result.success) {
+    expect("correctChoiceId" in result.data.quiz.questions[0]!).toBe(false);
+  }
+});
+```
+
+If the dev opts for `.strict()` on `QuestionDTOSchema`, flip to `expect(result.success).toBe(false)`. Either is acceptable; both prevent a host bug from leaking the correct answer.
+
+Coverage target: 90% on `protocol` (CLAUDE.md). Achievable — new schemas are pure shapes.
+
+### Consequences
+
+- **Wire-format grows from 3 to 7 frame kinds.** `parseFrame` automatically covers them; no downstream changes beyond type widening.
+- **Gate integrity is type-level.** Reviewer cannot accidentally let `correctChoiceId` reach the extension.
+- **Diff-only invariant gains a fifth enforcement layer** (every new message's TSDoc forbids extension with PR-text fields without an ADR).
+- **PR identifier transport is parsed-not-raw.** Malformed URLs never cross native messaging.
+- **Session correlation is host concern.** Wire carries IDs; in-memory `Map` is enough for v1; restart → `unknown-quiz-id` → extension shows "session expired, retry."
+- **No new runtime deps.** `monadyssey` stays out of `protocol`.
+- **Forward compat**: `type: "multiple-choice"` discriminant reserves room for free-text v2 without breaking `PROTOCOL_VERSION = 1`.
+- **What this ADR does NOT decide**: pass-threshold policy (#38), session TTL (#39), per-question feedback completeness (#39). Wire permits any host policy.
+- **Reversibility**: high. No downstream consumers yet (#38, #39, #41 land later). Mistakes here are one-PR fixes.
+- **Security**: every quiz-flow byte from stdin passes through `parseFrame`. Extension cannot infer correct answers from `quiz-response`. Host cannot leak diff bytes into any wire payload — no field shaped for them.
