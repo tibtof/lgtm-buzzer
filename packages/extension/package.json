@@ -17,6 +17,7 @@
     "@lgtm-buzzer/protocol": "*"
   },
   "devDependencies": {
+    "jsdom": "^26.1.0",
     "wxt": "^0.20.26"
   }
 }
