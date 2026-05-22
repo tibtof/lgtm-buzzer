@@ -3731,3 +3731,218 @@ Coverage target: 90% on core. Achievable with table-driven cases.
 - Reversibility high. If a v2 needs IO-returning aggregates, separate ADR can extend ports/** carve-out OR move composition to host fully.
 - Security: aggregate is the single composition point that feeds the LLM (via #39's wiring). Keeping it pure + Quiz-only locks the diff-only invariant at the aggregate boundary. Reviewer for #39 verifies §Sequence is followed.
 - Binding for #39 (must wire per §Sequence), #41 (consumes ADR-13 frames), #43 (modal). Extension never re-implements scoring.
+
+---
+
+## ADR-17: Service worker maintains a lazy native-messaging port and routes quiz frames via a correlation map
+**Date**: 2026-05-22
+**Issue**: #41
+**Status**: Accepted
+
+### Context
+
+The MV3 service worker is the only process that can call `chrome.runtime.connectNative`. Content scripts need a request/response channel to the host via the SW. Wire format (ADR-7, ADR-13) is already discriminated-union + zod-validated; SW's job is two-way routing.
+
+Three forces shape the design:
+1. **MV3 SW lifecycle** — Chrome terminates idle SWs; in-memory state vanishes; `chrome.storage.session` is async + non-serializable for promise resolvers.
+2. **CLAUDE.md per-package policy** — extension defaults plain TS + zod; monadyssey opt-in only. No monadyssey here.
+3. **`chrome.*` testability** — push logic into pure helpers + dep-injected functions; Playwright (#51) covers integration.
+
+PM open question resolved: in-memory correlation map; SW termination mid-flight = pending fails with `internal` on next wake. CS treats as transient.
+
+### Decision
+
+#### 1. Lazy port lifecycle
+
+`createPortClient` exposes `sendFrame(frame): Promise<Frame>`. First call connects; subsequent reuse. `port.onDisconnect` drops the ref, drains pending with synthetic `ErrorFrame { reason: "internal", message: "host disconnected" }`. Next `sendFrame` re-connects.
+
+Lazy over eager because eager doesn't preempt SW termination, can't save a round-trip, and spawns the host needlessly when user doesn't approve.
+
+#### 2. In-memory correlation map with TTL
+
+`Map<correlationId, { tabId, resolve, timer }>`. Per-request `setTimeout(timeoutMs)` defaults 60s; on timeout resolves with synthetic `ErrorFrame { reason: "internal", message: "host did not respond" }`. `correlationId`s via `crypto.randomUUID()`.
+
+NOT persisted to `chrome.storage.session` — promise resolvers aren't serializable. Accepted v1 limitation: SW restart = pending lost; CS sees "extension context invalidated" → retry-able.
+
+#### 3. CS↔SW protocol — reuse FrameSchema (option a)
+
+```ts
+// packages/extension/src/lib/cs-protocol.ts
+export const CSRequestSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("send-frame"), frame: FrameSchema }),
+]);
+
+export const CSResponseSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("frame"), frame: FrameSchema }),
+  z.object({
+    kind: z.literal("sw-error"),
+    reason: z.enum(["schema-violation", "internal"]),
+    message: z.string().min(1),
+  }),
+]);
+```
+
+`sw-error` only for failures BEFORE a frame can be exchanged with host. Host-side failures (disconnect, timeout, host ErrorFrame) come back as `{ kind: "frame", frame: ErrorFrame }`. CS sees one error vocabulary.
+
+Rationale for (a): CS already depends on `@lgtm-buzzer/protocol`; parallel SW↔CS protocol would duplicate types.
+
+#### 4. Reconnect — drain map on disconnect
+
+`port.onDisconnect`:
+1. Log `chrome.runtime.lastError?.message`.
+2. Drain map: resolve every pending with `ErrorFrame { reason: "internal", message: "host disconnected" }`.
+3. Null port ref; next `sendFrame` re-connects.
+
+No auto-retry loop. User-driven retry via modal.
+
+#### 5. Frame validation both directions
+
+- **CS → SW**: `CSRequestSchema.safeParse`. Invalid → `{ kind: "sw-error", reason: "schema-violation", message }`.
+- **Host → SW** (`port.onMessage`): `FrameSchema.safeParse`. Invalid → log + drop. Don't synthesize ErrorFrame (no correlationId to attribute).
+
+#### 6. Multi-tab concurrency
+
+`correlationId` per request via `crypto.randomUUID()`. Map keyed by correlation id, stores `tabId` for logging. `sendResponse` is the actual delivery path; cross-tab confusion impossible by construction.
+
+#### 7. Diff-only invariant — type-level
+
+SW handles `Frame` opaquely; never reads `payload.diff` (doesn't exist on any frame per ADR-13) or PR text. Reviewer confirms no `frame.payload.*` access beyond `correlationId`.
+
+### Affected workspaces
+
+`packages/extension` only.
+
+### Types
+
+```ts
+// correlation.ts
+export type PendingRequest = {
+  readonly correlationId: string;
+  readonly tabId: number | undefined;
+  readonly resolve: (frame: Frame) => void;
+  readonly timer: ReturnType<typeof setTimeout>;
+};
+
+export type CorrelationMap = {
+  readonly size: () => number;
+  readonly add: (pending: PendingRequest) => void;
+  readonly takeById: (correlationId: string) => PendingRequest | undefined;
+  readonly drainAll: (reason: (correlationId: string) => Frame) => void;
+};
+
+export const createCorrelationMap = (): CorrelationMap;
+```
+
+```ts
+// port.ts
+export type HostPort = {
+  readonly postMessage: (msg: unknown) => void;
+  readonly onMessage: { readonly addListener: (cb: (msg: unknown) => void) => void };
+  readonly onDisconnect: { readonly addListener: (cb: () => void) => void };
+  readonly disconnect: () => void;
+};
+
+export type ConnectFn = () => HostPort;
+
+export type PortClientDeps = {
+  readonly connect: ConnectFn;
+  readonly map: CorrelationMap;
+  readonly now: () => number;
+  readonly timeoutMs: number;        // default 60_000
+  readonly logger?: { readonly warn: (msg: string, ctx?: Record<string, unknown>) => void };
+};
+
+export type PortClient = {
+  readonly sendFrame: (frame: Frame, tabId?: number) => Promise<Frame>;
+  readonly isConnected: () => boolean;
+};
+
+export const createPortClient = (deps: PortClientDeps): PortClient;
+```
+
+```ts
+// router.ts
+export type RouterDeps = { readonly portClient: PortClient; readonly logger?: ... };
+
+export const createCSMessageHandler = (deps: RouterDeps): CSMessageHandler;
+```
+
+### File layout
+
+**New (8)**:
+- `src/lib/correlation.ts` + `.test.ts`
+- `src/lib/cs-protocol.ts` + `.test.ts`
+- `src/lib/port.ts` + `.test.ts`
+- `src/lib/router.ts` + `.test.ts`
+
+**Modified (1)**:
+- `entrypoints/background.ts` — minimal wiring:
+
+```ts
+export default defineBackground(() => {
+  const map = createCorrelationMap();
+  const portClient = createPortClient({
+    connect: () => chrome.runtime.connectNative(NATIVE_HOST_ID),
+    map,
+    now: () => Date.now(),
+    timeoutMs: 60_000,
+    logger: { warn: (msg, ctx) => console.warn(`[lgtm-buzzer:sw] ${msg}`, ctx ?? {}) },
+  });
+  chrome.runtime.onMessage.addListener(createCSMessageHandler({ portClient }));
+});
+```
+
+Listener registered SYNCHRONOUSLY at top level (MV3 wake-on-message requirement).
+
+### Sequence
+
+1. CS detects Approve click; `parsePRIdentifier(url)`. Right → proceed.
+2. CS generates `correlationId = crypto.randomUUID()`, builds `QuizRequestFrame`, calls `chrome.runtime.sendMessage({ kind: "send-frame", frame })`.
+3. SW: `CSRequestSchema.safeParse`. Invalid → `sw-error`.
+4. Handler: `portClient.sendFrame(frame, sender.tab?.id)`; returns `true` to keep channel open.
+5. `sendFrame`: lazy-connect if needed, wire `onMessage`+`onDisconnect` once, set timer, `map.add`, `port.postMessage`.
+6. Host processes, posts reply.
+7. SW `onMessage`: `FrameSchema.safeParse`. Valid → `map.takeById(reply.correlationId)`. Present → clear timer, resolve.
+8. Awaiting promise (step 4) resolves; handler `sendResponse({ kind: "frame", frame: reply })`.
+9. CS receives reply via `sendMessage` callback. Branches on `frame.kind`.
+
+Diff-flow audit: SW handles Frame opaquely; never reads `frame.payload.*` beyond `correlationId`.
+
+### Error cases
+
+| Failure | Surfaced to CS as |
+|---|---|
+| Malformed CS request | `{ kind: "sw-error", reason: "schema-violation" }` |
+| Host disconnected (no host installed) | per-pending `ErrorFrame { reason: "internal", message: "host disconnected" }` |
+| Host sends malformed bytes | dropped; awaiting times out → `internal` |
+| Host never replies | `ErrorFrame { reason: "internal", message: "host did not respond" }` after `timeoutMs` |
+| Unknown correlationId in reply | logged + dropped |
+| SW restart mid-flight | Chrome surfaces "extension context invalidated" to CS |
+| `crypto.randomUUID` unavailable | invariant violation (won't happen in MV3 SW) |
+
+### Test strategy
+
+**`correlation.test.ts`** (8 cases): add+take; missing id; timer cleared on take; drainAll; duplicate-id rejection; property test (3 cases hand-rolled).
+
+**`port.test.ts`** (10 cases): lazy connect; reuse; round-trip; concurrent frames; disconnect mid-flight; reconnect; invalid host reply; timeout; sync `postMessage` throw → drain as disconnected; `tabId` preserved.
+
+**`router.test.ts`** (6 cases): malformed CS; well-formed CS; handler returns `true`; resolution → `sendResponse`; ErrorFrame passed through unchanged; unknown CS kind → `sw-error`.
+
+**`cs-protocol.test.ts`** (4 cases): CSRequest happy; reject unknown outer kind; CSResponse with ErrorFrame; reject sw-error with empty message.
+
+NOT unit-tested: `chrome.runtime.connectNative` actually working; SW wake timing; cross-tab routing. Playwright (#51) covers these.
+
+Coverage: pure helpers ~95%; port + router ~85%; entrypoint via Playwright.
+
+### Consequences
+
+- Lazy lifecycle is simplest correct choice; eager doesn't preempt termination.
+- In-memory map is v1 floor; pending across SW restart = retry-able error.
+- SW is pure pipe — doesn't interpret frame `kind`, doesn't access payload beyond correlationId.
+- One wire vocabulary across extension boundary. Future "popup health" features extend CS↔SW envelope without touching wire format.
+- No monadyssey in extension yet. Consistent with per-package policy.
+- `sendFrame` returns `Promise<Frame>` and NEVER rejects — all failure encoded in ErrorFrame.
+- No new runtime deps. `crypto.randomUUID` in MV3 SW; zod transitively from `@lgtm-buzzer/protocol`.
+- Reversibility high. Swap to persisted correlation / eager connect / thinner CS↔SW protocol is an isolated change.
+- Binding for #43 (modal): modal speaks Frame to SW via `chrome.runtime.sendMessage`. No new layer.
+- Security: SW never logs frame payloads. Only `{ correlationId, kind }` reaches the dev console.
