@@ -10,6 +10,15 @@ export type {
   QuestionId, Quiz, QuizId,
 } from "./quiz/quiz.js";
 export type { LLMProviderError } from "./quiz/errors.js";
+export type {
+  AnswerKey,
+  PerQuestionResult,
+  Score,
+  ScoreError,
+  SubmittedAnswer,
+  SubmittedAnswers,
+} from "./quiz/session.js";
+export { decidePassed, pickCorrectAnswers, scoreSubmission } from "./quiz/session.js";
 
 /**
  * Marker version constant for @lgtm-buzzer/core.
