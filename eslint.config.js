@@ -171,6 +171,78 @@ export default tseslint.config(
       ],
     },
   },
+  // Ports in core may type-import `IO` from monadyssey (ADR-11 §Decision 6).
+  // This block MUST restate ALL paths and patterns from the parent core block —
+  // ESLint flat-config replaces (does not merge) rule configs on overlapping file
+  // globs. Omitting any pattern would silently re-enable the banned import in
+  // ports/. The only change from the parent block: `IO`'s entry adds
+  // `allowTypeImports: true`. Value imports of IO remain forbidden.
+  {
+    files: ["packages/core/src/ports/**/*.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            ...FORBIDDEN_FP_LIBS.paths,
+            {
+              name: "monadyssey",
+              importNames: [
+                "Schedule",
+                "Policy",
+                "RepeatError",
+                "RetryError",
+                "PolicyValidationError",
+                "TimeoutError",
+                "CancellationError",
+                "ConditionalRetryError",
+                "Fiber",
+                "Cancelled",
+                "EvaluationError",
+                "Reader",
+              ],
+              message:
+                "Core must use only the IO-free surface of monadyssey (Either, Option, Eval, NonEmptyList, etc.). IO and Schedule belong in adapters. See CLAUDE.md per-package dependency policy.",
+            },
+            {
+              name: "monadyssey",
+              importNames: ["IO"],
+              allowTypeImports: true,
+              message:
+                "Core must use only the IO-free surface of monadyssey (Either, Option, Eval, NonEmptyList, etc.). IO and Schedule belong in adapters. See CLAUDE.md per-package dependency policy.",
+            },
+          ],
+          patterns: [
+            ...FORBIDDEN_FP_LIBS.patterns,
+            {
+              group: [
+                "node:*",
+                "fs",
+                "fs/*",
+                "path",
+                "child_process",
+                "os",
+                "stream",
+                "util",
+                "crypto",
+              ],
+              message:
+                "Core must not depend on Node APIs. Define a port instead.",
+            },
+            {
+              group: [
+                "@lgtm-buzzer/adapter-*",
+                "@lgtm-buzzer/host",
+                "@lgtm-buzzer/extension",
+              ],
+              message:
+                "Core must not depend on outer-layer packages.",
+            },
+          ],
+        },
+      ],
+    },
+  },
   // WXT entrypoints require default exports.
   {
     files: ["packages/extension/entrypoints/**/*.ts"],
