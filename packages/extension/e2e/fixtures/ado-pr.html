@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MyRepo — Pull Request 42 | contoso</title>
+</head>
+<body>
+  <h1>Fix: improve review gate (#42)</h1>
+
+  <!--
+    Minimal ADO-style vote button.
+    The wire-stable contract is:
+      data-testid="complete-vote-button"
+    This value is the first entry in KNOWN_ADO_VOTE_TESTIDS in ado-vote-intercept.ts.
+    The CS capture-phase interceptor matches it via recognizeAdoVoteClick() Layer 1.
+    ADO uses click handlers, not form submit, so we use a click listener here.
+    See ADR-21 §4.
+  -->
+  <button data-testid="complete-vote-button">Approve</button>
+
+  <!--
+    Bubble-phase listener that marks body when the click is not prevented.
+    The CS capture-phase handler has first refusal; if it calls preventDefault +
+    stopPropagation the click never reaches here. Only when the bypass flag is
+    set (quiz passed) does element.click() replay the event and this listener
+    fires.
+  -->
+  <script>
+    document.querySelector('[data-testid="complete-vote-button"]').addEventListener('click', function () {
+      document.body.setAttribute('data-vote-clicked', 'true');
+    });
+  </script>
+</body>
+</html>

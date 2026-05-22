@@ -6195,3 +6195,1212 @@ All tests use Vitest + jsdom (Vitest workspace already configured). No new tooli
 - (g) No new `throw` outside invariant violations; all expected failures route through `Promise<Either<E, A>>`.
 
 ---
+
+## ADR-24 (2026-05-22): Quiz modal polish — state machine, error UX, accessibility
+**Date**: 2026-05-22
+**Issue**: #53
+**Status**: Accepted
+
+### Context
+
+M2 (ADR-18) shipped the modal as a functional skeleton: idle → loading → quiz-active → submitting → result → error, with one spinner, one generic error banner, one Esc-to-dismiss handler, and ADR-23's `missing-credentials` / `bad-credentials` "Configure options" link bolted on. The modal is correct on the happy path but a bare prototype on the failure paths and the keyboard / screen-reader paths.
+
+Five forces shape this story:
+
+- **Error-class explosion from ADR-22.** The wire-level `ErrorReason` enum grew from 4 to 9 reasons: `schema-violation`, `unknown-message`, `version-mismatch`, `internal`, `unknown-quiz-id`, plus the ADR-22 additions `unsupported-llm-adapter`, `unsupported-vcs-adapter`, `bad-credentials`, `missing-credentials`. The modal currently treats every reason except the two credential ones as "generic error" — useless for diagnosis. Each reason has a distinct remediation (configure adapter, configure credentials, reinstall host, retry, give up).
+- **Extension-internal transport failures share one wire reason.** `port.ts` and `quiz-flow.ts` synthesize their own error frames for host-disconnect, host-no-response (timeout), unexpected-reply-kind, sendFrame-threw, and invalid-SW-response — every one tagged `reason: "internal"` because the wire enum has no other slot. The modal needs to distinguish these from genuine host-returned `internal` errors so it can show a "Retry" affordance on transport failures without offering retry on a host crash.
+- **Accessibility is currently 30%.** The modal sets `role="dialog"` and `aria-modal="true"`, has Esc-to-dismiss, but: no focus trap, no `aria-labelledby`, no `aria-live` announcements of state changes, no keyboard-discoverable controls in the `quiz-active` state beyond Tab/Space (which works by default but is undocumented). WCAG AA is achievable here without a library; this ADR commits to AA, documents AAA as aspirational.
+- **No protocol-level cancellation in v1.** The wire protocol has no `quiz-cancel` frame. Today the modal's Cancel button drops the pending state on the CS side and lets the SW's 60s timeout clean up — but the host keeps generating, burning LLM tokens. Adding a `quiz-cancel-request` frame is a protocol change with host fiber-cancellation work and a new round of cross-package tests; it would balloon this PR and is the wrong scope for "modal polish." Defer to a follow-up issue.
+- **Retry must not regress idempotency.** Re-fetching a quiz on retry is a new `quiz-request` frame with a **new** correlationId — the original request is dead (its SW-side correlation entry timed out or its host fiber finished and the reply was dropped). Retry must not reuse the old correlation map slot.
+
+The PM spec already resolved several questions (state list, error → UI mapping examples, defer protocol-level cancel, AA-not-AAA). This ADR commits them and adds the missing technical detail: the **classified error model** that bridges wire reasons + extension-internal transport reasons; the **state machine refactor** that explicitly adds `submitting` and treats `passed` / `failed` / `error` as separate top-level states; the **focus-trap algorithm**; the **retry contract**; and the **aria-live announcement strategy**.
+
+### Decision
+
+1. **A renamed, normalised state machine** lives in the modal: `idle | generating | ready | submitting | passed | failed | error`. The current `loading` becomes `generating`; `quiz-active` becomes `ready`; the conjoined `result { passed: boolean }` splits into `passed` and `failed` as distinct kinds so render code is exhaustive without nested `if`s.
+
+2. **A classified error model** lives in the modal layer (extension-only, not in `protocol`). Define `DisplayErrorClass` — a discriminated union covering both wire `ErrorReason` values and three new extension-internal classes (`host-unreachable`, `host-timeout`, `host-unexpected-reply`) that today get flattened into `reason: "internal"`. The quiz-flow controller emits the existing `outcome { kind: "error", reason, message }` shape unchanged on the wire, but the modal classifies the `(reason, message)` pair into a `DisplayErrorClass` via a pure mapper. This avoids a wire-protocol bump while letting the UI distinguish transport from host-internal failures.
+
+3. **Per-class UI specification** (title, body, optional CTA) lives in a `errorClassToUI(cls): ErrorUISpec` pure function. The CTA is one of: `retry` (re-emits a fresh `quiz-request`), `open-options` (existing ADR-23 wire), `install-host` (links to install instructions, opens a new tab), `dismiss` (just closes).
+
+4. **Retry semantics**:
+   - On `retry` CTA click in state `error`, the modal emits a new DOM event `lgtm-buzzer:quiz-retry { requestId }` (additive — no breaking change to the existing event bus).
+   - The CS controller (`quiz-flow.ts`) handles `quiz-retry`: re-resolves the pending Approve (if still tracked) or, if dropped, looks up the PR identifier from `currentPR` and starts a fresh `onBlocked` flow with a **new requestId + new correlationId**. The old correlation slot, if any, was already drained on the error.
+   - No automatic retries. CLAUDE.md §Functional idiom #3 says "retries use `Schedule`, not hand-rolled loops" — but **user-driven retry is not the same as automatic retry**. `Schedule` belongs in the **host** for transient LLM/HTTP errors (where the user is not in the loop). The modal's Retry button is a one-click manual retry; no `Schedule` involvement.
+   - This is a deliberate variance from the PM acceptance criterion that says "Retry uses monadyssey Schedule semantics on the extension side or in the host — architect picks." Architect picks: **host**, in a follow-up issue for LLM-adapter-level retry. The modal stays simple: one click = one new request.
+
+5. **Accessibility upgrades**: focus trap on the `.panel`, focus restoration on close, `aria-labelledby` pointing to the modal heading, `aria-live="polite"` region for state transitions (announces "Generating quiz" / "Quiz ready, N questions" / "Checking answers" / "Quiz passed" / "Quiz failed" / "Error: <title>"), `<fieldset>` + `<legend>` for each question, programmatic focus on the first focusable element after each state transition.
+
+6. **Cancel during `generating`** ships as **Option A** (modal-side drop only): the modal emits the existing `quiz-cancel`, the CS drops the pending state, the SW's 60s timeout cleans the host correlation, the host fiber runs to completion and its reply is discarded. This wastes LLM cycles. Mitigation: file follow-up issue for `quiz-cancel-request` wire frame + host fiber cancellation (Option B). This ADR documents the limitation prominently in the cancel button's `aria-describedby` text? No — that would be user-hostile. Document in `packages/extension/README.md` and in the follow-up issue body.
+
+7. **No new protocol changes.** No new wire frames. No new ErrorReason values. The new `quiz-retry` DOM event is intra-CS only and does not cross the SW boundary.
+
+8. **No new runtime dependencies.** All work is hand-rolled DOM + CSS within the existing shadow root. The focus trap is ~30 LOC of vanilla DOM. The `aria-live` region is a single `<div role="status" aria-live="polite">`.
+
+#### Affected workspaces
+
+- `packages/extension/` — primary work:
+  - `src/lib/dom/modal.ts` — refactored state machine, classified error rendering, focus trap, aria-live region, retry CTA wiring.
+  - `src/lib/dom/error-classes.ts` (new) — `DisplayErrorClass`, `classifyError`, `errorClassToUI`.
+  - `src/lib/dom/focus-trap.ts` (new) — focus-trap factory with `activate` / `deactivate`.
+  - `src/lib/dom/dom-events.ts` — adds `DOM_EVENTS.quizRetry` constant + `QuizRetryEventDetailSchema`.
+  - `src/lib/dom/quiz-flow.ts` — handles `quiz-retry`: looks up `pending` (if alive) or `currentPR`, re-emits a fresh `quiz-request` flow.
+  - Existing test files extended; one new test file per new module.
+- `packages/protocol/` — **no changes**. The wire protocol is stable. New display classes live in the extension's classification layer.
+- `packages/core/` — no changes. Modal is pure UI; no domain.
+- `packages/host/`, `packages/adapters/*` — no changes.
+
+**Dependency arrows reaffirmed**:
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+```
+
+`error-classes.ts` imports `ErrorReason` from `@lgtm-buzzer/protocol` (type only) and re-exports a richer union internal to the extension. No new cross-workspace imports.
+
+#### State machine (binding)
+
+```
+idle
+ └─[quiz-request DOM event]─> generating
+                                ├─[outcome:quiz-ready]─> ready
+                                ├─[outcome:error]─> error
+                                ├─[Cancel button | Esc]─> idle  (emits quiz-cancel)
+ready
+ ├─[Submit button (all answered)]─> submitting (emits quiz-submit)
+ ├─[Cancel button | Esc]─> idle  (emits quiz-cancel)
+submitting
+ ├─[outcome:quiz-passed]─> passed
+ ├─[outcome:quiz-failed]─> failed
+ ├─[outcome:error]─> error
+ ├─[Esc]─> idle  (emits quiz-cancel; submit reply dropped if late)
+passed
+ └─[Dismiss button | Esc]─> idle  (no quiz-cancel — submission completed)
+failed
+ ├─[Try Again button]─> generating  (emits quiz-retry)
+ └─[Dismiss button | Esc]─> idle  (emits quiz-cancel)
+error
+ ├─[Retry CTA]─> generating  (emits quiz-retry)
+ ├─[Open Options CTA]─> idle  (emits open-options + quiz-cancel)
+ ├─[Install Host CTA]─> idle  (opens external URL + quiz-cancel)
+ └─[Dismiss button | Esc]─> idle  (emits quiz-cancel)
+```
+
+Re-submit replay correctness: the CS's `replayApprove` path (ADR-18) fires synchronously on receipt of `quiz-passed` — **before** the modal transitions to `passed`. The user sees the green banner; the GitHub/ADO Approve has already gone through. The Dismiss button in `passed` just closes the modal. No regression vs current behavior.
+
+#### Types
+
+##### `packages/extension/src/lib/dom/error-classes.ts` (new)
+
+```ts
+import type { ErrorReason } from "@lgtm-buzzer/protocol";
+
+/**
+ * Display-layer classification of any error surfaced to the modal.
+ *
+ * The first four classes are extension-internal — they cover transport
+ * failures that today get flattened into `reason: "internal"` with a
+ * marker `message` from `port.ts` / `quiz-flow.ts`. The remaining classes
+ * are 1:1 with the protocol's `ErrorReason` enum.
+ *
+ * This type does NOT cross the SW boundary; it is the modal's local view.
+ */
+export type DisplayErrorClass =
+  // Extension-internal transport classes (synthesised from "internal" reason)
+  | { readonly kind: "host-unreachable" }
+  | { readonly kind: "host-timeout" }
+  | { readonly kind: "host-unexpected-reply"; readonly replyKind: string }
+  | { readonly kind: "transport-internal"; readonly detail: string }
+  // Wire-level reasons (mirror protocol.ErrorReason 1:1)
+  | { readonly kind: "schema-violation" }
+  | { readonly kind: "unknown-message" }
+  | { readonly kind: "version-mismatch" }
+  | { readonly kind: "internal" }            // genuine host-side internal
+  | { readonly kind: "unknown-quiz-id" }
+  | { readonly kind: "unsupported-llm-adapter" }
+  | { readonly kind: "unsupported-vcs-adapter" }
+  | { readonly kind: "bad-credentials" }
+  | { readonly kind: "missing-credentials" };
+
+/** The action a CTA performs. */
+export type ErrorCTAAction =
+  | { readonly kind: "retry" }
+  | { readonly kind: "open-options" }
+  | { readonly kind: "install-host"; readonly url: string }
+  | { readonly kind: "dismiss" };
+
+/** What the error renderer needs to know to draw the panel. */
+export type ErrorUISpec = {
+  readonly title: string;
+  readonly body: string;
+  readonly cta?: { readonly label: string; readonly action: ErrorCTAAction };
+};
+
+/**
+ * Maps a `(reason, message)` pair from the wire `outcome.error` into a
+ * `DisplayErrorClass`. The mapping rule for transport-internal reasons:
+ * `port.ts` / `quiz-flow.ts` already emit specific marker strings in
+ * `message` ("host disconnected", "host did not respond", "Unexpected
+ * reply kind: X", "sendFrame threw: ...", "invalid SW response",
+ * "connect failed: ..."). This function recognises those markers and
+ * promotes them to dedicated classes. Anything else with
+ * `reason === "internal"` falls back to `transport-internal`.
+ *
+ * Pure — no side effects.
+ */
+export const classifyError = (
+  reason: ErrorReason,
+  message: string,
+): DisplayErrorClass;
+
+/**
+ * Pure mapping from a display class to the UI it should render.
+ * Centralises the user-facing copy + CTA in one place; the renderer
+ * just paints the result.
+ */
+export const errorClassToUI = (cls: DisplayErrorClass): ErrorUISpec;
+```
+
+##### `packages/extension/src/lib/dom/focus-trap.ts` (new)
+
+```ts
+/**
+ * A focus trap confines Tab / Shift+Tab to the focusable descendants
+ * of a container. Used to keep keyboard navigation inside the modal
+ * panel while the modal is open.
+ *
+ * Activation:
+ * - Records `previouslyFocused = doc.activeElement`.
+ * - Focuses the first focusable element inside `container`.
+ * - Attaches a `keydown` listener that wraps Tab / Shift+Tab.
+ *
+ * Deactivation:
+ * - Detaches the listener.
+ * - Restores focus to `previouslyFocused` (if still in the DOM).
+ *
+ * Focusable selector covers: `a[href]`, `button:not([disabled])`,
+ * `input:not([disabled])`, `select:not([disabled])`,
+ * `textarea:not([disabled])`, `[tabindex]:not([tabindex="-1"])`.
+ *
+ * Shadow-DOM-aware: the container is the shadow root of the modal host,
+ * and the selector runs against `shadow.querySelectorAll(...)`.
+ */
+export type FocusTrap = {
+  /** Attach the trap and move focus into the container. */
+  readonly activate: () => void;
+  /** Detach the trap and restore focus. Idempotent. */
+  readonly deactivate: () => void;
+};
+
+export type FocusTrapDeps = {
+  readonly doc: Document;
+  readonly container: HTMLElement | ShadowRoot;
+};
+
+export const createFocusTrap = (deps: FocusTrapDeps): FocusTrap;
+```
+
+##### `packages/extension/src/lib/dom/dom-events.ts` (modified)
+
+Add a fifth namespaced DOM event for retry:
+
+```ts
+export const DOM_EVENTS = {
+  quizRequest: "lgtm-buzzer:quiz-request",
+  quizResult:  "lgtm-buzzer:quiz-result",
+  quizSubmit:  "lgtm-buzzer:quiz-submit",
+  quizCancel:  "lgtm-buzzer:quiz-cancel",
+  quizRetry:   "lgtm-buzzer:quiz-retry", // NEW
+} as const;
+
+/**
+ * Detail carried by `lgtm-buzzer:quiz-retry` (modal → CS).
+ *
+ * Fired when the user clicks Retry in `error` state or Try Again in
+ * `failed` state. The CS re-emits a fresh `quiz-request` with a new
+ * requestId and correlationId.
+ */
+export const QuizRetryEventDetailSchema = z.object({
+  requestId: z.string().min(1),
+});
+export type QuizRetryEventDetail = z.infer<typeof QuizRetryEventDetailSchema>;
+```
+
+##### `packages/extension/src/lib/dom/modal.ts` (modified)
+
+The internal `ModalState` is renamed to use the canonical seven-kind union (see State machine above). The render function dispatches on `state.kind`. New private dependencies: `createFocusTrap`, `classifyError`, `errorClassToUI`.
+
+The `quiz-active` state (now `ready`) is rendered with `<fieldset>` / `<legend>` per question instead of the current `<div role="radiogroup">`. The `<legend>` carries the prompt text; native fieldset semantics replace the bespoke `aria-label` + `role="radiogroup"`. Choices remain `<input type="radio">` inside `<label>` (existing pattern is already correct).
+
+A persistent `aria-live="polite"` `<div role="status">` sits at the top of the panel, hidden visually with `clip-path: inset(50%)` but readable by screen readers. The render function updates its `textContent` on every state transition.
+
+`closeModal()` also calls `focusTrap.deactivate()`.
+
+#### Functions and methods
+
+```ts
+// packages/extension/src/lib/dom/error-classes.ts
+export const classifyError: (
+  reason: ErrorReason,
+  message: string,
+) => DisplayErrorClass;
+
+export const errorClassToUI: (cls: DisplayErrorClass) => ErrorUISpec;
+
+// packages/extension/src/lib/dom/focus-trap.ts
+export const createFocusTrap: (deps: FocusTrapDeps) => FocusTrap;
+```
+
+No `Either` / `IO` here: these are pure mappers and DOM glue, and the existing modal is plain TS per CLAUDE.md's "extension defaults to plain TS + zod" rule. The `quiz-retry` event detail is zod-validated at the listener edge (existing `addDOMEventListener` helper).
+
+#### File layout
+
+```
+packages/extension/src/lib/dom/
+  error-classes.ts                 (new — DisplayErrorClass, classifyError, errorClassToUI)
+  error-classes.test.ts            (new — pure mapper tests, one per class)
+  focus-trap.ts                    (new — createFocusTrap factory)
+  focus-trap.test.ts               (new — Tab wrap, Shift+Tab wrap, restore-on-deactivate)
+  dom-events.ts                    (modified — adds quizRetry constant + schema)
+  dom-events.test.ts               (modified — adds quizRetry schema parse cases)
+  modal.ts                         (modified — new state machine, classified error renderer, focus trap, aria-live region)
+  modal.test.ts                    (modified — adds states, error classes, a11y assertions)
+  quiz-flow.ts                     (modified — handles QuizRetry event)
+  quiz-flow.test.ts                (modified — adds retry flow test)
+```
+
+#### Per-class UI mapping (binding copy)
+
+The dev MAY copy-edit minor wording, but the (title, CTA action) pairs are binding. Bodies SHOULD reference the underlying cause without exposing raw error messages.
+
+| Class | Title | Body | CTA label | CTA action |
+|---|---|---|---|---|
+| `host-unreachable` | "Native host not installed" | "LGTM-Buzzer needs the native messaging host to talk to your local LLM. Install it from the project page." | "Install host" | `install-host` (opens README anchor in new tab) |
+| `host-timeout` | "Host didn't respond" | "The native host took too long to reply. This usually clears on its own." | "Retry" | `retry` |
+| `host-unexpected-reply` | "Unexpected response" | "The native host sent an unexpected message. Retry, or report a bug if it keeps happening." | "Retry" | `retry` |
+| `transport-internal` | "Connection error" | "Something went wrong talking to the native host. Retry, or restart the host." | "Retry" | `retry` |
+| `schema-violation` | "Protocol mismatch" | "Extension and host versions are out of sync. Reinstall the native host to fix this." | "Install host" | `install-host` |
+| `unknown-message` | "Protocol mismatch" | "The native host didn't recognise the request. Reinstall the host to fix this." | "Install host" | `install-host` |
+| `version-mismatch` | "Protocol version mismatch" | "Extension and host versions are incompatible. Reinstall the native host." | "Install host" | `install-host` |
+| `internal` | "Host error" | "The native host hit an internal error. Retry, or check the host logs." | "Retry" | `retry` |
+| `unknown-quiz-id` | "Quiz expired" | "The quiz session is no longer valid. Try again to fetch a fresh quiz." | "Try again" | `retry` |
+| `unsupported-llm-adapter` | "LLM adapter not available" | "The selected LLM adapter is not registered in your native host. Pick a different adapter in options." | "Open options" | `open-options` |
+| `unsupported-vcs-adapter` | "VCS adapter not available" | "The selected VCS adapter is not registered in your native host. Pick a different adapter in options." | "Open options" | `open-options` |
+| `bad-credentials` | "Credentials rejected" | "The adapter rejected your credentials. Update them in extension options." | "Open options" | `open-options` |
+| `missing-credentials` | "Credentials required" | "This adapter needs credentials. Add them in extension options." | "Open options" | `open-options` |
+
+The `install-host` URL is a fixed constant pointing at the project's README install section (`https://github.com/tibtof/lgtm-buzzer#install`). Lives in `error-classes.ts`. Opens via `window.open(url, "_blank", "noopener")` from the CTA click handler.
+
+#### classifyError marker strings (binding)
+
+```ts
+classifyError("internal", message) →
+  message === "host disconnected"             → { kind: "host-unreachable" }
+  message === "host did not respond"          → { kind: "host-timeout" }
+  message.startsWith("Unexpected reply kind:")→ { kind: "host-unexpected-reply",
+                                                  replyKind: <parsed from message> }
+  message.startsWith("connect failed:")       → { kind: "host-unreachable" }
+  message.startsWith("sendFrame threw:")      → { kind: "transport-internal", detail: message }
+  message.startsWith("replay failed:")        → { kind: "transport-internal", detail: message }
+  message === "invalid SW response"           → { kind: "transport-internal", detail: message }
+  otherwise                                   → { kind: "internal" }   // host-side genuine internal
+
+classifyError(reason, _) for any other reason → { kind: reason }   // 1:1 wire mapping
+```
+
+This couples the modal to the marker strings hard-coded in `port.ts` / `quiz-flow.ts`. The coupling is **deliberate and unidirectional** — the modal accepts what those modules already emit. If `port.ts` / `quiz-flow.ts` change a marker, the modal still falls back to `internal` (genuine host-side) which renders as "Host error / Retry" — not catastrophic, just suboptimal. A unit test in `error-classes.test.ts` asserts every marker recognised by `classifyError` matches a real marker string used in `port.ts` or `quiz-flow.ts`, via `grep`-style import:
+
+```ts
+// modal-side test:
+import { MAKE_ERROR_MARKERS } from "./error-classes.js";
+
+// In port.ts (export a const, replace the inline string):
+export const PORT_ERROR_MARKERS = {
+  hostDisconnected: "host disconnected",
+  hostNoResponse:   "host did not respond",
+  connectFailed:    "connect failed:",  // prefix
+} as const;
+```
+
+The dev MUST extract the marker strings into named exports in `port.ts` and `quiz-flow.ts`, then `classifyError` imports them — no string literals duplicated in both places. This eliminates the drift risk entirely.
+
+#### Sequence
+
+Quiz error → retry (round-trip):
+
+1. User clicks Approve → CS → SW → host → host's LLM adapter returns `bad-credentials`.
+2. SW relays `ErrorFrame { reason: "bad-credentials", message: "..." }` to the CS.
+3. CS's `handleQuizRequestReply` drops `pending` and emits `quiz-result { outcome: error }`.
+4. Modal receives `quiz-result`, classifies the reason via `classifyError("bad-credentials", msg)` → `{ kind: "bad-credentials" }`, renders the panel using `errorClassToUI(...)` → "Credentials rejected / Open options".
+5. Focus moves to the first focusable element (the "Open options" link); `aria-live` region announces "Error: Credentials rejected".
+6. User clicks "Open options" → modal emits `lgtm-buzzer:open-options` (existing ADR-23 wire) AND `lgtm-buzzer:quiz-cancel` (so the CS frees state), modal transitions to `idle`.
+
+Transient retry round-trip:
+
+1. SW reports `host did not respond` (timeout) → CS emits `quiz-result { outcome: error, reason: "internal", message: "host did not respond" }`.
+2. Modal classifies → `{ kind: "host-timeout" }` → renders "Host didn't respond / Retry".
+3. User clicks Retry → modal emits `lgtm-buzzer:quiz-retry { requestId }`, transitions optimistically to `generating`, focus moves to the Cancel button, aria-live announces "Generating quiz from the diff".
+4. CS's `onQuizRetry` handler: looks up the prior `pending` (if still tracked) or, if the prior was dropped (it usually has been — the error path drops), reads `currentPR` and synthesises a fresh `PendingApprove` **without a fresh approve interception** — Retry is a re-fetch of the quiz only; the user is already past the Approve click. A new requestId + correlationId is allocated; `pending` is set; a new `quiz-request` frame is sent.
+5. On success: same path as a normal `quiz-request` round-trip from step 2 onward of the original ADR-18 flow.
+
+Failed quiz → try again:
+
+1. State `failed`, user clicks "Try Again" → modal emits `lgtm-buzzer:quiz-retry { requestId }`, transitions to `generating`.
+2. Same CS handler as transient retry; a fresh `quiz-request` is sent. The host re-generates a (different) quiz from the same PR diff.
+3. The original `blocked` (`InterceptedApproveEvent`) is **not** re-replayed on the retry path — replay happens only when a fresh `quiz-passed` arrives.
+
+Cancel during generating (Option A):
+
+1. User clicks Cancel during `generating` → modal emits `quiz-cancel`, transitions to `idle`, focus restored.
+2. CS's `onQuizCancel` drops `pending`.
+3. Host continues generating; reply arrives at SW; SW's correlation map either has the entry (resolves to a now-orphan Promise that nobody awaits — GC reclaims it) or has timed out and drained the entry.
+4. If the orphan reply arrives at CS via SW, `pending.has(requestId)` is false → `handleQuizRequestReply` logs a warn and returns early. Already implemented (see `quiz-flow.ts:306`).
+
+#### Error cases
+
+Modal-internal failures:
+
+- **Retry click while `pending` is gone AND `currentPR` is null** (e.g., user navigated mid-error). `onQuizRetry` logs a warn and emits `quiz-result { error, reason: "internal", message: "no active PR" }`; the modal classifies this as `transport-internal` and re-renders the error panel. This is a dead-end the user can only escape via Dismiss — acceptable; the navigation already broke their flow.
+- **Focus trap on an empty panel** (defensive). If `querySelectorAll` returns no focusable elements (shouldn't happen — every state has at least one button), the trap's `activate()` focuses the panel itself (which has `tabindex="-1"`). No throw.
+- **Multiple state transitions in quick succession** (e.g., `generating → error → retry → generating` rapid-fire). The render function fully rebuilds the panel on each transition; previous focus-trap listeners are deactivated in the same call. The `data-lgtm-modal-host` element is reused (idempotent mount); only the backdrop is recreated.
+
+Wire-level / classification edge cases:
+
+- **`classifyError` receives a `reason` value not in the union** (defensive — host shipped a newer enum). TypeScript exhaustiveness prevents this at the call site; at runtime the schema in `dom-events.ts` rejects it before reaching `classifyError`. If somehow it slips through, default to `{ kind: "internal" }` → "Host error / Retry".
+- **`classifyError` receives `internal` reason with a marker string the modal does not recognise**. Falls back to `{ kind: "internal" }` (genuine host-side internal). Renders as "Host error / Retry". The retry will hit the same root cause but the user is allowed to try.
+
+No `throw` is added. The modal continues the existing pattern: pure DOM + zod-validated event details + plain TS.
+
+#### Accessibility checklist (binding)
+
+| Feature | Implementation |
+|---|---|
+| Role / modal semantics | `role="dialog"` + `aria-modal="true"` on the backdrop (existing); add `aria-labelledby="lgtm-buzzer-modal-title"` pointing at the `<h2>`. |
+| Focus trap | `createFocusTrap` activated on every non-idle render; deactivated on `closeModal()`. |
+| Focus restoration | `focusTrap.deactivate()` restores focus to `previouslyFocused` (recorded at activation). |
+| First-focus targets | `generating`: Cancel button. `ready`: first radio of first question. `submitting`: Cancel button (visually styled "Cancel submission" — wait, no — submitting has NO buttons currently. Add Cancel button to `submitting` for parity; same behavior as generating-cancel: emits `quiz-cancel`, modal goes to idle, late submit reply dropped). `passed` / `failed` / `error`: primary CTA (Dismiss / Try Again / Retry / Open Options). |
+| Esc | Existing handler retained: emits `quiz-cancel` and closes. Except in state `passed` — Esc dismisses without cancel (the approval is already through). |
+| Tab / Shift+Tab | Trapped within the panel. Tab from last focusable wraps to first; Shift+Tab from first wraps to last. |
+| `aria-live` region | Single `<div role="status" aria-live="polite" aria-atomic="true">` inside the panel, visually hidden via `clip-path: inset(50%); position: absolute; width: 1px; height: 1px; overflow: hidden;`. `textContent` updated on every state transition. |
+| `<fieldset>` + `<legend>` | Each question wraps choices in `<fieldset>` with `<legend>` carrying the prompt text. Remove the bespoke `role="radiogroup"` + `aria-label` (native fieldset semantics replace it). |
+| Color contrast | All copy uses GitHub Primer color tokens (`#24292f` on `#ffffff`, etc.), all combinations pass WCAG AA (≥ 4.5:1 for body text, ≥ 3:1 for large text). Verified manually via Primer's published contrast tables — no automated contrast test in v1. AAA aspirational; AA committed. |
+| Reduced motion | The existing `lgtm-fadein` and `lgtm-spin` animations remain; wrap them in `@media (prefers-reduced-motion: no-preference)` blocks so users with `prefers-reduced-motion: reduce` see no animation. |
+| `aria-busy` | The panel sets `aria-busy="true"` during `generating` and `submitting` states; `false` in all other states. |
+
+#### Loading state
+
+Replace the inline spinner-only loading panel with a thin **skeleton + spinner** combo:
+
+```
+[ ⏳ spinner ]  Generating quiz from the diff…
+─────────────────────────────────────
+[░░░░░░░░░░░░░░░░░░░░░░░]   ← skeleton block 1 (question placeholder)
+[░░░░  ░░░░  ░░░░]          ← skeleton block 2 (choices placeholder)
+[░░░░░░░░░░░░░░░░░░░░]      ← skeleton block 3 (question placeholder)
+[░░░░  ░░░░]                ← skeleton block 4 (choices placeholder)
+```
+
+Skeletons are styled `<div>` blocks with a faint background and a 1.5s pulse animation (`@keyframes lgtm-pulse { 0%, 100% { opacity: 0.4 } 50% { opacity: 0.8 } }`). Two question-shaped skeletons (each: one prompt rectangle + three choice rectangles) — gives the user a sense of the question count without committing to a specific N. `prefers-reduced-motion: reduce` disables the pulse but keeps the skeleton visible. All pure CSS, zero external deps.
+
+For `submitting`, the skeleton is omitted — the modal is short-lived and disorienting to re-skeleton over a quiz the user just answered. The spinner-with-context (`Checking answers…`) stays as today.
+
+#### Test strategy
+
+**`error-classes.test.ts`** (new, ≥18 cases):
+1. `classifyError("internal", "host disconnected")` → `host-unreachable`.
+2. `classifyError("internal", "host did not respond")` → `host-timeout`.
+3. `classifyError("internal", "Unexpected reply kind: ping")` → `host-unexpected-reply { replyKind: "ping" }`.
+4. `classifyError("internal", "connect failed: ENOENT")` → `host-unreachable`.
+5. `classifyError("internal", "sendFrame threw: ...")` → `transport-internal`.
+6. `classifyError("internal", "invalid SW response")` → `transport-internal`.
+7. `classifyError("internal", "replay failed: ...")` → `transport-internal`.
+8. `classifyError("internal", "some other thing")` → `internal` (genuine host-side).
+9–16. One case per wire `ErrorReason` value, asserting 1:1 mapping.
+17. `errorClassToUI` returns a non-empty title + body for every variant (exhaustive switch).
+18. `errorClassToUI({ kind: "host-unreachable" }).cta?.action.kind === "install-host"`.
+19. Marker-drift canary: import `PORT_ERROR_MARKERS` from `port.ts` and `QUIZ_FLOW_ERROR_MARKERS` from `quiz-flow.ts`; assert every value is recognised by `classifyError`.
+
+**`focus-trap.test.ts`** (new, ≥6 cases — jsdom):
+1. Activate on a container with three buttons → focus is on the first button.
+2. Tab from the last button → focus wraps to the first.
+3. Shift+Tab from the first → focus wraps to the last.
+4. Tab in the middle → moves to the next focusable (no wrap).
+5. Deactivate → focus restored to the previously-focused element.
+6. Deactivate twice → idempotent (no throw).
+7. Activate on an empty container → focus on the container itself (tabindex="-1" fallback).
+
+**`modal.test.ts`** (extended, ≥10 new cases):
+1. State transition: idle → generating shows skeleton + spinner + Cancel button.
+2. Generating → ready (on quiz-ready outcome): renders questions, first radio focused.
+3. Ready → submitting (on submit): spinner shown, no questions, Cancel button focused.
+4. Submitting → passed: green banner, Dismiss focused.
+5. Submitting → failed: red banner, "Try Again" button focused.
+6. Failed → generating (on Try Again click): emits `quiz-retry`, skeleton shown.
+7. Error: `bad-credentials` → "Credentials rejected" + "Open options" CTA.
+8. Error: `host-unreachable` (synthesised from "host disconnected" message) → "Native host not installed" + "Install host" CTA.
+9. Error: `host-timeout` (synthesised from "host did not respond" message) → "Host didn't respond" + "Retry" CTA.
+10. Error: `version-mismatch` → "Protocol version mismatch" + "Install host" CTA.
+11. `aria-live` region announces "Generating quiz" on entering `generating`.
+12. `aria-live` region announces "Quiz ready, 2 questions" on entering `ready`.
+13. Focus trap: Tab from last focusable in `ready` wraps to first.
+14. Esc in `passed` state: closes WITHOUT emitting `quiz-cancel` (already approved).
+15. Esc in `error` state: emits `quiz-cancel`.
+16. `prefers-reduced-motion: reduce` (via `matchMedia` mock) → spinner has no animation property set (or has `animation: none`).
+17. Each question is wrapped in `<fieldset>` with a `<legend>` containing the prompt text.
+18. `aria-labelledby` on the backdrop points to an element whose id matches the `<h2>`.
+19. Retry CTA in error state: emits `quiz-retry { requestId }`.
+20. `aria-busy="true"` on the panel during `generating` and `submitting`; `false` otherwise.
+
+**`quiz-flow.test.ts`** (extended, ≥3 new cases):
+1. `quiz-retry` for a known requestId where `pending` is still alive → emits a new `quiz-request` to the SW with a fresh correlationId.
+2. `quiz-retry` for a requestId already dropped, but `currentPR` is set → synthesises a fresh `PendingApprove` (no blocked-event re-replay) and emits a new `quiz-request`.
+3. `quiz-retry` when `currentPR` is null → emits `quiz-result { error, message: "no active PR" }` and does not send a frame.
+
+**Coverage**: ≥85% on every new file; ≥90% on `error-classes.ts` (pure).
+
+**End-to-end**: existing Playwright happy-path coverage (ADR-19) does NOT change. A follow-up issue may add an e2e for the retry flow and a screen-reader smoke test (axe-playwright); explicitly out of scope here.
+
+#### Diff-only invariant
+
+This story touches **zero** LLM prompt construction. All copy is hard-coded constants in `error-classes.ts`. The `aria-live` announcements are derived from state-kind + question count — no diff text, no LLM-returned text beyond the existing `question.prompt` / `choice.label` (which were already in the quiz response and rendered safely via `textContent` per ADR-18). The CLAUDE.md §Key differentiator invariant is preserved by construction.
+
+### Consequences
+
+- **The modal becomes a real product.** Each error has a title, a body, and a clear next action. Transient failures are one-click recoverable. Adapter / credential failures route the user directly to the options page.
+- **No protocol changes.** The wire-level `ErrorReason` enum is untouched. The new `DisplayErrorClass` is an extension-internal classification; if the wire enum grows in a future ADR, only `error-classes.ts` and the UI table need updates.
+- **One new DOM event** (`lgtm-buzzer:quiz-retry`) joins the four existing extension-internal events. Additive; no breaking change to ADR-18's event bus.
+- **No new runtime dependencies.** ~80 LOC for the focus trap, ~120 LOC for `error-classes.ts`, ~150 LOC of CSS for skeletons + visually-hidden region. All hand-rolled, all reviewed.
+- **Accessibility committed at WCAG AA.** Documented in `packages/extension/README.md`. AAA is aspirational and may motivate a follow-up issue.
+- **Cancel during generation still wastes LLM cycles** (Option A). The follow-up issue for Option B (`quiz-cancel-request` wire frame + host fiber cancellation) is filed at PR-merge time. The waste is bounded: the SW's 60s timeout caps the orphan cost.
+- **Marker-string coupling between transport modules and the modal classifier.** Mitigated by extracting named constants in `port.ts` / `quiz-flow.ts` and a drift-canary test in `error-classes.test.ts`. Future refactors of those marker strings touch one constant.
+- **Submit-state Cancel button is new.** Today the modal has no Cancel during submitting. The new state machine adds one for symmetry with generating. The CS handles a late `quiz-result` after submit-cancel the same way it handles a late post-cancel reply (drops it).
+- **Retry is user-driven, not Schedule-driven.** Architect picked the host as the right layer for `Schedule`-based automatic retries (LLM transient failures). The modal stays simple. CLAUDE.md §Functional idiom #3 is honored: the modal is not "doing retries" — the user is. A follow-up issue may add `Schedule` in the LLM adapter where it belongs.
+- **Reduced-motion respected.** Animations gated on `prefers-reduced-motion: no-preference`. Vestibular users get a static, fast UI.
+- **First-class screen-reader announcements.** The `aria-live` region narrates state transitions. Combined with `aria-labelledby` and `<fieldset>` / `<legend>`, the modal becomes self-describing to assistive tech.
+- **Diff-only invariant preserved.** No new LLM prompt input path. All user-facing text is either hard-coded copy or pre-existing quiz fields (already invariant-safe).
+- **Reversibility moderate.** Rolling back is one folder delete (the two new files) plus a revert of the `modal.ts` refactor. The new `DOM_EVENTS.quizRetry` constant can stay (unused) without breaking anything.
+
+**Binding for the reviewer**:
+- (a) No new runtime dep in any package.
+- (b) `ErrorReasonSchema` in `protocol` is untouched. No new wire-level enum values.
+- (c) `classifyError` MUST import marker strings from `port.ts` / `quiz-flow.ts` as named constants, not duplicate string literals. The marker-drift canary test asserts this.
+- (d) The modal MUST render `<fieldset>` + `<legend>` for each question in `ready` state (replacing `role="radiogroup"`).
+- (e) Focus trap MUST be active in every non-idle state; deactivation happens in `closeModal()` and only there.
+- (f) Esc in `passed` state MUST NOT emit `quiz-cancel` (the approval is through). Esc in any other non-idle state MUST emit `quiz-cancel`.
+- (g) `aria-live` region MUST be present from initial render and updated on every state transition (not torn down and re-mounted per state — that breaks screen-reader announcement).
+- (h) All animations MUST be wrapped in `@media (prefers-reduced-motion: no-preference)`.
+- (i) `errorClassToUI` MUST be exhaustive over `DisplayErrorClass`. A `switch` with `assertNever` default suffices.
+- (j) No new LLM-prompt input paths. All copy is static. CLAUDE.md §Key differentiator preserved.
+- (k) `data-testid` attributes from ADR-19 + ADR-23 (`lgtm-buzzer-quiz-modal`, `lgtm-buzzer-quiz-submit`, `lgtm-buzzer-quiz-cancel`, `lgtm-buzzer-configure-options`) MUST remain unchanged. New testids for new affordances: `lgtm-buzzer-quiz-retry` on the Retry / Try Again button, `lgtm-buzzer-install-host` on the install-host link.
+
+---
+
+## ADR-25 (2026-05-23): Playwright e2e implementation — fixture HTML pages, SW-stub scenarios, page objects
+**Date**: 2026-05-23
+**Issue**: #51
+**Status**: Accepted
+
+### Context
+
+ADR-19 shipped the harness (`launchPersistentContext` + `sw.evaluate` stub +
+fixture-via-`page.route` + binding `data-testid` contract) and one happy-path
+spec. That was enough to gate the end of M2. M3 then doubled the extension's
+testable surface:
+
+- **ADR-22** (#49) added five new wire `ErrorReason` values (`unsupported-llm-adapter`,
+  `unsupported-vcs-adapter`, `bad-credentials`, `missing-credentials`, plus
+  retained `internal`).
+- **ADR-23** (#50) shipped the options page — adapter dropdowns, credential
+  inputs, Save, "Test connection" probe, `chrome.storage.local` persistence,
+  per-`quiz-request` storage injection in the SW.
+- **ADR-24** (#53) shipped a seven-kind modal state machine, focus-trap,
+  aria-live announcements, classified error rendering with four extension-
+  internal classes (`host-unreachable`, `host-timeout`, `host-unexpected-reply`,
+  `transport-internal`), Retry / Try Again wires, and the
+  `lgtm-buzzer:quiz-retry` DOM event.
+- **ADR-21** (#48) shipped the ADO content-script vote-button interceptor.
+
+None of these surfaces is exercised end-to-end. The unit tests cover each
+module in jsdom; the wire is contract-tested in `host`; but the *integrated*
+behaviour — real MV3 SW, real `chrome.storage.local`, real DOM, real
+`addEventListener` — is empirically un-validated. M3 cannot ship without
+that gate.
+
+Constraints that shape this design:
+
+- **Headless: false is binding.** ADR-19 §spec-comment-1 documented this:
+  Chrome does NOT expose MV3 extension service workers to CDP in headless
+  mode; `headless: true` makes `context.waitForEvent("serviceworker")` time
+  out unconditionally. Every new spec inherits this constraint. CI uses
+  `xvfb-run` on Linux (deferred to #54).
+- **No real network.** Every navigation goes through `page.route(...,
+  route.fulfill(...))` against a local HTML fixture. github.com,
+  dev.azure.com, and `*.visualstudio.com` are NEVER hit.
+- **No real native messaging host.** Every spec calls `sw.evaluate(stubScript)`
+  to install the same canned-port stub family from ADR-19. The stub is
+  scenario-parameterised so error-path specs do not need new stub modules.
+- **Test count budget: 15–25.** E2e is slow (~2s per case on dev hardware,
+  ~5s in CI cold). Twenty-ish cases stay within a 60s end-to-end budget.
+  Unit tests still catch the lion's share of regressions; e2e validates the
+  integration seams.
+- **Page-object pattern, not framework.** Vanilla TS classes wrapping
+  `Page` + the `data-testid` contract. No `playwright-fixtures` library
+  dependency — the project already mandates minimal devDeps and the
+  patterns are short enough to maintain by hand.
+- **`data-testid` is the test surface.** ADR-19 §7 made these binding; ADR-24
+  added `lgtm-buzzer-quiz-retry`, `lgtm-buzzer-install-host`,
+  `lgtm-buzzer-configure-options`. The options page DOM uses `data-lgtm-*`
+  attributes (`data-lgtm-select`, `data-lgtm-cred-input`, `data-lgtm-btn`,
+  `data-lgtm-banner`, etc.) — the e2e suite uses those as-is; no new attrs.
+  ADO interception uses a fixture that ships its own
+  `data-testid="complete-vote-button"` per the known ADO contract.
+
+### Decision
+
+Expand `packages/extension/e2e/` into a six-spec suite with three page
+objects, two scenario-driven fixture HTML pages, a generalised SW stub, and
+shared spec scaffolding. All existing ADR-19 contracts (headless: false,
+stub-via-`sw.evaluate`, fixture-via-`page.route`, `state: "attached"` for
+shadow-root host, `npm run test:e2e` gate separate from `npm run check`)
+carry over unchanged. The existing `quiz-happy-path.spec.ts` becomes
+`happy-path.spec.ts` with the same body refactored to use the new page
+objects.
+
+#### Affected workspaces
+
+`packages/extension` only. No changes to `protocol`, `core`, `adapters/*`,
+or `host`.
+
+**Dependency arrows reaffirmed**:
+
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+```
+
+The e2e suite imports nothing from workspace packages (the stub script must
+remain self-contained per ADR-19 §3 — the script is a string literal that
+runs inside the browser process). The page objects and helpers are pure
+Node-side TS that wrap `@playwright/test`'s `Page` / `BrowserContext` /
+`Worker` types.
+
+#### Scope (the six specs)
+
+| # | File | Cases | Purpose |
+|---|---|---|---|
+| 1 | `e2e/happy-path.spec.ts` | 1–2 | Replay-only (ADR-19 §6 refactored to use page objects). Adds a "re-click Approve after pass = no modal" assertion (replay flow). |
+| 2 | `e2e/failure-retry.spec.ts` | 2 | Wrong answers → `failed` state with Try Again → retry → pass. Plus: a partial-answers Submit attempt is blocked (no `quiz-submit` frame sent). |
+| 3 | `e2e/error-paths.spec.ts` | 6 | Data-driven over the six representative `DisplayErrorClass` variants visible from the SW-stub: `bad-credentials`, `missing-credentials`, `host-unreachable` (synthesised via "host disconnected" message), `host-timeout` (via "host did not respond"), `unsupported-llm-adapter`, `internal` (genuine host-side). Each case asserts the modal renders the ADR-24-binding `(title, CTA label, CTA action wire)`. |
+| 4 | `e2e/options-page.spec.ts` | 4 | (a) Mount with empty storage → `list-adapters-request` populates dropdowns. (b) Save → reload → values + (redacted) credentials persist via `chrome.storage.local`. (c) "Test connection" → success banner. (d) "Test connection" with bad-creds stub-reply → red banner with the ADR-23 copy. |
+| 5 | `e2e/accessibility.spec.ts` | 3 | (a) Focus trap wraps Tab/Shift+Tab. (b) Esc dismisses (in non-`passed` states emits `quiz-cancel`; passed dismisses without cancel). (c) `aria-modal`, `aria-labelledby`, and `aria-live` present and updated. |
+| 6 | `e2e/ado-intercept.spec.ts` | 1–2 | ADO fixture with `data-testid="complete-vote-button"` → vote click intercepted → modal opens with the same canned quiz. Smoke only — does not re-test the full quiz flow (covered by happy-path). |
+
+Total: 17–19 cases. Within the budget.
+
+**Cases the SW stub cannot drive** (documented out-of-scope):
+- `version-mismatch`, `schema-violation`, `unknown-message`, `unknown-quiz-id`,
+  `host-unexpected-reply` (the last two require the stub to send a malformed
+  reply or a wrong-kind frame). These are unit-tested in `modal.test.ts` and
+  `error-classes.test.ts`; the e2e suite covers six representative classes,
+  not all thirteen.
+
+#### What is NOT covered (binding)
+
+- **Real LLM CLIs.** Subprocess-based and HTTP-based adapters
+  (claude-cli, codex-cli, copilot-cli, claude-api) are too slow and
+  non-deterministic for e2e. Their behaviour is covered by adapter
+  contract tests + httptape recordings.
+- **Real native messaging host.** The manifest installer + the host
+  binary are validated by manual smoke in the M3 walkthrough; the SW
+  stub stands in for the wire in e2e.
+- **Real network to github.com / dev.azure.com / *.visualstudio.com.**
+  Fixtures only.
+- **promptfoo eval suite** (#52). That covers quiz quality, not flow.
+- **Cross-browser** (Firefox / Safari). Chrome MV3 only for v1.
+- **Visual regression / screenshot diffing.** Out of scope; the modal's
+  copy and CTAs are asserted via text + `data-testid`.
+- **Real `chrome.storage.local` cross-page leak.** The options-page spec
+  asserts persistence within one persistent context; nothing more.
+
+#### Test infrastructure
+
+##### 1. Fixture HTML pages — two files
+
+`e2e/fixtures/github-pr.html` (existing — ADR-19 §4, unchanged shape but
+upgrade the title metadata):
+
+- Hidden `<input name="pull_request_review[event]" value="approve">` form.
+- `<button id="approve-btn" type="submit">Approve</button>`.
+- Bubble-phase listener sets `body[data-form-submitted="true"]` when the
+  form submit is not preventDefaulted.
+
+`e2e/fixtures/ado-pr.html` (new):
+
+- A `<button data-testid="complete-vote-button">Approve</button>` matching the
+  ADR-21 KNOWN_ADO_VOTE_TESTIDS contract.
+- Bubble-phase click listener sets
+  `body[data-vote-clicked="true"]` when the click is not preventDefaulted (no
+  form submit; ADO uses click handlers).
+- URL routed: `https://dev.azure.com/contoso/MyProj/_git/MyRepo/pullrequest/42`.
+
+Both fixtures are minimal — they contain only what the CS interceptors need.
+Adding marketing copy / GitHub chrome / etc. is forbidden (it would invite
+testing the chrome, not the gate).
+
+##### 2. SW stub generalisation — scenario-parameterised builder
+
+`e2e/helpers/sw-stub.ts` (renamed from `e2e/sw-stub.ts`):
+
+```ts
+/** The scenarios the stub knows how to play. */
+export type StubScenario =
+  | { readonly kind: "happy"; readonly quiz: CannedQuiz; readonly correctAnswers: CannedCorrectAnswers }
+  | { readonly kind: "wrong-then-right"; readonly quiz: CannedQuiz; readonly correctAnswers: CannedCorrectAnswers }
+  // Error scenarios reply to `quiz-request` with an ErrorFrame.
+  | { readonly kind: "error-on-quiz-request"; readonly reason: WireErrorReason; readonly message: string }
+  // The probe scenario answers `ping` with a matching `pong` (or a mismatched nonce on demand).
+  | { readonly kind: "list-adapters"; readonly llm: readonly string[]; readonly vcs: readonly string[] }
+  | { readonly kind: "list-adapters-then-happy"; readonly llm: readonly string[]; readonly vcs: readonly string[]; readonly quiz: CannedQuiz; readonly correctAnswers: CannedCorrectAnswers }
+  // Mixed scenario for options-page tests: list-adapters succeeds, probe replies with bad-creds error.
+  | { readonly kind: "probe-bad-credentials"; readonly llm: readonly string[]; readonly vcs: readonly string[] };
+
+export type WireErrorReason =
+  | "bad-credentials"
+  | "missing-credentials"
+  | "internal"             // genuine host-side internal — also used to drive transport markers
+  | "unsupported-llm-adapter"
+  | "unsupported-vcs-adapter";
+
+export const buildSwStubScript = (scenario: StubScenario): string;
+```
+
+The returned string still passes through `sw.evaluate(...)`. Internally the
+stub branches on `scenario.kind`:
+
+- `happy` — same as ADR-19 §3.
+- `wrong-then-right` — first `quiz-submit` returns `passed: false` regardless
+  of answers; second `quiz-submit` scores normally. State is a stub-local
+  counter, not exposed to the page.
+- `error-on-quiz-request` — `quiz-request` returns `{ kind: "error",
+  payload: { reason, message } }`. `ping` still returns `pong` so SW
+  liveness checks pass.
+- `list-adapters` — `list-adapters-request` returns
+  `{ kind: "list-adapters-response", payload: { llm, vcs } }`. All other
+  frames return a generic ErrorFrame `{ reason: "internal", message: "scenario does not handle this kind" }`.
+- `list-adapters-then-happy` — combines `list-adapters` (for the options
+  page) with `happy` (for the quiz flow).
+- `probe-bad-credentials` — `list-adapters` succeeds, `ping` returns an
+  ErrorFrame with `reason: "bad-credentials"`. (v1 probe uses ping; this
+  exercises the dom.ts banner code path.)
+
+The stub continues to carry a setup-time `__LGTM_E2E_STUB__` marker for
+race-free detection. Each scenario sets a separate marker namespace
+(`__LGTM_E2E_STUB__: "happy" | "wrong-then-right" | ...`) so specs can
+sanity-check the scenario they expect was installed.
+
+##### 3. Shared spec scaffolding
+
+`e2e/helpers/context.ts` (new):
+
+```ts
+/**
+ * Launches a persistent Chromium context with the unpacked extension and the
+ * named SW stub scenario installed. Resolves only after the SW event fires
+ * AND the stub marker is set.
+ */
+export const launchExtensionContext = async (deps: {
+  readonly scenario: StubScenario;
+}): Promise<{
+  readonly context: BrowserContext;
+  readonly sw: Worker;
+  readonly cleanup: () => Promise<void>;
+}>;
+
+/**
+ * Asserts the built extension artifact exists at `.output/chrome-mv3/`.
+ * Fails fast with the same "run npm run build first" message as ADR-19.
+ */
+export const assertBuiltExtension = (): void;
+
+/**
+ * Routes one or more GitHub / ADO PR URLs to local fixture HTML files via
+ * `page.route(...)`. Centralised so specs don't duplicate the URL list.
+ */
+export const routeFixtures = async (page: Page, routes: ReadonlyArray<{
+  readonly url: string;
+  readonly fixturePath: string;
+}>): Promise<void>;
+```
+
+`e2e/helpers/fixture-paths.ts` (new):
+
+```ts
+export const FIXTURE_URLS = {
+  github: "https://github.com/owner/repo/pull/1",
+  ado: "https://dev.azure.com/contoso/MyProj/_git/MyRepo/pullrequest/42",
+} as const;
+
+export const FIXTURE_FILES = {
+  github: "fixtures/github-pr.html",
+  ado: "fixtures/ado-pr.html",
+} as const;
+```
+
+##### 4. Page objects — three files
+
+Each page object wraps a Playwright `Page` and exposes a typed API over the
+binding `data-testid` and `data-lgtm-*` attribute contracts. No
+`PageObjectModel`-style framework; just classes with methods.
+
+`e2e/pages/pr-page.ts` (new) — wraps the GitHub or ADO fixture page:
+
+```ts
+export class PRPage {
+  constructor(private readonly page: Page, private readonly variant: "github" | "ado");
+
+  /** Clicks the Approve / Vote button. */
+  async clickApprove(): Promise<void>;
+
+  /** Asserts the underlying form (GitHub) or click (ADO) succeeded — i.e. the gate let it through. */
+  async expectApproved(): Promise<void>;
+
+  /** Asserts the gate blocked the submit. */
+  async expectBlocked(): Promise<void>;
+}
+```
+
+`e2e/pages/quiz-modal.ts` (new) — wraps the Shadow-DOM modal:
+
+```ts
+/** The seven-kind ADR-24 state machine as observed from the e2e surface. */
+export type ObservedState =
+  | "generating" | "ready" | "submitting" | "passed" | "failed" | "error";
+
+export class QuizModal {
+  constructor(private readonly page: Page);
+
+  /** Waits for the modal host to attach. Uses `state: "attached"` per ADR-19. */
+  async waitForOpen(): Promise<void>;
+
+  /** Asserts the modal is no longer in the DOM. */
+  async waitForClosed(): Promise<void>;
+
+  /** Returns the modal's currently-observable state derived from on-screen testids. */
+  async getState(): Promise<ObservedState>;
+
+  /** Selects a choice within a question by id. */
+  async answerQuestion(questionId: string, choiceId: string): Promise<void>;
+
+  /** Clicks Submit (must be enabled — all questions answered). */
+  async submit(): Promise<void>;
+
+  /** Clicks Retry / Try Again (works in `failed` and `error` states). */
+  async retry(): Promise<void>;
+
+  /** Clicks Cancel / Dismiss (state-dependent label). */
+  async cancel(): Promise<void>;
+
+  /** Returns the rendered error title + body + CTA label, when in `error` state. */
+  async getErrorPanel(): Promise<{ title: string; body: string; cta?: string }>;
+
+  /** Returns the textContent of the aria-live region. */
+  async getAriaLive(): Promise<string>;
+
+  /** Returns true if the host backdrop carries the expected ARIA attributes. */
+  async hasAriaContract(): Promise<boolean>;
+
+  /** Tabs `count` times from the panel; returns the focused element's data-testid (or text). */
+  async tabAndReadFocus(count: number, opts?: { shift?: boolean }): Promise<string | null>;
+}
+```
+
+`e2e/pages/options-page.ts` (new) — wraps the WXT options entrypoint:
+
+```ts
+export class OptionsPage {
+  constructor(private readonly page: Page, private readonly extensionId: string);
+
+  /** Navigates to `chrome-extension://${id}/options.html`. */
+  async open(): Promise<void>;
+
+  /** Returns the currently-rendered LLM / VCS adapter dropdown options. */
+  async getAdapterChoices(): Promise<{ llm: string[]; vcs: string[] }>;
+
+  /** Selects an LLM adapter; renders its credential inputs. */
+  async selectLlmAdapter(id: string): Promise<void>;
+
+  /** Selects a VCS adapter; renders its credential inputs. */
+  async selectVcsAdapter(id: string): Promise<void>;
+
+  /** Fills the named credential input under the LLM section. */
+  async setLlmCredential(field: string, value: string): Promise<void>;
+
+  /** Fills the named credential input under the VCS section. */
+  async setVcsCredential(field: string, value: string): Promise<void>;
+
+  /** Clicks Save; returns the visible banner kind + message after save resolves. */
+  async save(): Promise<{ kind: "success" | "error"; message: string }>;
+
+  /** Clicks Test connection; returns the visible banner kind + message. */
+  async testConnection(): Promise<{ kind: "success" | "error"; message: string }>;
+}
+```
+
+The `OptionsPage.open()` resolves the extension ID by inspecting the SW URL
+(`sw.url()` is `chrome-extension://<id>/background.js`; the id is the second
+URL segment). The `launchExtensionContext` helper exposes the resolved
+extension id as a return field for callers that need it (the options-page
+spec).
+
+##### 5. Test data — single canonical quiz, scenario overrides
+
+`e2e/helpers/canned-quiz.ts` (new):
+
+```ts
+/** The "canonical" two-question multiple-choice quiz used across happy-path tests. */
+export const CANONICAL_QUIZ: CannedQuiz = {
+  id: "e2e-quiz-1",
+  questions: [
+    { type: "multiple-choice", id: "q1", prompt: "Which file was modified?",
+      choices: [{ id: "c1", label: "src/foo.ts" }, { id: "c2", label: "src/bar.ts" }] },
+    { type: "multiple-choice", id: "q2", prompt: "What did the change add?",
+      choices: [{ id: "c1", label: "A bug" }, { id: "c2", label: "A feature" }] },
+  ],
+};
+
+export const CANONICAL_CORRECT: CannedCorrectAnswers = { q1: "c1", q2: "c2" };
+```
+
+Error-path and options-page specs override per-test; failure-retry spec uses
+the same canonical quiz.
+
+#### Types
+
+All new types live under `packages/extension/e2e/` and are not exported to
+any other workspace.
+
+```ts
+// e2e/helpers/sw-stub.ts (extended from ADR-19)
+export type CannedQuiz = /* unchanged from ADR-19 §Types */;
+export type CannedCorrectAnswers = Readonly<Record<string, string>>;
+export type WireErrorReason = /* see scenario types above */;
+export type StubScenario = /* see scenario types above */;
+
+// e2e/helpers/context.ts
+export type LaunchedContext = {
+  readonly context: BrowserContext;
+  readonly sw: Worker;
+  readonly extensionId: string;
+  readonly cleanup: () => Promise<void>;
+};
+
+// e2e/pages/quiz-modal.ts
+export type ObservedState = /* see page object above */;
+```
+
+No port interfaces, no `Result` / `Either`. E2e is the standard Playwright
++ Page-Object pattern. Per CLAUDE.md §Dependency rules, the extension
+"defaults to plain TS + zod" — and the e2e folder already has an ESLint
+override (ADR-19 §8) lifting the `no-restricted-imports` `node:*` ban.
+
+#### Functions and methods
+
+The new exported surface:
+
+- `buildSwStubScript(scenario: StubScenario): string` — generalised from
+  ADR-19's two-arg form.
+- `launchExtensionContext(deps: { scenario: StubScenario }): Promise<LaunchedContext>`.
+- `assertBuiltExtension(): void`.
+- `routeFixtures(page: Page, routes: ReadonlyArray<{ url: string; fixturePath: string }>): Promise<void>`.
+- `class PRPage`, `class QuizModal`, `class OptionsPage` per §4.
+- `CANONICAL_QUIZ`, `CANONICAL_CORRECT`, `FIXTURE_URLS`, `FIXTURE_FILES` constants.
+
+No new exported types in any non-e2e package.
+
+#### File layout
+
+**New (15)**:
+
+- `packages/extension/e2e/helpers/context.ts`
+- `packages/extension/e2e/helpers/fixture-paths.ts`
+- `packages/extension/e2e/helpers/canned-quiz.ts`
+- `packages/extension/e2e/pages/pr-page.ts`
+- `packages/extension/e2e/pages/quiz-modal.ts`
+- `packages/extension/e2e/pages/options-page.ts`
+- `packages/extension/e2e/happy-path.spec.ts` (replaces `quiz-happy-path.spec.ts`)
+- `packages/extension/e2e/failure-retry.spec.ts`
+- `packages/extension/e2e/error-paths.spec.ts`
+- `packages/extension/e2e/options-page.spec.ts`
+- `packages/extension/e2e/accessibility.spec.ts`
+- `packages/extension/e2e/ado-intercept.spec.ts`
+- `packages/extension/e2e/fixtures/ado-pr.html`
+- `packages/extension/e2e/README.md` — explains the suite, how to run,
+  the headless: false and `--load-extension` constraints, the SW-stub
+  scenario API, the page-object pattern, and the
+  `npm run build` prerequisite.
+- (No new TS config — existing `e2e/tsconfig.json` covers everything.)
+
+**Modified (4)**:
+
+- `packages/extension/e2e/sw-stub.ts` → moved to `packages/extension/e2e/helpers/sw-stub.ts`; the `buildSwStubScript` signature changes from `(quiz, correctAnswers)` to `(scenario)`. Existing callers are migrated as part of this work.
+- `packages/extension/e2e/quiz-happy-path.spec.ts` → renamed to `happy-path.spec.ts`; rewritten on top of the page objects. Behaviour preserved + the replay assertion added (re-click Approve after pass → modal stays closed, form submits).
+- `packages/extension/e2e/fixtures/github-pr.html` — unchanged structure; one cosmetic comment update pointing to ADR-25 alongside ADR-19.
+- `packages/extension/e2e/playwright.config.ts` — `testMatch` already `"**/*.spec.ts"` so it picks up the new files automatically. The deprecated `use.headless: true` value is updated to `headless: false` to match the actual launch options (the previous setting was vestigial — the spec already overrides per ADR-19). `reporter` stays `[["list"], ["html", { open: "never" }]]`. `retries` stays at 0 (deterministic stubs); if a CI flake emerges, raise to 1 with `trace: "on-first-retry"` (already configured).
+
+**Unchanged**:
+
+- `packages/protocol/**`, `packages/core/**`, `packages/adapters/**`,
+  `packages/host/**`.
+- `packages/extension/src/**`, `packages/extension/entrypoints/**`
+  (no test-id additions required — every needed selector is already
+  present from ADR-19, ADR-23, ADR-24).
+- `packages/extension/package.json` — no new deps. (`@playwright/test`
+  already devDep.)
+- `eslint.config.js` — ADR-19's `e2e/**` override already covers `helpers/**`
+  and `pages/**` (matches `packages/extension/e2e/**/*.ts`).
+
+#### Sequence
+
+##### A. happy-path.spec.ts (single test case, end-to-end replay assertion)
+
+1. `assertBuiltExtension()`; `launchExtensionContext({ scenario: { kind: "happy", quiz: CANONICAL_QUIZ, correctAnswers: CANONICAL_CORRECT } })`.
+2. Create `page`; `routeFixtures(page, [{ url: FIXTURE_URLS.github, fixturePath: FIXTURE_FILES.github }])`.
+3. `page.goto(FIXTURE_URLS.github)`.
+4. Construct `pr = new PRPage(page, "github")`, `modal = new QuizModal(page)`.
+5. `await pr.clickApprove()` → modal opens.
+6. `await modal.waitForOpen()`; assert `await pr.expectBlocked()`.
+7. `await modal.answerQuestion("q1", "c1")`; `await modal.answerQuestion("q2", "c2")`; `await modal.submit()`.
+8. `await pr.expectApproved()`.
+9. **Replay assertion**: `await pr.clickApprove()` again on the same page; assert the modal does NOT reopen (it stays closed per ADR-17 §replay cache), and that the form submitted again (a new `body[data-form-submitted]` cycle — easiest assertion is the form's request was attempted; specifically the fixture's bubble-phase listener fires a second time).
+
+##### B. failure-retry.spec.ts
+
+Test 1 — wrong answers → failed → Try Again → correct:
+1. Launch with `{ kind: "wrong-then-right", quiz: CANONICAL_QUIZ, correctAnswers: CANONICAL_CORRECT }`.
+2. Click Approve → modal opens.
+3. Answer with wrong choices (`q1: c2`, `q2: c1`) → Submit → modal transitions to `failed`.
+4. Assert `modal.getState() === "failed"`.
+5. Click Try Again → modal emits `quiz-retry`; modal transitions back to `generating`, then `ready` with the same canonical quiz.
+6. Answer correctly → Submit → modal transitions to `passed` → form submitted.
+
+Test 2 — partial answers cannot submit:
+1. Launch happy scenario.
+2. Open modal; answer only `q1`; click the Submit button.
+3. Assert the Submit button is disabled (or `aria-disabled="true"`) and the modal remains in `ready`. ADR-24 §State machine binding requires "Submit button (all answered)" gate — confirm the e2e behaviour.
+
+##### C. error-paths.spec.ts (six data-driven cases)
+
+Per-case:
+1. Launch with `{ kind: "error-on-quiz-request", reason, message }` (or a "happy" scenario when the error is transport-class — the SW stub cannot easily synthesise transport errors; for `host-unreachable` and `host-timeout` we deliberately use the `internal` reason with the exact marker string the modal's `classifyError` recognises).
+2. Click Approve → modal opens → transitions to `error`.
+3. Assert `modal.getState() === "error"` AND `modal.getErrorPanel().title === expectedTitle`, `cta === expectedCtaLabel`.
+4. Drive the CTA per the case:
+   - `retry` cases → click Retry; modal transitions to `generating` (then back to `error` since the stub keeps returning the same reason — assert one cycle).
+   - `open-options` cases → click "Open options"; assert the modal closed and the browser opened the options page (`pages()` length increased OR `page.url()` shows `chrome-extension://${id}/options.html` in a new tab).
+   - `install-host` cases — open a new tab to the README URL. Assertion: a new page with the configured `target="_blank"` URL was opened (mock via `context.waitForEvent("page")`).
+
+The six cases:
+| Case | Stub scenario | Expected title | CTA label | CTA assertion |
+|---|---|---|---|---|
+| `bad-credentials` | `error-on-quiz-request { reason: "bad-credentials" }` | "Credentials rejected" | "Open options" | options page opens |
+| `missing-credentials` | `error-on-quiz-request { reason: "missing-credentials" }` | "Credentials required" | "Open options" | options page opens |
+| `host-unreachable` | `error-on-quiz-request { reason: "internal", message: "host disconnected" }` | "Native host not installed" | "Install host" | new tab opens |
+| `host-timeout` | `error-on-quiz-request { reason: "internal", message: "host did not respond" }` | "Host didn't respond" | "Retry" | retry cycle observed |
+| `unsupported-llm-adapter` | `error-on-quiz-request { reason: "unsupported-llm-adapter" }` | "LLM adapter not available" | "Open options" | options page opens |
+| `internal` | `error-on-quiz-request { reason: "internal", message: "some other internal" }` | "Host error" | "Retry" | retry cycle observed |
+
+##### D. options-page.spec.ts (four cases)
+
+Test 1 — list-adapters populates dropdowns:
+1. Launch with `{ kind: "list-adapters", llm: ["claude-cli", "claude-api"], vcs: ["github", "ado"] }`.
+2. `new OptionsPage(page, extensionId).open()`.
+3. `getAdapterChoices()` → `{ llm: [...], vcs: [...] }`.
+
+Test 2 — Save + reload persists:
+1. Launch with `list-adapters` scenario.
+2. Open options; select `claude-api`, fill `apiKey`, select `github`, fill `pat`; Save.
+3. Close the options page tab; open a new options page tab; assert dropdowns pre-select stored values AND credential inputs are pre-filled (input.value matches what was saved; this asserts persistence end-to-end through `chrome.storage.local`).
+
+Test 3 — Test connection success:
+1. Launch with `list-adapters` scenario; ping replies pong with matching nonce.
+2. Open options; select claude-cli + github; click Test connection.
+3. Assert green "Connection successful!" banner.
+
+Test 4 — Test connection bad-credentials banner:
+1. Launch with `{ kind: "probe-bad-credentials" }`; ping replies with `ErrorFrame { reason: "bad-credentials" }`.
+2. Open options; select claude-api + github; fill some creds; click Test connection.
+3. Assert red banner with the ADR-23 copy "Credentials rejected by the adapter. Re-enter and try again."
+4. **Security canary**: assert the saved credential string (e.g. `"SECRET_CANARY_xxx"`) does NOT appear anywhere in `page.content()`.
+
+##### E. accessibility.spec.ts (three cases)
+
+Test 1 — Focus trap wraps:
+1. Launch happy scenario; open modal; reach `ready` state with two questions.
+2. Use `modal.tabAndReadFocus(n)` to walk focus from the panel's first focusable element through the last; assert the last Tab wraps to the first; assert Shift+Tab from the first wraps to the last.
+
+Test 2 — Esc dismisses (cancel semantics):
+1. Launch happy scenario; open modal in `ready`.
+2. `page.keyboard.press("Escape")`; assert modal closed AND the bypass flag was NOT set (form should NOT have been submitted).
+3. Re-open + reach `passed`; press Esc; assert modal closed AND form IS submitted (already approved before Esc).
+
+Test 3 — ARIA contract:
+1. Launch happy scenario; open modal.
+2. Assert `modal.hasAriaContract()` returns true: backdrop has `role="dialog"`, `aria-modal="true"`, `aria-labelledby="lgtm-buzzer-modal-title"`.
+3. Drive `generating → ready → submitting`; assert `modal.getAriaLive()` updates on each transition with non-empty text.
+
+##### F. ado-intercept.spec.ts (one or two cases)
+
+Test 1 — ADO vote click intercepted:
+1. Launch happy scenario; route ADO fixture URL to `fixtures/ado-pr.html`.
+2. `page.goto(FIXTURE_URLS.ado)`.
+3. `pr = new PRPage(page, "ado")`; `pr.clickApprove()`.
+4. `modal.waitForOpen()`; assert `await pr.expectBlocked()`.
+5. (Optional cheap follow-through:) answer correctly; assert `body[data-vote-clicked="true"]` set after pass — this exercises ADR-21's `replayApprove` for ADO (`element.click()` instead of `requestSubmit`).
+
+(Optional test 2 — recognition of `aria-label="Approve"` button without
+`data-testid`, exercising ADR-21 Layer 2 — defer if tight on time; the unit
+test in `ado-vote-intercept.test.ts` already covers it.)
+
+#### Error cases (test-suite robustness)
+
+| Failure | Surfaced as |
+|---|---|
+| `.output/chrome-mv3/` missing | `assertBuiltExtension` throws "Run npm run build first" (ADR-19 contract; preserved). |
+| Stub install race | `launchExtensionContext` awaits `context.waitForEvent("serviceworker")` AND `sw.evaluate(() => globalThis.__LGTM_E2E_STUB__ === <expected-marker>)` polls (5s) before returning. |
+| Modal selector drift | Page-object methods use binding `data-testid` from ADR-19/24. If a refactor breaks them, `waitForOpen` / `getState` / `submit` time out → fail fast with a clear locator error. |
+| Options-page selector drift | Page-object methods use `data-lgtm-*` attributes from the existing `dom.ts`. Same fail-fast story. |
+| ADO fixture's `data-testid` not in `KNOWN_ADO_VOTE_TESTIDS` | The fixture uses `complete-vote-button` — the production list. Drift between fixture and code is caught by the spec failing (modal does not open). |
+| Stub does not recognise a frame kind | Stub returns ErrorFrame `{ reason: "internal", message: "scenario does not handle this kind" }`; the modal surfaces it as a "Host error" panel. Catches spec/scenario mismatch obviously. |
+| Playwright Chromium not installed | `test:e2e:install` script (ADR-19, unchanged). |
+| Flaky timing | Single worker (`workers: 1`); retries: 0. If flakes appear, raise to 1 + use the existing `trace: "on-first-retry"`. |
+| Lingering temp profile dirs | Each spec's `cleanup()` calls `context.close()` and `fs.rmSync(userDataDir, { recursive: true, force: true })`. `playwright-report/` and `test-results/` already in `.gitignore` (ADR-19). |
+
+No `throw`s outside test setup invariants (e.g., missing build artifact).
+Expected test failures travel through Playwright's `expect()` / locator
+timeouts as designed.
+
+#### Test strategy
+
+**This ADR IS the test strategy artifact** — the e2e suite is the strategy
+for catching cross-package integration regressions in the extension. No new
+unit tests; no new contract tests; no protocol or core changes.
+
+**Coverage philosophy**:
+- Each new spec exercises a *user journey*, not a unit. The unit tests
+  underneath remain the source of truth for branch coverage.
+- Each binding contract from ADR-19, ADR-23, ADR-24 has at least one
+  e2e assertion to keep the contract honest:
+  - `data-testid` modal contract → asserted by every page-object call.
+  - Focus trap binding (ADR-24 §Binding-e) → asserted in accessibility.spec.ts.
+  - `aria-live` binding (ADR-24 §Binding-g) → asserted in accessibility.spec.ts test 3.
+  - `lgtm-buzzer-quiz-retry` testid (ADR-24 §Binding-k) → asserted in failure-retry.spec.ts + error-paths.spec.ts.
+  - `lgtm-buzzer-install-host` testid (ADR-24 §Binding-k) → asserted in error-paths.spec.ts (`host-unreachable` case).
+  - Per-class UI title/CTA mapping (ADR-24 §Per-class UI mapping) → asserted in error-paths.spec.ts.
+  - Options page persistence (ADR-23 §Sequence-A.5) → asserted in options-page.spec.ts test 2.
+  - SW injects storage projection into `quiz-request` (ADR-23 §Binding-b) → indirectly asserted by happy-path: the stub receives a `quiz-request` whose payload includes the adapter IDs the options page wrote. The stub's "happy" scenario does not validate this today; ADR-25 adds a stub-side assertion that the
+    `quiz-request` payload contains `llmAdapterId === "claude-api"` after the user saved that selection, and surfaces it via the `__LGTM_E2E_LAST_REQUEST__` global the spec can read. (Optional; if it complicates the stub, defer to an additional unit test of the router.)
+  - ADO intercept (ADR-21 §recognizeAdoVoteClick Layer 1) → asserted in ado-intercept.spec.ts.
+
+**Runtime budget**: ≤ 60s on dev hardware. ~3s per case × ~19 cases =
+~57s worst case; in practice closer to ~30s with parallel-within-spec
+test ordering and stub microtasks.
+
+**Failure visibility**: `trace: "on-first-retry"` + `reporter: [["list"],
+["html", { open: "never" }]]` (ADR-19; unchanged). On CI (#54), traces
+upload as an artifact when any spec fails.
+
+**Diff-only invariant audit (CLAUDE.md §Key differentiator)**: the e2e
+suite touches zero LLM prompt construction. The canned quiz is hard-coded
+in `e2e/helpers/canned-quiz.ts`; the stub never invokes a real adapter;
+no PR text is read by anything that talks to an LLM. The invariant is
+preserved by construction.
+
+#### CI integration (deferred to #54)
+
+This ADR documents the CI requirements; the wiring is #54's responsibility.
+
+- **OS**: Ubuntu (Linux). Windows / macOS not required for v1.
+- **Required system packages**: `xvfb-run` (or `Xvfb` + manual DISPLAY
+  export). Playwright's Chromium is downloaded by `npm run
+  test:e2e:install --workspace=@lgtm-buzzer/extension`. Other Playwright
+  system deps are installed by `npx playwright install-deps chromium`
+  (run once in the CI Dockerfile / setup step).
+- **Command**: `xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" npm run test:e2e --workspace=@lgtm-buzzer/extension`.
+- **Build prerequisite**: `npm run build --workspace=@lgtm-buzzer/extension`
+  must run before `test:e2e`.
+- **Artifact upload**: `packages/extension/playwright-report/` and
+  `packages/extension/test-results/` on failure.
+- **NOT in `npm run check`**: per ADR-19, `test:e2e` is a sibling gate.
+  `#54` may add it as a separate CI job that gates merge, not a step of
+  the main check.
+
+#### Reversibility / future work
+
+- New error-class scenarios (e.g., `version-mismatch` end-to-end) can be
+  added by extending `StubScenario` and adding cases in `error-paths.spec.ts`.
+- A Firefox / Safari variant lands as new projects in `playwright.config.ts`
+  + a forked `launchExtensionContext` that uses the Web Extensions API
+  shim. Out of scope for v1.
+- A real-host e2e variant (driving the actual native messaging host
+  + a stub LLM binary on PATH) can live alongside the stubbed suite as
+  `e2e-with-host/` — a separate config and gate. Out of scope.
+
+### Consequences
+
+- **The extension's integration surface is now empirically pinned.** Modal
+  state transitions, options-page persistence, ADO interception, and ARIA
+  contracts all break the build if they regress.
+- **No new runtime dependencies** in any package. The e2e suite already
+  has `@playwright/test` as a devDep (ADR-19). No new libraries.
+- **The `data-testid` and `data-lgtm-*` contracts become binding for
+  refactors.** Page objects are the only consumers; a renamed attribute
+  means a one-place update. Reviewer enforces.
+- **`headless: false` remains a binding constraint.** The new spec base
+  inherits it via `launchExtensionContext`. CI uses Xvfb (#54).
+- **The SW-stub scenario API is the canonical way to script the wire.**
+  Future e2e tests choose a scenario instead of writing inline stub JS.
+  Drift between the stub's JSON shape and the protocol's `FrameSchema` is
+  caught by the existing setup-time `parseFrame` round-trip from ADR-19 §3
+  (extended to every new scenario reply shape — add one round-trip per
+  new frame kind that the stub generates).
+- **Runtime cost**: ~30–60s per full run. Acceptable for a sibling
+  gate, not for the inner-loop `npm run check`.
+- **No protocol or core changes.** ADR-25 is extension-internal; no other
+  package can break because of this ADR.
+- **Diff-only invariant preserved by construction.** No LLM is invoked
+  in any e2e spec.
+- **Security**: no real network egress, no real credentials, no real
+  LLM, no real host. The fixture HTML files are static and contain no
+  GitHub / Microsoft branding or copyrighted assets — they are minimal
+  by design.
+- **Reversibility high**: removing the suite is `rm -r e2e/` and a
+  `package.json` script delete. The existing happy-path spec is
+  preserved (renamed) so the M2 gate stays green throughout the M3
+  rollout.
+
+**Binding for the reviewer**:
+- (a) No new runtime deps in any package. `@playwright/test` is devDep-only.
+- (b) No spec may navigate to a real `github.com`, `dev.azure.com`, or
+  `*.visualstudio.com` URL. Every navigation goes through
+  `routeFixtures(...)`.
+- (c) No spec may invoke a real LLM CLI or host binary. The SW stub is
+  the only wire.
+- (d) Every modal-related spec MUST use the `QuizModal` page object —
+  no inline `data-testid` selectors in `*.spec.ts`. Same for `PRPage`
+  and `OptionsPage`.
+- (e) The `data-testid` attributes from ADR-19/23/24 remain unchanged;
+  page objects reference them by constant.
+- (f) No spec asserts visual / screenshot output. Text + ARIA + state.
+- (g) `npm run test:e2e` MUST remain outside `npm run check`. CI runs
+  it as a sibling gate (#54).
+- (h) `headless: false` is binding; specs MUST NOT pass `headless: true`
+  to `launchPersistentContext`.
+- (i) Each new `StubScenario` reply frame MUST round-trip through
+  `parseFrame` at setup time (the ADR-19 anti-drift gate); the test
+  fails fast if the protocol shape drifts from the stub.
+- (j) No spec may persist secrets beyond the test's `cleanup()` — the
+  `userDataDir` is `fs.mkdtempSync`d per spec and removed on teardown.
+- (k) Diff-only invariant preserved: no spec constructs an LLM prompt.
+
+---
+

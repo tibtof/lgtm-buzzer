@@ -9,7 +9,7 @@
   <h1>Fix: improve review gate (#1)</h1>
 
   <!--
-    Minimal GitHub-style approve form.
+    Minimal GitHub-style approve form (ADR-19 §4, ADR-25 §1).
     The wire-stable contract is:
       <input name="pull_request_review[event]" value="approve">
     Server-side parameter; GitHub cannot change it without breaking their API.
@@ -26,7 +26,11 @@
     does requestSubmit() escape the capture handler — and this listener fires.
   -->
   <script>
-    document.querySelector('#approve-form').addEventListener('submit', function () {
+    document.querySelector('#approve-form').addEventListener('submit', function (e) {
+      // Prevent actual navigation so Playwright assertions on body attributes
+      // remain stable after the CS calls requestSubmit() (bypass path).
+      // The fixture marks the body so specs can assert the gate let it through.
+      e.preventDefault();
       document.body.setAttribute('data-form-submitted', 'true');
     });
   </script>
