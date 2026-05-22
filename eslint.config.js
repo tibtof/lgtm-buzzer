@@ -68,9 +68,9 @@ export default tseslint.config(
       ],
     },
   },
-  // Core and protocol may not depend on Node APIs, outer-layer packages, or forbidden FP libraries.
+  // Protocol may not depend on Node APIs, outer-layer packages, or forbidden FP libraries.
   {
-    files: ["packages/protocol/**/*.ts", "packages/core/**/*.ts"],
+    files: ["packages/protocol/**/*.ts"],
     rules: {
       "no-restricted-imports": [
         "error",
@@ -91,7 +91,7 @@ export default tseslint.config(
                 "crypto",
               ],
               message:
-                "Core and protocol must not depend on Node APIs. Define a port instead.",
+                "Protocol must not depend on Node APIs. Define a port instead.",
             },
             {
               group: [
@@ -100,7 +100,71 @@ export default tseslint.config(
                 "@lgtm-buzzer/extension",
               ],
               message:
-                "Core and protocol must not depend on outer-layer packages.",
+                "Protocol must not depend on outer-layer packages.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  // Core may not depend on Node APIs, outer-layer packages, forbidden FP libraries,
+  // or the monadyssey IO/Schedule surface (IO, Schedule, and related effect types).
+  // Core is side-effect-free by construction; ports describe effectful capabilities,
+  // adapters implement them. See CLAUDE.md per-package dependency policy.
+  {
+    files: ["packages/core/**/*.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            ...FORBIDDEN_FP_LIBS.paths,
+            {
+              name: "monadyssey",
+              importNames: [
+                "IO",
+                "Schedule",
+                "Policy",
+                "RepeatError",
+                "RetryError",
+                "PolicyValidationError",
+                "TimeoutError",
+                "CancellationError",
+                "ConditionalRetryError",
+                "Fiber",
+                "Cancelled",
+                "EvaluationError",
+                "Reader",
+              ],
+              message:
+                "Core must use only the IO-free surface of monadyssey (Either, Option, Eval, NonEmptyList, etc.). IO and Schedule belong in adapters. See CLAUDE.md per-package dependency policy.",
+            },
+          ],
+          patterns: [
+            ...FORBIDDEN_FP_LIBS.patterns,
+            {
+              group: [
+                "node:*",
+                "fs",
+                "fs/*",
+                "path",
+                "child_process",
+                "os",
+                "stream",
+                "util",
+                "crypto",
+              ],
+              message:
+                "Core must not depend on Node APIs. Define a port instead.",
+            },
+            {
+              group: [
+                "@lgtm-buzzer/adapter-*",
+                "@lgtm-buzzer/host",
+                "@lgtm-buzzer/extension",
+              ],
+              message:
+                "Core must not depend on outer-layer packages.",
             },
           ],
         },
