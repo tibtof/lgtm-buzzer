@@ -2,14 +2,26 @@
 /**
  * Native messaging host entry point.
  *
- * Reads length-prefixed JSON frames from stdin, dispatches them, and writes
- * responses back to stdout. On clean EOF the process exits with code 0. On
- * stream-level errors the process exits with code 1.
+ * Reads length-prefixed JSON frames from stdin, dispatches them via the
+ * frame dispatcher, and writes responses back to stdout. On clean EOF the
+ * process exits with code 0. On stream-level errors the process exits with
+ * code 1.
  *
- * Dispatch table (this issue):
- *   ping  → pong (echoes nonce + correlationId)
- *   error → warn + ignore (extension should not send error frames)
+ * Dispatch table:
+ *   ping          → pong (echoes nonce + correlationId)
+ *   error         → warn + ignore (extension should not send error frames)
+ *   quiz-request  → fetch diff, generate quiz, send quiz-response
+ *   quiz-submit   → score submission, send quiz-result
  *   decode failure → write ErrorFrame with reason "schema-violation"
+ *
+ * Required environment variables:
+ *   LGTM_BUZZER_GH_TOKEN  GitHub personal access token (classic or fine-grained).
+ *                         Required when handling quiz-request frames with pr.kind="github".
+ *                         If missing, an ErrorFrame { reason: "internal" } is returned.
+ *
+ * Optional environment variables:
+ *   LGTM_BUZZER_LLM        LLM adapter to use: "cli" (default) | "api" (not yet in M2).
+ *   LGTM_BUZZER_LOG_LEVEL  pino log level: trace|debug|info|warn|error|fatal|silent (default: info).
  */
 import process from "node:process";
 
@@ -20,27 +32,12 @@ import { createPinoLogger } from "./logger.js";
 import { createFrameReader } from "./framing/reader.js";
 import { createFrameWriter } from "./framing/writer.js";
 import type { DecodeError } from "./framing/errors.js";
+import { createSessionStore } from "./session-store.js";
+import { createDispatcher } from "./dispatcher.js";
 
 // ---------------------------------------------------------------------------
-// Dispatch helpers
+// Decode-error helper
 // ---------------------------------------------------------------------------
-
-/**
- * Builds a pong frame that echoes the ping's nonce and correlationId.
- *
- * @param correlationId - The correlationId from the incoming ping frame.
- * @param nonce - The optional nonce from the ping payload.
- * @returns A well-formed pong `Frame`.
- */
-const buildPong = (
-  correlationId: string | null,
-  nonce: string | undefined,
-): Frame => ({
-  v: PROTOCOL_VERSION,
-  kind: "pong",
-  correlationId,
-  payload: nonce !== undefined ? { nonce } : {},
-});
 
 /**
  * Builds an error frame for a decode failure.
@@ -77,6 +74,13 @@ const main = async (): Promise<void> => {
 
   const frames = readerResult.value;
   const write = createFrameWriter({ sink: process.stdout, logger });
+  const store = createSessionStore();
+  const { dispatch } = createDispatcher({
+    write,
+    store,
+    logger,
+    env: process.env,
+  });
 
   let streamFailed = false;
 
@@ -95,38 +99,15 @@ const main = async (): Promise<void> => {
       },
       // Right: well-formed frame — dispatch by kind
       async (frame) => {
-        logger.info("Dispatching frame", {
-          kind: frame.kind,
-          correlationId: frame.correlationId,
-        });
-
-        if (frame.kind === "ping") {
-          const pong = buildPong(frame.correlationId, frame.payload.nonce);
-          const writeResult = await write(pong).unsafeRun();
-          if (writeResult.type === "Err") {
-            logger.error("Failed to write pong frame", {
-              kind: writeResult.error.kind,
-            });
-            streamFailed = true;
-          }
-          return;
-        }
-
-        if (frame.kind === "error") {
-          // Extension should not send error frames to the host, but the schema
-          // allows it. Log at warn and ignore per issue #12 scope.
-          logger.warn("Received error frame from extension — ignoring", {
-            kind: frame.kind,
-            correlationId: frame.correlationId,
+        const dispatchResult = await dispatch(frame).unsafeRun();
+        if (dispatchResult.type === "Err") {
+          // dispatch returns IO<never, void> so this branch is unreachable,
+          // but we guard it defensively.
+          logger.error("Unexpected dispatch error — this is a bug", {
+            kind: "internal",
           });
-          return;
+          streamFailed = true;
         }
-
-        // Exhaustive guard: future frame kinds are ignored with a warn.
-        logger.warn("Received unhandled frame kind — ignoring", {
-          kind: (frame as Frame).kind,
-          correlationId: (frame as Frame).correlationId,
-        });
       },
     );
 
