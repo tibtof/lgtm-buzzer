@@ -20,6 +20,7 @@
     "build:libs": "node scripts/build-libs.mjs",
     "build:extension": "npm run build --workspace=@lgtm-buzzer/extension --if-present",
     "typecheck": "node scripts/build-libs.mjs",
+    "typecheck:tests": "node scripts/typecheck-tests.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint . --no-error-on-unmatched-pattern",

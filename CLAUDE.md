@@ -484,10 +484,17 @@ npm run build            # tsc -b for libs + wxt build for the extension
 npm run build:libs       # tsc -b only (skip the extension)
 npm run build:extension  # wxt build only
 npm test                 # vitest run across all packages
+npm run typecheck:tests  # tsc --noEmit over every *.test.ts file
 npm run lint             # eslint . (flat config, enforces dep direction)
 npm run format           # prettier --write .
 npm run clean            # tsc -b --clean
 ```
 
-`npm run check` (build + test + lint, the CI gate) is a TODO for the first
-CI ADR.
+`npm run typecheck:tests` runs the test-file type-check gate
+introduced by ADR-2. It is required because `tsc -b` excludes
+`**/*.test.ts` in every workspace's `tsconfig.json` and `vitest run`
+strips types via esbuild without checking them, so without this step
+type errors in tests slip through the gate.
+
+`npm run check` (the composed CI gate) is a TODO for issue #6 and
+will include `typecheck:tests` once it lands.
