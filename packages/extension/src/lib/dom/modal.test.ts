@@ -480,6 +480,78 @@ describe("createQuizModal", () => {
     document.removeEventListener(DOM_EVENTS.quizCancel, handler);
   });
 
+  // 15. data-testid contract (ADR-19 §7) — all five attributes must be present
+  it("sets data-testid='lgtm-buzzer-quiz-modal' on the modal host element", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    const host = document.querySelector("[data-lgtm-modal-host]");
+    expect(host).not.toBeNull();
+    expect(host!.getAttribute("data-testid")).toBe("lgtm-buzzer-quiz-modal");
+  });
+
+  it("sets data-question on each question container and data-choice on each radio", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document); // transitions to quiz-active with 2 questions
+
+    const shadow = getShadow(document)!;
+
+    // data-question attributes
+    const q1Block = shadow.querySelector("[data-question='q1']");
+    const q2Block = shadow.querySelector("[data-question='q2']");
+    expect(q1Block).not.toBeNull();
+    expect(q2Block).not.toBeNull();
+
+    // data-choice attributes inside q1
+    const c1Radio = q1Block!.querySelector("[data-choice='a']");
+    const c2Radio = q1Block!.querySelector("[data-choice='b']");
+    expect(c1Radio).not.toBeNull();
+    expect(c2Radio).not.toBeNull();
+  });
+
+  it("sets data-testid='lgtm-buzzer-quiz-submit' on the submit button in quiz-active state", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    const submitBtn = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-submit']");
+    expect(submitBtn).not.toBeNull();
+    expect(submitBtn!.tagName.toLowerCase()).toBe("button");
+  });
+
+  it("sets data-testid='lgtm-buzzer-quiz-cancel' on the cancel button in loading state", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document); // loading state
+
+    const shadow = getShadow(document)!;
+    const cancelBtn = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-cancel']");
+    expect(cancelBtn).not.toBeNull();
+    expect(cancelBtn!.tagName.toLowerCase()).toBe("button");
+  });
+
+  it("sets data-testid='lgtm-buzzer-quiz-cancel' on the cancel button in quiz-active state", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document); // quiz-active state
+
+    const shadow = getShadow(document)!;
+    const cancelBtn = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-cancel']");
+    expect(cancelBtn).not.toBeNull();
+    expect(cancelBtn!.tagName.toLowerCase()).toBe("button");
+  });
+
   beforeEach(() => {
     // Ensure a fresh document.body for each test.
     document.body.innerHTML = "";
