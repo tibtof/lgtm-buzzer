@@ -488,6 +488,7 @@ npm run typecheck:tests  # tsc --noEmit over every *.test.ts file
 npm run lint             # eslint . (flat config, enforces dep direction)
 npm run format           # prettier --write .
 npm run clean            # tsc -b --clean
+npm run check            # CI gate: build → test → lint → typecheck:tests
 ```
 
 `npm run typecheck:tests` runs the test-file type-check gate
@@ -496,5 +497,6 @@ introduced by ADR-2. It is required because `tsc -b` excludes
 strips types via esbuild without checking them, so without this step
 type errors in tests slip through the gate.
 
-`npm run check` (the composed CI gate) is a TODO for issue #6 and
-will include `typecheck:tests` once it lands.
+`npm run check` runs the full CI gate locally — required to pass before
+merging any PR. It chains `build`, `test`, `lint`, and `typecheck:tests`
+with `&&` so the first failing stage halts the run immediately.

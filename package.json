@@ -26,6 +26,7 @@
     "lint": "eslint . --no-error-on-unmatched-pattern",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "check": "npm run build && npm run test && npm run lint && npm run typecheck:tests",
     "clean": "tsc -b --clean"
   },
   "devDependencies": {
