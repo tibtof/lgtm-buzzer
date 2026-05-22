@@ -1,15 +1,17 @@
-import { Left, NonEmptyList, Right } from "monadyssey";
+import { Left, Right } from "monadyssey";
 import type { Either } from "monadyssey";
 import { z } from "zod";
-import type { LLMProviderError, Quiz, Question, Choice } from "@lgtm-buzzer/core";
+import type { LLMProviderError, Quiz } from "@lgtm-buzzer/core";
+import {
+  LlmQuestionSchema,
+  LlmQuizSchema,
+  clipRaw,
+  parseQuizFromText,
+} from "@lgtm-buzzer/adapter-shared";
 import type { IdGenerator } from "./ids.js";
 
-/** Maximum number of bytes kept in `raw` error payloads (8 KiB). */
-const MAX_RAW_BYTES = 8 * 1024;
-
-/** Clip a string to at most `MAX_RAW_BYTES` characters. */
-const clipRaw = (s: string): string =>
-  s.length > MAX_RAW_BYTES ? s.slice(0, MAX_RAW_BYTES) : s;
+// Re-export shared schemas so existing consumers of this module are unaffected.
+export { LlmQuestionSchema, LlmQuizSchema };
 
 /**
  * Schema for the outer JSON envelope that `claude --output-format json`
@@ -23,24 +25,6 @@ export const ClaudePrintEnvelopeSchema = z.object({
   result: z.string().min(1),
 });
 
-/** The shape of a single question as emitted by the model. */
-export const LlmQuestionSchema = z.object({
-  prompt: z.string().min(1),
-  choices: z.array(z.string().min(1)).min(2).max(6),
-  correctChoiceIndex: z.number().int().min(0),
-  explanation: z.string().min(1).optional(),
-});
-
-/** The top-level shape of the model's JSON payload. */
-export const LlmQuizSchema = z.object({
-  questions: z.array(LlmQuestionSchema).min(1),
-});
-
-type LlmQuestion = z.infer<typeof LlmQuestionSchema>;
-
-/** Regex that strips optional markdown code fences around JSON. */
-const CODE_FENCE_RE = /^```(?:json)?\s*([\s\S]*?)\s*```$/;
-
 /**
  * Pure function that parses the raw stdout from a `claude --output-format json`
  * run into a `Quiz` domain object.
@@ -48,11 +32,7 @@ const CODE_FENCE_RE = /^```(?:json)?\s*([\s\S]*?)\s*```$/;
  * Implements the 7-step pipeline from ADR-14 §Decision 3:
  * 1. Parse stdout as JSON → `ClaudePrintEnvelopeSchema`. Fail → `malformed-response`.
  * 2. Extract `envelope.result`.
- * 3. Strip optional markdown code fences.
- * 4. Parse the stripped text as JSON → `LlmQuizSchema`. Fail → `malformed-response`.
- * 5. Cross-check `correctChoiceIndex < choices.length`. OOB → `malformed-response`.
- * 6. Empty questions array → `malformed-response { detail: "empty-quiz" }`.
- * 7. Map to `core.Quiz` via the injected `IdGenerator`.
+ * 3–7. Delegated to `parseQuizFromText` from `@lgtm-buzzer/adapter-shared`.
  *
  * The `raw` field in error payloads is the LLM's response clipped to 8 KiB.
  * It MUST NOT contain diff bytes (the diff is never present in stdout).
@@ -86,85 +66,12 @@ export const parseResponse = (
     });
   }
 
-  // Step 2: extract model text
-  let modelText = envelopeResult.data.result;
-
-  // Step 3: strip markdown fences if present
-  const fenceMatch = CODE_FENCE_RE.exec(modelText.trim());
-  if (fenceMatch !== null && fenceMatch[1] !== undefined) {
-    modelText = fenceMatch[1];
-  }
-
-  // Step 4: parse model JSON
-  let quizRaw: unknown;
-  try {
-    quizRaw = JSON.parse(modelText);
-  } catch {
-    return Left.pure<LLMProviderError>({
-      kind: "malformed-response",
-      detail: "model-output-not-json",
-      raw: clipRaw(modelText),
-    });
-  }
-
-  const quizResult = LlmQuizSchema.safeParse(quizRaw);
-  if (!quizResult.success) {
-    return Left.pure<LLMProviderError>({
-      kind: "malformed-response",
-      detail: `quiz-schema: ${quizResult.error.issues.map((i) => i.message).join("; ")}`,
-      raw: clipRaw(modelText),
-    });
-  }
-
-  const llmQuestions = quizResult.data.questions;
-
-  // Step 5: cross-check correctChoiceIndex bounds
-  for (const q of llmQuestions) {
-    if (q.correctChoiceIndex >= q.choices.length) {
-      return Left.pure<LLMProviderError>({
-        kind: "malformed-response",
-        detail: "correctChoiceIndex out of range",
-      });
-    }
-  }
-
-  // Step 6: empty questions guard (LlmQuizSchema.min(1) catches this during
-  // schema parse, but we keep an explicit guard for the ADR-14 §7 mapping)
-  if (llmQuestions.length === 0) {
-    return Left.pure<LLMProviderError>({
-      kind: "malformed-response",
-      detail: "empty-quiz",
-    });
-  }
-
-  // Step 7: map to core.Quiz
-  const questions = llmQuestions.map((q: LlmQuestion): Question => {
-    const choiceObjects: Choice[] = q.choices.map(
-      (label): Choice => ({ id: ids.choiceId(), label }),
-    );
-    // correctChoiceIndex is guaranteed in-bounds by step 5
-    const correctChoice = choiceObjects[q.correctChoiceIndex];
-    if (correctChoice === undefined) {
-      // This is an invariant violation — the bounds check in step 5 must have
-      // been bypassed. Throw to surface the programmer error.
-      throw new Error(
-        `Invariant violation: correctChoiceIndex ${q.correctChoiceIndex} out of bounds after bounds check`,
-      );
-    }
-    const base = {
-      type: "multiple-choice" as const,
-      id: ids.questionId(),
-      prompt: q.prompt,
-      choices: NonEmptyList.fromArray(choiceObjects),
-      correctChoiceId: correctChoice.id,
-    };
-    return q.explanation !== undefined
-      ? { ...base, explanation: q.explanation }
-      : base;
-  });
-
-  return Right.pure<Quiz>({
-    id: ids.quizId(),
-    questions: NonEmptyList.fromArray(questions),
-  });
+  // Step 2: extract model text; steps 3–7 handled by shared helper
+  const modelText = envelopeResult.data.result;
+  return parseQuizFromText(modelText, ids);
 };
+
+// Ensure Right and Left imports are not unused (used via parseQuizFromText delegate).
+// These re-exports are kept for any consumers that may import them directly.
+export type { Either };
+export { Right, Left };

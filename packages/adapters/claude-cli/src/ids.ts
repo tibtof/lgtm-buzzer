@@ -1,25 +1,8 @@
-import type { ChoiceId, QuestionId, QuizId } from "@lgtm-buzzer/core";
-
 /**
- * Factory for generating branded IDs used when constructing `Quiz` domain
- * objects from parsed LLM responses.
+ * Re-exports `IdGenerator` and `defaultIdGenerator` from `@lgtm-buzzer/adapter-shared`.
  *
- * Injected into `createClaudeCliProvider` so that tests can supply a
- * deterministic counter-based implementation instead of random UUIDs.
+ * These were extracted to `_shared` by ADR-20 so that both `claude-cli` and
+ * `claude-api` use the same type. The public API of this module is unchanged.
  */
-export type IdGenerator = {
-  readonly quizId: () => QuizId;
-  readonly questionId: () => QuestionId;
-  readonly choiceId: () => ChoiceId;
-};
-
-/**
- * Production `IdGenerator` backed by `crypto.randomUUID()`.
- *
- * @returns An `IdGenerator` that mints UUID v4 values for each brand.
- */
-export const defaultIdGenerator = (): IdGenerator => ({
-  quizId: () => crypto.randomUUID() as QuizId,
-  questionId: () => crypto.randomUUID() as QuestionId,
-  choiceId: () => crypto.randomUUID() as ChoiceId,
-});
+export type { IdGenerator } from "@lgtm-buzzer/adapter-shared";
+export { defaultIdGenerator } from "@lgtm-buzzer/adapter-shared";

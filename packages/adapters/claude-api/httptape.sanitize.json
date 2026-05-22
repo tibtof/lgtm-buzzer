@@ -1,0 +1,22 @@
+{
+  "version": "1",
+  "rules": [
+    {
+      "action": "redact_headers",
+      "headers": [
+        "x-api-key",
+        "anthropic-api-key",
+        "Authorization",
+        "Cookie",
+        "Set-Cookie"
+      ]
+    },
+    {
+      "action": "redact_headers",
+      "headers": [
+        "ETag",
+        "Last-Modified"
+      ]
+    }
+  ]
+}

@@ -22,6 +22,7 @@ const sharedAlias = {
     "./packages/adapters/github/src/index.ts",
   ),
   "@lgtm-buzzer/adapter-ado": r("./packages/adapters/ado/src/index.ts"),
+  "@lgtm-buzzer/adapter-claude-api": r("./packages/adapters/claude-api/src/index.ts"),
   "@lgtm-buzzer/host": r("./packages/host/src/index.ts"),
 };
 
