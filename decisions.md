@@ -2609,3 +2609,207 @@ Behavioral tests live in adapter PRs (#36 et al.) — this ADR introduces only t
 - **`LLMProviderError.cancelled` is unreachable via `Err` at monadyssey@2.0.1** (ADR-10). Adapters MUST NOT construct this variant from `SpawnError.cancelled` — runtime delivers `Cancelled`. Variant kept for type contract and forward-compat.
 - **Reversibility high.** If multiple-choice-only is wrong, additive free-text via the discriminant. If type-only IO in `ports/` is wrong, switch to option (d) — one method signature changes per adapter.
 - **Binding for #36, #45, #46, #59.** Every LLM adapter implements this port; every prompt construction takes `input.diff` as its only PR-derived input.
+
+---
+
+## ADR-12: `VCSProvider` port + `PRIdentifier`/`Diff` domain types in `core` (replaces ADR-11's `Diff` placeholder)
+**Date**: 2026-05-22
+**Issue**: #34
+**Status**: Accepted (consumes ADR-11's `Diff` placeholder; reuses ADR-11 §Decision 6 ESLint carve-out)
+
+### Context
+
+ADR-11 shipped `LLMProvider` with `Diff = string` as a placeholder. #34 ships the canonical shape. The host dispatcher (#39) needs to route by URL: GitHub URLs → GitHub VCS adapter; ADO URLs → ADO VCS adapter. Both implement the same port; the dispatcher picks per identifier.
+
+Three constraints:
+
+1. **Diff-only invariant** (CLAUDE.md §Key differentiator) — return type cannot carry PR description/title/commits/labels/comments.
+2. **`core` purity** — type-only `IO` already permitted in `core/src/ports/**` (ADR-11 §Decision 6).
+3. **One identifier type, multiple VCS kinds** — URL parser, kind dispatch, adapter call all need a shared type.
+
+### Decision
+
+#### 1. `PRIdentifier` — discriminated union by VCS kind
+
+```ts
+export type PRIdentifier =
+  | { readonly kind: "github"; readonly owner: string; readonly repo: string; readonly number: number }
+  | { readonly kind: "ado"; readonly org: string; readonly project: string; readonly repo: string; readonly pullRequestId: number };
+```
+
+Chosen over opaque branded string and common-fields-plus-raw because the host dispatcher (#39) needs to `switch (id.kind)` with TS exhaustiveness checking, and per-VCS coordinates genuinely differ (GitHub: owner/repo/number; ADO: org/project/repo/id). Future VCS additions are additive. Diff-only invariant preserved at the type level — no slot for description/title/comments.
+
+#### 2. `Diff` — branded string
+
+```ts
+export type Diff = string & { readonly __brand: "Diff" };
+```
+
+YAGNI on rich-object metadata. Branding prevents accidental coercion of "any string" into the LLM input. Construction goes through (1) a VCS adapter at the trust boundary, or (2) a test-fixture `asDiff` helper. Branding is compile-time only — security is enforced by the reviewer on every VCS-adapter PR (#37, #47): the adapter MUST call the diff endpoint exclusively.
+
+#### 3. `VCSProviderError` — 4 variants
+
+```ts
+export type VCSProviderError =
+  | { readonly kind: "transport"; readonly status?: number; readonly detail: string }
+  | { readonly kind: "malformed-response"; readonly detail: string; readonly raw?: string }
+  | { readonly kind: "timeout"; readonly afterMs: number }
+  | { readonly kind: "cancelled" };
+```
+
+Source-mapping (binding for every VCS adapter):
+
+| Underlying | Maps to |
+|---|---|
+| HTTP non-2xx (including 401, 403, 404, 429, 5xx) | `transport { status, detail }` |
+| HTTP network/TLS failure | `transport { detail }` (no status) |
+| Server body fails zod parse / isn't unified-diff | `malformed-response { detail, raw? }` |
+| Adapter wall-clock budget exceeded | `timeout { afterMs }` |
+| Fiber cancelled by caller | `Cancelled` runtime per ADR-10; variant kept for forward-compat |
+
+**401/404 folded into `transport`** via optional `status` field — mirrors ADR-11's collapsed HTTP error shape. Consumers branch on `status` for adapter-specific handling.
+
+`subprocess` is absent — VCS adapters are pure HTTP. `cancelled` is kept for the same forward-compat reason as ADR-11.
+
+#### 4. `VCSProvider` port — single method
+
+```ts
+import type { IO } from "monadyssey";
+
+export type VCSProvider = {
+  readonly id: string;
+  readonly fetchDiff: (input: PRIdentifier) => IO<VCSProviderError, Diff>;
+};
+```
+
+`fetchDiff` is the only method. URL parsing is a sibling export (§5). Port surface mirrors `LLMProvider`. The type contract encodes diff-only at the return position: `Diff` not `PR`, not `{ diff, description, ... }`.
+
+#### 5. `parsePRIdentifier` — pure helper, sibling export
+
+```ts
+export type UnsupportedURL = {
+  readonly kind: "unsupported-url";
+  readonly detail: string;
+  readonly url: string;
+};
+
+export const parsePRIdentifier = (url: string): Either<UnsupportedURL, PRIdentifier> => {
+  // GitHub: https://github.com/<owner>/<repo>/pull/<number>
+  // ADO:    https://dev.azure.com/<org>/<project>/_git/<repo>/pullrequest/<id>
+  //         https://<org>.visualstudio.com/<project>/_git/<repo>/pullrequest/<id> (legacy)
+};
+```
+
+Lives in `vcs-provider.ts`. Pure (uses WHATWG URL or regex). Both the host dispatcher (#39) and the extension content-script gate (#43-area) consume it. Reject any URL that isn't `https:` to a known host with a known path shape → `Left<UnsupportedURL>`. Reviewer: do not log the full URL above `debug` (legacy ADO URLs may carry tokens in query strings).
+
+#### 6. Diff-only enforcement (KEY DIFFERENTIATOR)
+
+Encoded at four layers (one stronger than ADR-11's three):
+
+1. **Type-level (port return)** — `fetchDiff` returns `Diff`, not a `PR` record.
+2. **Type-level (identifier shape)** — `PRIdentifier` variants carry only location coordinates.
+3. **TSDoc** — port + identifier comments state the rule.
+4. **Adapter implementation review** — every VCS adapter PR (#37, #47) is reviewed for: (a) call targets diff endpoint only, (b) response treated as diff bytes only, (c) no description/title/comments queries even speculatively.
+
+Reviewer rejects any change to `PRIdentifier` adding a non-coordinate field, or any addition to `Diff` beyond branded bytes, without a dedicated ADR.
+
+#### 7. `Diff` placeholder migration in `llm-provider.ts`
+
+```ts
+// Before (ADR-11):
+export type Diff = string;
+
+// After (this ADR):
+export type { Diff } from "./vcs-provider.js";
+```
+
+Re-export keeps the public path stable. The ADR-11 test `expectTypeOf<Diff>().toBeString();` becomes `expectTypeOf<Diff>().toMatchTypeOf<string>();` — the one knock-on test update.
+
+#### 8. No ESLint changes
+
+The override block from ADR-11 §Decision 6 targets `packages/core/src/ports/**/*.ts`. `vcs-provider.ts` lives at exactly that path; the type-only `IO` carve-out and Node-API/forbidden-FP bans apply automatically.
+
+### Affected workspaces
+
+Only `packages/core` (1 new source + test, 2 modified files). Adapters and host consume in subsequent issues. Dep direction unchanged.
+
+### Types
+
+(Per Decisions 1, 2, 3, 5.) `PRIdentifier`, `Diff`, `VCSProviderError`, `VCSProvider`, `UnsupportedURL` — all in `packages/core/src/ports/vcs-provider.ts`.
+
+### Functions
+
+`parsePRIdentifier(url: string): Either<UnsupportedURL, PRIdentifier>` — pure, in `vcs-provider.ts`. NOT part of the port; sibling export. Handles GitHub `pull/<n>` and ADO `pullrequest/<id>` (both `dev.azure.com` and legacy `visualstudio.com` shapes).
+
+### File layout
+
+New (2):
+- `packages/core/src/ports/vcs-provider.ts`
+- `packages/core/src/ports/vcs-provider.test.ts`
+
+Modified (2):
+- `packages/core/src/ports/llm-provider.ts` — replace `export type Diff = string;` with `export type { Diff } from "./vcs-provider.js";`.
+- `packages/core/src/index.ts` — add re-exports:
+
+```ts
+export type { Diff, PRIdentifier, VCSProvider, VCSProviderError, UnsupportedURL } from "./ports/vcs-provider.js";
+export { parsePRIdentifier } from "./ports/vcs-provider.js";
+```
+
+Also touched: `packages/core/src/ports/llm-provider.test.ts` — one line, `.toBeString()` → `.toMatchTypeOf<string>()`.
+
+### Sequence
+
+Type-definition + re-export change. Downstream flow once #37, #38, #39 land:
+1. Extension content script sends URL to service worker.
+2. Service worker forwards URL to host via native messaging.
+3. Host calls `parsePRIdentifier(url)`.
+4. Host dispatcher (`#39`) `switch`es on `id.kind` to pick the right VCS adapter + LLM adapter pair.
+5. `vcsProvider.fetchDiff(id)` → `IO<VCSProviderError, Diff>`.
+6. On success, hands `Diff` to `QuizSession.start({ diff, questionCount, llmProvider })` (#38).
+7. `QuizSession` calls `llmProvider.generateQuiz({ diff, questionCount })`.
+8. Host returns Quiz to extension.
+
+Type-level note: step 6 is the only place `Diff` crosses from "fetched bytes" to "LLM-prompt input." Reviewer on #38 verifies no other field on a `PR` value reaches the LLM through any other path.
+
+### Error cases
+
+Per §Decision 3 source-mapping table. `parsePRIdentifier`'s only failure mode is `UnsupportedURL` — pure, no I/O. No `throw` introduced.
+
+### Test strategy
+
+**`vcs-provider.test.ts`** — three describe blocks:
+
+1. **Type-only smoke** for `VCSProvider` — noop fake matching the port; assert `fetchDiff` returns `IO<VCSProviderError, Diff>`; assert `PRIdentifier.kind` is `"github" | "ado"`; assert `Diff extends string` but `Diff !== string`.
+
+2. **Unit tests for `parsePRIdentifier`** — 8 table-driven cases:
+   - ✓ `https://github.com/tibtof/lgtm-buzzer/pull/34` → `Right({ kind: "github", owner: "tibtof", repo: "lgtm-buzzer", number: 34 })`.
+   - ✓ `https://github.com/foo/bar/pull/1/files` → `Right({ kind: "github", ..., number: 1 })` (trailing path stripped).
+   - ✓ `https://dev.azure.com/my-org/My%20Project/_git/repo/pullrequest/123` → `Right({ kind: "ado", project: "My Project", ... })`.
+   - ✓ `https://my-org.visualstudio.com/MyProj/_git/repo/pullrequest/7` → `Right({ kind: "ado", ... })` (legacy host).
+   - ✗ `https://gitlab.com/foo/bar/-/merge_requests/1` → `Left<UnsupportedURL>`.
+   - ✗ `http://github.com/foo/bar/pull/1` (non-https) → `Left`.
+   - ✗ `https://github.com/foo` (missing `/pull/<n>`) → `Left`.
+   - ✗ `not-a-url` → `Left`.
+
+3. **Structural smoke for `VCSProviderError`** — table of all 4 variants × shape variations (`transport` with/without `status`, `malformed-response` with/without `raw`), 6 distinguishable shapes.
+
+4. **Diff-only invariant assertion** — `expectTypeOf<PRIdentifier>().not.toHaveProperty("description")` and similar for "title", "comments".
+
+**`llm-provider.test.ts`** — one-line update for the branded `Diff`.
+
+**ESLint regression** — re-run ADR-11 §Test strategy steps 1, 2, 3, 5 with `vcs-provider.ts` in place. Confirm step 5 still fails (Node-API ban preserved).
+
+Coverage: `parsePRIdentifier` table-driven cases push the helper to ≥95%.
+
+### Consequences
+
+- **`Diff` is now canonical and branded.** VCS adapters do `as Diff` at the trust boundary; test fixtures use an `asDiff` helper.
+- **`PRIdentifier` is discriminated.** Adding GitLab is additive. Reviewer rejects any "default branch" `if (kind !== "github")` shortcut that bypasses exhaustiveness.
+- **`parsePRIdentifier` lives in `core`** — both host and extension consume it.
+- **No new runtime deps.** `monadyssey.Either` already on the allowlist.
+- **ADR-11's `Diff` placeholder is consumed.** No remaining placeholders in `core/src/ports/`.
+- **Diff-only invariant gains a fourth enforcement layer** (port return type) on top of ADR-11's three. Reviewer's burden on adapter PRs becomes more mechanical: "did the adapter call the diff endpoint exclusively?"
+- **`VCSProviderError.cancelled` unreachable via `Err` at v2.0.1** per ADR-10; kept for type contract + forward-compat.
+- **Reversibility high.** Brand drop is one type edit; identifier shape changes are additive.
+- **Binding for #37, #39, #43, #47.**
