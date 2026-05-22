@@ -4218,3 +4218,190 @@ Coverage: ~90% on `src/lib/dom/**`.
 - Cancellation best-effort: v1 lets host quiz generation continue after modal close (SW timeout cleans up).
 - Diff-only invariant type-enforced. Reviewer grep gate on PR-content selectors codifies this.
 - Reversibility high. All five concerns in separate files. Swapping intercept strategy is one file's change.
+
+---
+
+## ADR-19: Playwright e2e for the happy-path quiz gate, with a stubbed SW native channel
+**Date**: 2026-05-22
+**Issue**: #51
+**Status**: Accepted
+
+### Context
+
+End-of-M2 acceptance gate. Wire layer + host + LLM are already exhaustively unit-tested (ADRs 7/8/13/14/15/17); only browser-side surface (real Chrome MV3 loading, real DOM submit capture, real CustomEvent bus, real modal render, real bypass replay) needs e2e. Stub the SW's native channel to keep tests deterministic + cheap.
+
+### Decision
+
+Single Playwright happy-path spec under `packages/extension/e2e/`. Persistent-context Chromium with `--load-extension`. SW's `chrome.runtime.connectNative` replaced via `addInitScript` with a stub returning canned `Frame` responses. Static HTML fixture at `https://github.com/owner/repo/pull/1` served via `page.route`. Gated behind `npm run test:e2e` (NOT part of `npm run check`).
+
+#### 1. Playwright config
+
+- `@playwright/test` (MIT) devDep. Chromium only.
+- `npm run test:e2e:install` for `playwright install chromium` (not in `postinstall`).
+- `npm run test:e2e` for the run. NOT in root `check`.
+- `e2e/playwright.config.ts`: single chromium project, headless, `trace: "on-first-retry"`, single worker, 30s timeout.
+
+#### 2. Browser launch
+
+`chromium.launchPersistentContext(userDataDir, { args: [--load-extension, --disable-extensions-except, --no-sandbox], headless: true })`. Spec asserts `.output/chrome-mv3/` exists first; clear "run npm run build first" message if missing.
+
+#### 3. SW stub via `addInitScript`
+
+Stub replaces `browser.runtime.connectNative` BEFORE extension code runs. Sets a `globalThis.__LGTM_E2E_STUB__` marker; spec awaits SW + marker before clicking.
+
+Stub behavior:
+- `postMessage(quiz-request)` → microtask → `onMessage(QuizResponseFrame with canned quiz)`.
+- `postMessage(quiz-submit)` → score against canned correct-answer map → `onMessage(QuizResultFrame { passed })`.
+- `ping` → synthetic `pong`.
+- anything else → `ErrorFrame { reason: "internal" }`.
+
+Stub duplicates minimal Frame shape inline (no `core`/`protocol` import inside the addInitScript string). Setup-time assertion: `parseFrame(cannedFrame)` returns `success: true` to catch drift.
+
+#### 4. PR fixture
+
+`e2e/fixtures/github-pr.html` — minimal form with hidden `<input name="pull_request_review[event]" value="approve">` and an Approve submit button. Bubble-phase submit listener sets `body[data-form-submitted="true"]` (the assertion target).
+
+Served via `page.route("https://github.com/owner/repo/pull/1", fulfill(html))`. No real network.
+
+#### 5. Canned quiz + correct answers
+
+```ts
+const cannedQuiz = { id: "e2e-quiz-1", questions: [
+  { type: "multiple-choice", id: "q1", prompt: "Which file was modified?",
+    choices: [{ id: "c1", label: "src/foo.ts" }, { id: "c2", label: "src/bar.ts" }] },
+  { type: "multiple-choice", id: "q2", prompt: "What did the change add?",
+    choices: [{ id: "c1", label: "A bug" }, { id: "c2", label: "A feature" }] },
+]};
+const correctAnswers = { q1: "c1", q2: "c2" };
+```
+
+#### 6. Spec flow
+
+```ts
+test("happy path: approve gates on quiz, opens on correct answers", async () => {
+  await assertBuiltExtension(extensionDir);
+  const context = await chromium.launchPersistentContext(userDataDir, {...});
+  await context.addInitScript({ content: buildSwStubScript(cannedQuiz, correctAnswers) });
+  const sw = await context.waitForEvent("serviceworker");
+  const page = await context.newPage();
+  await page.route("https://github.com/owner/repo/pull/1", route =>
+    route.fulfill({ contentType: "text/html", body: fixtureHtml }));
+  await page.goto("https://github.com/owner/repo/pull/1");
+  await page.click("#approve-btn");
+  await page.waitForSelector("[data-testid='lgtm-buzzer-quiz-modal']");
+  expect(await page.getAttribute("body", "data-form-submitted")).toBeNull();
+  await page.click("[data-question='q1'] [data-choice='c1']");
+  await page.click("[data-question='q2'] [data-choice='c2']");
+  await page.click("[data-testid='lgtm-buzzer-quiz-submit']");
+  await page.waitForSelector("body[data-form-submitted='true']");
+});
+```
+
+#### 7. Modal data-testid contract (binding)
+
+The dev for #51 adds these attributes to `dom/modal.ts`:
+
+| Element | Attribute |
+|---|---|
+| Modal root | `data-testid="lgtm-buzzer-quiz-modal"` |
+| Each question container | `data-question="<questionId>"` |
+| Each choice radio | `data-choice="<choiceId>"` within the question container |
+| Submit button | `data-testid="lgtm-buzzer-quiz-submit"` |
+| Cancel button | `data-testid="lgtm-buzzer-quiz-cancel"` |
+
+Inert (no JS reads them); zero security/a11y cost. Modal unit test gets one assertion confirming presence.
+
+#### 8. ESLint override for `e2e/**`
+
+```js
+{
+  files: ["packages/extension/e2e/**/*.ts"],
+  rules: { "no-restricted-imports": "off", "no-default-export": "off" },
+}
+```
+
+Narrow — `node:*` / default-export bans lifted only for `e2e/**`. Browser-side bans for `entrypoints/**` and `src/**` unchanged.
+
+#### 9. Type-check integration
+
+`e2e/tsconfig.json` extends extension's tsconfig; `types: ["node"]`, `lib: ["ES2022", "DOM", "DOM.Iterable"]`, `noEmit: true`. Playwright's loader catches errors at test time. NOT in `npm run typecheck:tests`.
+
+### Affected workspaces
+
+`packages/extension` only.
+
+### Types
+
+```ts
+// e2e/sw-stub.ts
+export type CannedQuiz = { id: string; questions: Array<{ type: "multiple-choice"; id: string; prompt: string; choices: Array<{ id: string; label: string }> }> };
+export type CannedCorrectAnswers = Readonly<Record<string, string>>;
+
+export const buildSwStubScript = (
+  quiz: CannedQuiz,
+  correctAnswers: CannedCorrectAnswers,
+): string;
+```
+
+### File layout
+
+**New (6)**:
+- `e2e/playwright.config.ts`
+- `e2e/quiz-happy-path.spec.ts`
+- `e2e/sw-stub.ts`
+- `e2e/fixtures/github-pr.html`
+- `e2e/tsconfig.json`
+- `e2e/.gitignore`
+
+**Modified (3)**:
+- `packages/extension/package.json` — @playwright/test devDep + `test:e2e` + `test:e2e:install` scripts.
+- `packages/extension/src/lib/dom/modal.ts` — add data-testid contract per §7.
+- `eslint.config.js` — `e2e/**` override per §8.
+
+### Sequence
+
+1. Spec assert build artifact exists.
+2. Launch persistent context with extension.
+3. `addInitScript` with stub.
+4. Wait for `serviceworker` event + stub marker.
+5. Create page, route GitHub URL to fixture, navigate.
+6. Click Approve → CS captures, dispatches `lgtm-buzzer:quiz-request`.
+7. CS `sendFrame` → SW → stub → canned `QuizResponseFrame`.
+8. Controller dispatches `lgtm-buzzer:quiz-result { outcome: "quiz-ready" }`.
+9. Modal renders questions.
+10. Spec answers via data-question/data-choice selectors.
+11. Modal `lgtm-buzzer:quiz-submit`.
+12. Controller `sendFrame(QuizSubmitFrame)` → stub → canned `QuizResultFrame { passed: true }`.
+13. Controller sets bypass, `requestSubmit(submitter)`.
+14. Bypass-flagged capture handler returns without preventDefault.
+15. Fixture's bubble-phase listener sets `body[data-form-submitted="true"]`.
+16. Spec asserts. Test passes.
+
+### Error cases
+
+| Failure | Surfaced |
+|---|---|
+| `.output/chrome-mv3/` missing | `assertBuiltExtension` throws "Run npm run build first" |
+| `addInitScript` race | Spec waits for `serviceworker` event + `__LGTM_E2E_STUB__` marker |
+| Modal selectors drift | `waitForSelector` times out at 30s |
+| Playwright Chromium not installed | `test:e2e:install` script |
+| Canned frame shape drifts from protocol | Setup-time `parseFrame` round-trip assertion |
+
+### Test strategy
+
+This IS the test strategy artifact for end-of-M2 gate. One happy-path spec.
+
+Deferred to M3 #53 follow-ups: wrong answers, modal cancel, ErrorFrame paths, ADO coverage, multi-LLM, visual regression, real-host integration variant.
+
+Runtime budget: <60s. Achievable (~5-10s dev hardware, ~15-25s CI cold-start).
+
+### Consequences
+
+- Wire integration empirically tested end-to-end without real host. Native messaging framing bugs still rely on host contract tests.
+- Modal data-testid contract is binding from now on. Modal refactors must preserve attributes.
+- Developer must `npm run build` before `npm run test:e2e`. Fails fast with clear message.
+- Playwright Chromium download (~150 MB) gated behind explicit install script.
+- No new runtime deps. @playwright/test is dev-only (MIT).
+- Diff-only invariant unaffected (stub generates canned quiz from zero input; no LLM invoked).
+- Reversibility high. A future "real host" variant can coexist as a sibling spec.
+- Security: no real github.com, no credentials, no network egress, no LLM calls. Stub never bundled into production.
