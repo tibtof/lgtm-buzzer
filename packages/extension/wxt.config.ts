@@ -8,6 +8,10 @@ export default defineConfig({
     description: "Quiz yourself on the diff before approving PRs.",
     version: "0.0.0",
     permissions: [],
-    host_permissions: ["*://github.com/*", "*://dev.azure.com/*"],
+    host_permissions: [
+      "*://github.com/*",
+      "*://dev.azure.com/*",
+      "*://*.visualstudio.com/*",
+    ],
   },
 });

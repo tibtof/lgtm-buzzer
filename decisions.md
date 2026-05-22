@@ -4681,3 +4681,447 @@ Coverage: 80% adapter, ≥95% pure helpers.
 - ADR-6 redaction list extended (`x-api-key`, `anthropic-api-key`).
 - Reversibility high: 6 small files in claude-api, 3 small in _shared. SDK switch is one file's swap.
 - Binding for reviewer: (a) 4-param `buildMessagesPayload` + canary; (b) API key never in errors/logs; (c) Cancelled never manufactured; (d) retry only 429/529/status-0; (e) cache_control markers on both blocks; (f) `provider.id === "claude-api"`.
+
+---
+
+## ADR-21 (2026-05-22): ADO content script — Vote-button interception, defensive selectors, manifest patterns
+**Date**: 2026-05-22
+**Issue**: #48
+**Status**: Accepted
+
+### Context
+
+The GitHub content script (ADR-18) intercepts the Approve form via a capture-phase `submit` listener bound on a stable server-side hidden input (`pull_request_review[event]="approve"`). Azure DevOps does not give us that lever. ADO is a single-page application; the "Vote" action is a button-click that fires a JS handler which calls the ADO REST API directly — no `<form action="...">`, no submit event.
+
+This story extends the existing CS to ADO PR pages, reusing every host-agnostic helper from ADR-18 (`page-detection`, `dom-events`, `quiz-flow` orchestration, `modal`) and replacing only the platform-specific interception primitive. The diff-only invariant (CLAUDE.md §Key differentiator) is preserved — the CS reads zero PR text from the ADO DOM; only `window.location.href` and the click target.
+
+Three forces shape this ADR:
+
+1. **No form, only a button click.** ADO renders the Vote control as a dropdown button. The action fires through a click handler bound by ADO's SPA framework, not via form submission. ADR-18's submit-capture approach cannot be lifted.
+2. **DOM volatility.** ADO ships UI changes more aggressively than GitHub. A single CSS-class selector is fragile. We need a layered selector strategy (data-testid → aria-label → text content) with the most stable layer first.
+3. **Two URL hosts.** Modern ADO (`dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}`) and legacy (`{org}.visualstudio.com/{project}/_git/{repo}/pullrequest/{id}`). The core URL parser (`parsePRIdentifier` in `packages/core/src/ports/vcs-provider.ts`) already handles both — the manifest match patterns must too.
+
+Plain TS + zod per the per-package policy. No monadyssey. The CS isolated-world bypass-flag pattern from ADR-18 is reused unchanged.
+
+### Decision
+
+#### 1. URL parsing — reuse `parsePRIdentifier` unchanged
+
+The two ADO regexes already live in `packages/core/src/ports/vcs-provider.ts` (see `ADO_DEV_RE` and `ADO_VS_RE` constants on lines 112 and 119). Their canonical forms:
+
+- Modern: `^https:\/\/dev\.azure\.com\/([^/]+)\/([^/]+)\/_git\/([^/]+)\/pullrequest\/(\d+)(?:[/?].*)?$`
+  - Captures: org, project (percent-encoded segment, decoded by `parsePRIdentifier`), repo, id.
+- Legacy: `^https:\/\/([^.]+)\.visualstudio\.com\/([^/]+)\/_git\/([^/]+)\/pullrequest\/(\d+)(?:[/?].*)?$`
+  - Captures: org (from host), project, repo, id.
+
+Both produce a `PRIdentifier` with `kind: "ado"`, fields `{ org, project, repo, pullRequestId }`. The CS imports `parsePRIdentifier` via `detectPRPage` in `src/lib/dom/page-detection.ts` — already in place from ADR-18. No new URL parsing code in the extension workspace. ADO-side `page-detection` tests gain three cases for legacy host + percent-encoded project + trailing query strings.
+
+#### 2. Manifest match patterns and host permissions
+
+`packages/extension/wxt.config.ts` extends `host_permissions` to:
+
+```ts
+host_permissions: [
+  "*://github.com/*",
+  "*://dev.azure.com/*",
+  "*://*.visualstudio.com/*",
+],
+```
+
+The content-script `matches` array in `entrypoints/content.ts` extends to:
+
+```ts
+matches: [
+  "*://github.com/*",
+  "*://dev.azure.com/*",
+  "*://*.visualstudio.com/*",
+],
+```
+
+Match-pattern note: MV3 `matches` does not support the `_git`/`pullrequest` path-specificity GitHub gets via `/pull/`. The CS therefore loads on every ADO page under those hosts and idles on non-PR URLs — same behaviour as today's GitHub CS when navigated to `/issues`. `detectPRPage` is the gate.
+
+Adding a `host_permissions` entry triggers a Chrome permission re-prompt on auto-update. This is acceptable for v1; the alternative (optional permissions) is deferred to #50 (options page).
+
+#### 3. Vote-button discovery — layered defensive selectors
+
+ADO's Vote control is a dropdown. The user opens the dropdown and clicks one of: Approve, Approve with suggestions, Wait for author, Reject. **We intercept Approve and Approve-with-suggestions; we do NOT intercept Wait-for-author or Reject** (those are not approvals).
+
+The interceptor lives in a new file `src/lib/dom/ado-vote-intercept.ts`. It does NOT pre-locate the button at startup (the dropdown is lazily rendered when the user opens it). Instead, a capture-phase `click` listener on `document` inspects every click target and matches it against an ordered list of recognizers.
+
+Selector strategy — three layered recognizers, tried in order, first match wins:
+
+1. **`data-testid` / `data-test` (most stable).** If `target.closest("[data-testid]")` or `target.closest("[data-test]")` returns an element whose attribute value matches one of:
+   - exact: `pr-vote-approve`, `pr-vote-approve-with-suggestions`
+   - prefix: `vote-approve`, `approve-with-suggestions` (case-insensitive)
+   then this is an Approve click. ADO uses `data-` test hooks in current builds; the exact value is verified by the dev at implementation time and recorded as a `KNOWN_ADO_VOTE_TESTIDS` constant. Multiple known values are matched (one array constant) so a single-deploy change to `pr-vote-approve-v2` does not break us across the whole user base before we ship a fix.
+
+2. **`aria-label` (stable across visual redesigns).** `target.closest("[aria-label]")` whose `aria-label` (lowercased, trimmed) starts with `"approve"`. This catches both `"Approve"` and `"Approve with suggestions"` because both have aria-labels prefixed with `Approve`. Wait-for-author / Reject are explicitly excluded by the `startsWith` check.
+
+3. **Text content (last-resort, localisation-bounded).** `target.closest("button, [role='menuitem']")` whose `textContent` (trimmed, lowercased) equals `"approve"` or `"approve with suggestions"`. v1 supports English-only DOM text. ADO's UI language follows the user's ADO profile setting, NOT the browser locale — non-English deployments fall through this layer and Approve is not intercepted (Approve proceeds without a quiz — fail-open documented in §10). Localisation is deferred to a future ADR.
+
+The recognizer returns `null` (not an Approve click) or `{ variant: "approve" | "approve-with-suggestions"; element: HTMLElement }`. The `variant` is forwarded into `ApproveBlockedEvent` (see §6) and surfaced in CS logs only; it is NOT forwarded to the host (the host always receives the same `quiz-request` frame regardless of variant — the diff-only invariant forbids variant-aware prompt construction).
+
+#### 4. Capture-phase click interception strategy
+
+Bind a capture-phase listener on `document` for the `"click"` event:
+
+```ts
+doc.addEventListener("click", handler, { capture: true });
+```
+
+Handler flow (mirrors ADR-18 §Decision 1 for clicks instead of submits):
+
+1. `event.target` must be an `Element`. Else return.
+2. Run the three-layer recognizer. `null` → return.
+3. `getCurrentPR()` returns `null` or `{ kind: "github", ... }` → return. ADO interceptor only fires for `pr.kind === "ado"`.
+4. `shouldBypass()` true → consume the bypass, return without `preventDefault` (allow the replayed click through).
+5. Else: `event.preventDefault()` + `event.stopPropagation()` + `event.stopImmediatePropagation()`, build an `AdoApproveBlockedEvent`, call `onBlocked`.
+
+`stopImmediatePropagation` is ADO-specific (not in ADR-18): ADO's SPA framework binds its handlers in capture phase as well in some deployments — `stopImmediatePropagation` ensures no other capture-phase listener on `document` runs after ours. GitHub's submit-form path uses bubble-phase site code so `stopPropagation` is sufficient there.
+
+Module-scoped bypass flag (same pattern as ADR-18 §Decision 4): a `let approveBypass = false;` lives at module scope inside `quiz-flow.ts` (already there). The ADO interceptor consumes it via the same `shouldBypass()` deps callback used by GitHub. Module scope, not `window`, for the same security reason.
+
+#### 5. SPA navigation handling — replace Turbo with `popstate` + URL polling
+
+ADO does NOT use Hotwire Turbo. There is no `turbo:before-visit` or `turbo:render` event. ADO's SPA navigation is `history.pushState`-based. We add a small abstraction in `quiz-flow.ts` so the controller is host-agnostic:
+
+- A `NavigationWatcher` type (new, in `src/lib/dom/navigation.ts`) with two callbacks: `onWillNavigate()` and `onDidNavigate()`.
+- A `createGitHubNavigationWatcher(doc)` wires `turbo:before-visit` → `onWillNavigate`, `turbo:render` → `onDidNavigate` (current behaviour preserved).
+- A `createAdoNavigationWatcher(doc)` wires:
+  - `window.addEventListener("popstate", onDidNavigate)` for back/forward.
+  - A `MutationObserver` on `document.body` (`childList: true, subtree: false`) that compares `window.location.href` to a previous value and fires `onDidNavigate` on change. This catches `pushState` navigations (which fire no event).
+  - We do NOT monkey-patch `history.pushState`. Patching globals from a CS isolated world only affects the CS's own world, not the page's — it would never fire for real ADO navigations. Polling via the `MutationObserver` we already use for the GitHub fallback is the supported path.
+  - `onWillNavigate` is best-effort: ADO has no pre-navigation hook. The controller calls `onWillNavigate` synchronously from inside `onDidNavigate` on first detect — i.e. ADO collapses the two callbacks into one. State drop and PR re-detect both happen, just at the same moment. This is acceptable for v1 because pending state is cleaned by the SW's 60s timeout (ADR-17) if a navigation arrives mid-flight.
+
+The controller (`quiz-flow.ts`) is refactored to accept a `NavigationWatcher` via deps rather than hard-coding Turbo event names. This is a small refactor (one parameter, ~10 LOC) and keeps `quiz-flow.ts` as the single orchestrator for both platforms.
+
+#### 6. Interceptor wired via a strategy parameter into `quiz-flow.ts`
+
+`quiz-flow.ts` currently hard-codes `setupApproveInterceptor` (the GitHub variant). The minimal refactor:
+
+- Introduce a `setupInterceptor` deps field on `QuizFlowDeps`:
+  ```ts
+  readonly setupInterceptor: (deps: InterceptorDeps) => (() => void);
+  ```
+  where `InterceptorDeps` is the existing `ApproveInterceptorDeps` shape generalised over the platform-agnostic surface (`doc`, `getCurrentPR`, `shouldBypass`, `onBlocked`).
+- `ApproveBlockedEvent` is renamed `InterceptedApproveEvent` (no semantic change, just clarifies it covers ADO too). The optional `submitter` field stays; ADO's interceptor sets `form: null, submitter: null, variant: "approve" | "approve-with-suggestions", element: HTMLElement`. The replay path (`p.form.requestSubmit`) branches on `form !== null`: GitHub re-submits the form; ADO calls `p.element.click()` after setting the bypass flag.
+
+Replay-on-pass for ADO:
+1. Set `approveBypass = true`.
+2. `p.element.click()` — synchronous; capture listener fires, sees bypass, resets flag, returns without preventDefault.
+3. ADO's own click handler runs; the REST call goes through.
+
+A `try/catch` around `p.element.click()` falls back to dispatching `quiz-result` with `outcome: "error", reason: "internal"` (mirrors ADR-18's `requestSubmit` catch).
+
+#### 7. Modal injection and event bus — unchanged
+
+The modal (`src/lib/dom/modal.ts`) is host-agnostic. It subscribes to `lgtm-buzzer:quiz-request` / `lgtm-buzzer:quiz-result` and emits `lgtm-buzzer:quiz-submit` / `lgtm-buzzer:quiz-cancel`. Nothing in the modal touches the GitHub DOM. ADO inherits all of this for free.
+
+Shadow-DOM injection, z-index, CSS, and state machine are reused verbatim. The modal does not know the difference between a GitHub and an ADO quiz.
+
+#### 8. Selector fragility — runtime override hook (forward to #50)
+
+To absorb ADO UI changes between extension releases, the ADO interceptor accepts an optional override list:
+
+```ts
+type AdoVoteSelectorOverrides = {
+  readonly testIds?: ReadonlyArray<string>;
+  readonly ariaLabelPrefixes?: ReadonlyArray<string>;
+  readonly textContents?: ReadonlyArray<string>;
+};
+```
+
+These extend (do not replace) the built-in defaults. In v1 the override list is hard-coded `undefined` at the CS entrypoint — the only purpose is to give #50 (options page) a typed integration target with zero refactor when the user-facing setting lands. The CS reads the override list synchronously at construction time; runtime hot-swap is out of scope for v1.
+
+#### 9. Diff-only invariant — strictly preserved
+
+The ADO interceptor reads:
+- `window.location.href` (parsed by `parsePRIdentifier`).
+- `event.target` and its ancestors (button/menuitem element identity only, plus its `data-testid`/`data-test`/`aria-label` attributes and `textContent`).
+
+The ADO interceptor MUST NOT read:
+- PR title, description, threads, comments, work-item links, build statuses, commit messages, file names, or any element under `.repos-pr-overview-`, `.repos-discussion-`, `.repos-file-list-`, `.bolt-table` PR-detail rows.
+
+Reviewer grep gate (extends ADR-18 §Decision 7): any addition under `src/lib/dom/**` that touches one of those selectors fails review. The `textContent` recognizer's allow-list (`"approve"`, `"approve with suggestions"`) is the only PR-text-adjacent DOM read in the entire CS, and it is bounded to a fixed string-equality check against two short literals — it cannot exfiltrate variable PR content.
+
+#### 10. Failure modes — fail-open with diagnostic logging
+
+If none of the three recognizer layers fires (ADO ships a build with new selectors and non-English text), the click reaches ADO and the Approve goes through without a quiz. This is the expected fail-open: not gating a real Approve is far less damaging than wedging Approve permanently. The dev SHOULD wire a `logger.warn` on every Vote-menu open (detected via `data-testid` on the dropdown panel or `[role='menu']` with vote-related `aria-label`), but the v1 implementation is allowed to skip this — the smoke test is the gate.
+
+The override hook (§8) plus an issue-template entry ("My Approve was not gated") is the recovery path until #50 ships an in-product way for users to set their own selector.
+
+#### 11. Decision rules unchanged from ADR-18
+
+- Capture-phase, document-bound listener.
+- Module-scoped bypass flag, not `window`.
+- DOM CustomEvent bus to the modal — same four event names.
+- CS reads zero PR text from the DOM beyond URL and click target.
+- All diff fetching happens in the host via the ADO `VCSProvider` adapter (#47 territory, not this story).
+- `requestId` per click; SW correlation map keyed by wire `correlationId`.
+
+### Affected workspaces
+
+`packages/extension` only. The dependency-direction rule is unchanged:
+- `extension → core` (imports `parsePRIdentifier`, `PRIdentifier`).
+- `extension → protocol` (imports `PRIdentifierSchema`, `QuizDTOSchema`, etc.).
+- No imports added in `core`, `protocol`, `adapters/*`, or `host`.
+
+### Types
+
+```ts
+// src/lib/dom/ado-vote-intercept.ts (new)
+
+import type { PRIdentifier } from "@lgtm-buzzer/core";
+
+export type AdoVoteVariant = "approve" | "approve-with-suggestions";
+
+export type AdoVoteSelectorOverrides = {
+  readonly testIds?: ReadonlyArray<string>;
+  readonly ariaLabelPrefixes?: ReadonlyArray<string>;
+  readonly textContents?: ReadonlyArray<string>;
+};
+
+export type AdoInterceptedApproveEvent = {
+  readonly kind: "ado";
+  readonly element: HTMLElement;
+  readonly variant: AdoVoteVariant;
+  readonly pr: PRIdentifier & { readonly kind: "ado" };
+};
+
+export type AdoVoteInterceptorDeps = {
+  readonly doc: Document;
+  readonly getCurrentPR: () => PRIdentifier | null;
+  readonly shouldBypass: () => boolean;
+  readonly onBlocked: (e: AdoInterceptedApproveEvent) => void;
+  readonly overrides?: AdoVoteSelectorOverrides;
+  readonly logger?: { readonly warn: (msg: string, ctx?: Record<string, unknown>) => void };
+};
+```
+
+```ts
+// src/lib/dom/approve-intercept.ts (rename type, additive)
+
+export type InterceptedApproveEvent =
+  | (ApproveBlockedEvent & { readonly kind: "github" })
+  | AdoInterceptedApproveEvent;
+```
+
+The existing `ApproveBlockedEvent` is kept as the GitHub-specific shape; the discriminated `InterceptedApproveEvent` is what `quiz-flow.ts` consumes via `onBlocked`. The `kind` discriminator drives the replay branch (`form.requestSubmit` vs `element.click`).
+
+```ts
+// src/lib/dom/navigation.ts (new)
+
+export type NavigationWatcher = {
+  readonly start: (cb: {
+    readonly onWillNavigate: () => void;
+    readonly onDidNavigate: () => void;
+  }) => (() => void);
+};
+
+export const createGitHubNavigationWatcher = (doc: Document): NavigationWatcher;
+export const createAdoNavigationWatcher = (doc: Document): NavigationWatcher;
+```
+
+```ts
+// src/lib/dom/quiz-flow.ts (extended)
+
+export type InterceptorFactory = (deps: {
+  readonly doc: Document;
+  readonly getCurrentPR: () => PRIdentifier | null;
+  readonly shouldBypass: () => boolean;
+  readonly onBlocked: (e: InterceptedApproveEvent) => void;
+}) => (() => void);
+
+export type QuizFlowDeps = {
+  // ... existing fields ...
+  readonly setupInterceptor: InterceptorFactory;
+  readonly navigationWatcher: NavigationWatcher;
+};
+```
+
+The two new deps are required (no default) so the entrypoint must wire them explicitly per platform.
+
+### Functions and methods
+
+```ts
+// src/lib/dom/ado-vote-intercept.ts
+export const setupAdoVoteInterceptor =
+  (deps: AdoVoteInterceptorDeps): (() => void);
+
+// Internal helper — exported only for unit tests.
+export const recognizeAdoVoteClick = (
+  target: EventTarget | null,
+  overrides?: AdoVoteSelectorOverrides,
+): { variant: AdoVoteVariant; element: HTMLElement } | null;
+```
+
+```ts
+// src/lib/dom/navigation.ts
+export const createGitHubNavigationWatcher =
+  (doc: Document): NavigationWatcher;
+export const createAdoNavigationWatcher =
+  (doc: Document): NavigationWatcher;
+```
+
+```ts
+// src/lib/dom/quiz-flow.ts — refactored signature
+export const createQuizFlowController =
+  (deps: QuizFlowDeps): QuizFlowController;
+```
+
+```ts
+// entrypoints/content.ts — selects per-page strategy
+const initialPR = detectPRPage(window.location.href);
+const platform: "github" | "ado" =
+  initialPR.ok && initialPR.pr.kind === "ado" ? "ado" : "github";
+
+const setupInterceptor: InterceptorFactory =
+  platform === "ado"
+    ? (deps) => setupAdoVoteInterceptor({ ...deps, onBlocked: deps.onBlocked, logger })
+    : (deps) => setupApproveInterceptor(deps);
+
+const navigationWatcher =
+  platform === "ado"
+    ? createAdoNavigationWatcher(document)
+    : createGitHubNavigationWatcher(document);
+
+const controller = createQuizFlowController({
+  doc: document,
+  sendFrame,
+  newCorrelationId: () => crypto.randomUUID(),
+  newRequestId: () => crypto.randomUUID(),
+  setupInterceptor,
+  navigationWatcher,
+  logger,
+});
+```
+
+Note: the platform selection is computed at `main()` time. If the user navigates from a GitHub tab to an ADO tab the CS is loaded fresh per page (each is a separate document), so the static-at-load choice is correct. Cross-host SPA navigation does not exist.
+
+### File layout
+
+**New (5)**:
+- `packages/extension/src/lib/dom/ado-vote-intercept.ts`
+- `packages/extension/src/lib/dom/ado-vote-intercept.test.ts`
+- `packages/extension/src/lib/dom/navigation.ts`
+- `packages/extension/src/lib/dom/navigation.test.ts`
+- (no new modal/event-bus files — reused as-is)
+
+**Modified (5)**:
+- `packages/extension/src/lib/dom/approve-intercept.ts` — add the `InterceptedApproveEvent` discriminated union (additive; no breaking change to `setupApproveInterceptor`).
+- `packages/extension/src/lib/dom/quiz-flow.ts` — accept `setupInterceptor` + `navigationWatcher` via deps; branch replay path on `blocked.kind`.
+- `packages/extension/src/lib/dom/quiz-flow.test.ts` — extend with ADO happy-path + ADO replay-via-click tests.
+- `packages/extension/src/lib/dom/index.ts` — export new types and functions.
+- `packages/extension/entrypoints/content.ts` — platform selection at startup (see above).
+- `packages/extension/wxt.config.ts` — extend `host_permissions` with `*://*.visualstudio.com/*`.
+- `packages/extension/src/lib/dom/page-detection.test.ts` — three new cases: legacy host, percent-encoded project, trailing query.
+
+(Net 5 new files, 5 modified.)
+
+### Sequence — ADO happy path
+
+1. wxt loads CS on `dev.azure.com/*` (or `*.visualstudio.com/*`), `runAt: "document_idle"`.
+2. `main()` runs `detectPRPage(window.location.href)`. Result `{ ok: true, pr: { kind: "ado", ... } }` → platform = "ado".
+3. `createQuizFlowController` wires `setupAdoVoteInterceptor` and `createAdoNavigationWatcher`.
+4. Controller `start()`: capture-phase click listener on `document`, popstate + MutationObserver navigation watcher, quiz-submit + quiz-cancel listeners.
+5. User opens the Vote dropdown → ADO renders the menu (no listener fires).
+6. User clicks "Approve" or "Approve with suggestions". Capture-phase handler runs.
+7. `recognizeAdoVoteClick(event.target)` returns `{ variant, element }`.
+8. `getCurrentPR()` returns the ADO `PRIdentifier`; `shouldBypass()` returns false (no replay in progress).
+9. `preventDefault` + `stopPropagation` + `stopImmediatePropagation`. Store pending `{ requestId, element, variant, pr }`. Emit `lgtm-buzzer:quiz-request { requestId, correlationId, pr }`.
+10. `sendFrame(QuizRequestFrame)` awaits. SW routes to host (ADR-17), host generates quiz, replies.
+11. `QuizResponseFrame` → emit `quiz-result { outcome: "quiz-ready", quiz }`. Modal renders the quiz.
+12. User answers; modal emits `lgtm-buzzer:quiz-submit { requestId, quizId, answers }`.
+13. Controller sends `QuizSubmitFrame`; receives `QuizResultFrame { passed: true }`.
+14. Emit `quiz-result { outcome: "quiz-passed" }`. Set `approveBypass = true`. Call `pending.element.click()`.
+15. Capture listener fires synchronously, `shouldBypass()` consumes the flag and returns true → no preventDefault. ADO's own click handler runs; the Vote=Approve REST call goes through.
+16. ADO UI updates to show the user's vote.
+
+Failure variant at step 13: `passed: false` → `quiz-result { outcome: "quiz-failed" }`, no replay, pending dropped. Modal shows the failure UI; the user can dismiss and retry (a new click starts a new requestId).
+
+**Diff-flow audit**: the only PR-derived bytes on the wire are the `PRIdentifier` coordinates (org, project, repo, pullRequestId) — same shape as the GitHub case. No ADO DOM text crosses the CS boundary.
+
+### Error cases
+
+| Failure | Surfaced |
+|---|---|
+| ADO URL but click target is Wait-for-author / Reject | Recognizer returns `null`; click proceeds normally |
+| ADO URL on a non-PR page (e.g. `/pulls`) | `getCurrentPR()` returns `null`; click proceeds normally |
+| ADO ships a UI change breaking all three recognizers | Click proceeds without quiz (fail-open); logger.warn on Vote-menu open if instrumented (§10) |
+| Non-English ADO deployment | Text-content layer fails; `data-testid` / `aria-label` layers usually still work; if not, fail-open |
+| `getCurrentPR()` returns `{ kind: "github" }` on an ADO URL | Impossible (URL is parsed once at startup), but defensive `pr.kind === "ado"` check returns early |
+| `pending.element.click()` throws | Caught; `quiz-result { outcome: "error", reason: "internal" }` |
+| `popstate` to a non-PR ADO URL | `onDidNavigate` recomputes `currentPR = null`; subsequent clicks ignored |
+| SPA pushState to a different ADO PR | MutationObserver detects URL change; `currentPR` updated; bypass + pending dropped |
+| Bypass flag stuck after click-replay failure | Defensive reset on every `onDidNavigate` (same as ADR-18 `turbo:before-visit` defence) |
+| `setupInterceptor` factory throws | Bubbles to `main()`; CS does not start; error logged. Not a recoverable path |
+
+No throws on expected paths. The recognizer is a pure function over a DOM target — failures are `null` returns, not exceptions.
+
+### Test strategy
+
+**Unit (vitest + jsdom)**:
+
+- `ado-vote-intercept.test.ts` (~14 cases):
+  - Recognizer: data-testid match (each `KNOWN_ADO_VOTE_TESTIDS` value).
+  - Recognizer: aria-label `"Approve"` → match.
+  - Recognizer: aria-label `"Approve with suggestions"` → match (different variant).
+  - Recognizer: aria-label `"Reject"` → `null`.
+  - Recognizer: aria-label `"Wait for author"` → `null`.
+  - Recognizer: text content `"Approve"` → match.
+  - Recognizer: text content `"approve "` (with trailing whitespace) → match (trimmed).
+  - Recognizer: text content `"Approuver"` (non-English) → `null`.
+  - Recognizer: ancestor data-testid (target is a span inside a `<button data-testid>`) → match.
+  - Listener fires `onBlocked` with `variant` and `element` set.
+  - `shouldBypass()` true → click proceeds.
+  - `getCurrentPR()` null → no `onBlocked`.
+  - `getCurrentPR().kind === "github"` → no `onBlocked`.
+  - `dispose()` removes the listener.
+  - Overrides: `testIds: ["custom-approve"]` matches alongside built-ins.
+
+- `navigation.test.ts` (~6 cases):
+  - GitHub watcher: `turbo:before-visit` → `onWillNavigate`; `turbo:render` → `onDidNavigate`.
+  - GitHub watcher: dispose removes both listeners.
+  - ADO watcher: `popstate` → `onDidNavigate` AND `onWillNavigate` (collapsed).
+  - ADO watcher: MutationObserver on body change with URL change → `onDidNavigate`.
+  - ADO watcher: MutationObserver on body change without URL change → no callback.
+  - ADO watcher: dispose disconnects observer and removes popstate listener.
+
+- `quiz-flow.test.ts` extensions (~4 new cases):
+  - ADO happy path: click → request → ready → submit → passed → `element.click()` called once.
+  - ADO failed quiz: `element.click()` NOT called.
+  - ADO `pending.element.click()` throws: error outcome dispatched, bypass reset.
+  - ADO navigation mid-flight: `onDidNavigate` drops bypass + pending.
+
+- `page-detection.test.ts` extensions (~3 new cases):
+  - Legacy host: `https://myorg.visualstudio.com/MyProj/_git/myrepo/pullrequest/3`.
+  - Percent-encoded project on legacy host: `https://myorg.visualstudio.com/My%20Proj/_git/myrepo/pullrequest/3` → `project === "My Proj"`.
+  - Trailing query string preserved/ignored: `?_a=files` → still ok.
+
+**Contract**: none — there is no protocol surface added.
+
+**End-to-end**: deferred to #51 (Playwright). ADO requires login and a real ADO org, so #51 covers GitHub only for the first milestone. For #48 the dev verifies on a real ADO instance (their own org) via a manual smoke checklist:
+  1. Open an ADO PR. Verify modal appears on Approve click.
+  2. Pass the quiz. Verify the Approve goes through (the user's vote is recorded).
+  3. Fail the quiz. Verify the Approve is blocked.
+  4. Approve-with-suggestions: same pass + fail flow.
+  5. Reject: verify NO modal appears.
+  6. Wait-for-author: verify NO modal appears.
+  7. Navigate between two ADO PRs in the same tab. Verify the new PR is detected and the flow works on the second PR.
+  8. Legacy host (if accessible): repeat 1–3 on `*.visualstudio.com`.
+
+Coverage target: ~90% on `src/lib/dom/**` (unchanged from ADR-18). The new files are pure DOM logic, fully jsdom-testable.
+
+### Consequences
+
+- **Selector resilience.** Three-layer recognizer plus override hook bounds the blast radius of any ADO UI redesign. Most realistic UI changes (class renames, layout reshuffles) leave at least one of testid/aria-label/text intact.
+- **Fail-open semantics.** If all recognizers miss, Approve goes through without a quiz. We choose this over fail-closed because wedging Approve is a much worse UX than missing a quiz.
+- **No new runtime deps.** Plain TS + zod (already in use). No monadyssey in the extension paths.
+- **Manifest re-prompt.** Adding `*.visualstudio.com` to `host_permissions` triggers a Chrome user prompt on auto-update. Acceptable for v1; alternative is optional permissions, deferred to #50.
+- **Strategy refactor of `quiz-flow.ts`.** Two new deps (`setupInterceptor`, `navigationWatcher`) make it host-agnostic. Future VCS platforms (GitLab, Bitbucket) follow the same pattern — add a third interceptor + navigation watcher; no controller changes.
+- **Diff-only invariant preserved at the type level.** ADO `PRIdentifier` carries only coordinates (matches `vcs-provider.ts`). The recognizer reads only attribute / text from the click target — not from any PR-detail container. Reviewer grep gate extended.
+- **Forward-compat with #50.** `AdoVoteSelectorOverrides` is the typed integration point for the options page; no refactor needed when #50 lands.
+- **Localisation deferred.** v1 is English-only on the text-content fallback. ADO's two stable layers (data-testid, aria-label) are usually locale-independent, so non-English deployments are partially covered. A future ADR adds a locale-aware text layer if needed.
+- **No e2e for ADO in v1.** #51 covers GitHub only. ADO smoke is manual. This is the right trade-off — ADO e2e requires either a paid ADO instance or a non-trivial DOM fixture; defer until selector volatility justifies it.
+- **Reversibility high.** Two new files, four modified. Swapping the recognizer strategy is one file. Swapping the SPA navigation strategy is one file.
+- **Binding for the reviewer**: (a) ADO recognizer must not read any element under PR-content containers (grep gate); (b) `setupAdoVoteInterceptor` must call `stopImmediatePropagation`; (c) `quiz-flow.ts` must branch replay on `blocked.kind` and never call `requestSubmit` on the ADO path; (d) module-scoped bypass flag is shared between platforms but consumed identically; (e) `host_permissions` and `matches` must list both modern and legacy ADO hosts; (f) zero new runtime deps; (g) no `console.log` in committed code — only the injected `logger.warn`.

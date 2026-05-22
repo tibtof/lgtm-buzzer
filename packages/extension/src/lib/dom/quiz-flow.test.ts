@@ -1,9 +1,13 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import type { Frame } from "@lgtm-buzzer/protocol";
+import type { PRIdentifier } from "@lgtm-buzzer/core";
 import {
   createQuizFlowController,
   type QuizFlowController,
+  type InterceptorFactory,
 } from "./quiz-flow.js";
+import type { NavigationWatcher } from "./navigation.js";
+import type { InterceptedApproveEvent } from "./approve-intercept.js";
 import {
   DOM_EVENTS,
   type QuizResultEventDetail,
@@ -14,6 +18,13 @@ import {
 // Helpers / fakes
 // ---------------------------------------------------------------------------
 
+const adoPR: PRIdentifier = {
+  kind: "ado",
+  org: "my-org",
+  project: "My Project",
+  repo: "myrepo",
+  pullRequestId: 7,
+};
 
 const makeQuizResponseFrame = (correlationId: string, quizId = "quiz-1"): Frame => ({
   v: 1,
@@ -114,6 +125,63 @@ const collectRequestEvents = (): {
   };
 };
 
+/**
+ * Creates a GitHub-like `setupInterceptor` factory that wraps
+ * `setupApproveInterceptor` using the real form-submit mechanism.
+ * Used by GitHub-path tests.
+ */
+const makeGitHubInterceptorFactory = (): InterceptorFactory =>
+  (deps) => {
+    const handler = (event: Event): void => {
+      if (!(event.target instanceof HTMLFormElement)) return;
+      const form = event.target;
+      const submitter =
+        event instanceof SubmitEvent && event.submitter instanceof HTMLElement
+          ? event.submitter
+          : null;
+      const formData = new FormData(form, submitter);
+      if (formData.get("pull_request_review[event]") !== "approve") return;
+      const pr = deps.getCurrentPR();
+      if (pr === null) return;
+      if (deps.shouldBypass()) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const blocked: InterceptedApproveEvent = { kind: "github", form, submitter, pr };
+      deps.onBlocked(blocked);
+    };
+    deps.doc.addEventListener("submit", handler, { capture: true });
+    return () => { deps.doc.removeEventListener("submit", handler, { capture: true }); };
+  };
+
+/**
+ * Creates a no-op navigation watcher that does nothing. Used by tests that
+ * drive navigation manually or don't need SPA navigation.
+ */
+const makeNoOpNavigationWatcher = (): NavigationWatcher => ({
+  start: () => () => { /* no-op dispose */ },
+});
+
+/**
+ * Creates a GitHub Turbo navigation watcher fake that exposes callbacks so
+ * tests can fire navigation events manually.
+ */
+const makeTurboNavigationWatcher = (): NavigationWatcher & {
+  fireWillNavigate: () => void;
+  fireDidNavigate: () => void;
+} => {
+  let _onWillNavigate: (() => void) | null = null;
+  let _onDidNavigate: (() => void) | null = null;
+  return {
+    start: (cb: { readonly onWillNavigate: () => void; readonly onDidNavigate: () => void }) => {
+      _onWillNavigate = cb.onWillNavigate;
+      _onDidNavigate = cb.onDidNavigate;
+      return () => { _onWillNavigate = null; _onDidNavigate = null; };
+    },
+    fireWillNavigate: () => { _onWillNavigate?.(); },
+    fireDidNavigate: () => { _onDidNavigate?.(); },
+  };
+};
+
 // ---------------------------------------------------------------------------
 // Base setup
 // ---------------------------------------------------------------------------
@@ -127,10 +195,6 @@ describe("createQuizFlowController", () => {
 
   beforeEach(() => {
     // jsdom default href is "http://localhost/" — not a PR URL.
-    // We can't assign window.location.href directly in jsdom, but we can
-    // work around this by providing a custom getCurrentPR via the interceptor.
-    // The controller calls detectPRPage(doc.defaultView?.location.href ?? "").
-    // For tests we stub location via Object.defineProperty.
     Object.defineProperty(window, "location", {
       value: {
         ...window.location,
@@ -153,7 +217,7 @@ describe("createQuizFlowController", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 1. Happy path: Approve → quiz-ready → submit → quiz-passed → requestSubmit
+  // 1. Happy path GitHub: Approve → quiz-ready → submit → quiz-passed → requestSubmit
   // -------------------------------------------------------------------------
 
   it("happy path GitHub: quiz-ready then quiz-passed triggers requestSubmit", async () => {
@@ -183,6 +247,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
     });
     controller.start();
 
@@ -240,6 +306,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
     });
     controller.start();
 
@@ -282,6 +350,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
     });
     controller.start();
 
@@ -313,6 +383,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
     });
     controller.start();
 
@@ -354,6 +426,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
     });
     controller.start();
 
@@ -390,6 +464,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
       logger: { warn: (msg) => { warnCalls.push(msg); } },
     });
     controller.start();
@@ -417,20 +493,24 @@ describe("createQuizFlowController", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 7. turbo:before-visit clears bypass + pending
+  // 7. Navigation onWillNavigate clears bypass + pending
   // -------------------------------------------------------------------------
 
-  it("turbo:before-visit clears pending state", async () => {
+  it("onWillNavigate clears pending state", async () => {
     const requestSubmitSpy = vi.spyOn(HTMLFormElement.prototype, "requestSubmit").mockImplementation(() => { /* jsdom stub */ });
 
     // sendFrame that never resolves (simulates in-flight request).
     const sendFrame = vi.fn((): Promise<Frame> => new Promise(() => { /* never */ }));
+
+    const navWatcher = makeTurboNavigationWatcher();
 
     controller = createQuizFlowController({
       doc: document,
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: navWatcher,
     });
     controller.start();
 
@@ -438,8 +518,8 @@ describe("createQuizFlowController", () => {
     // Let the async start.
     await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
 
-    // Fire turbo:before-visit.
-    document.dispatchEvent(new Event("turbo:before-visit"));
+    // Fire will-navigate (equivalent to turbo:before-visit).
+    navWatcher.fireWillNavigate();
 
     // requestSubmit should NOT have been called.
     expect(requestSubmitSpy).not.toHaveBeenCalled();
@@ -448,20 +528,24 @@ describe("createQuizFlowController", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 8. turbo:render to non-PR page: controller idles (currentPR = null)
+  // 8. Navigation onDidNavigate to non-PR page: controller idles
   // -------------------------------------------------------------------------
 
-  it("turbo:render to non-PR URL: controller no longer intercepts Approve", async () => {
+  it("onDidNavigate to non-PR URL: controller no longer intercepts Approve", async () => {
     const blocked: unknown[] = [];
     const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> =>
       makeQuizResponseFrame(frame.correlationId ?? "null"),
     );
+
+    const navWatcher = makeTurboNavigationWatcher();
 
     controller = createQuizFlowController({
       doc: document,
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: navWatcher,
     });
     controller.start();
 
@@ -471,7 +555,7 @@ describe("createQuizFlowController", () => {
       writable: true,
       configurable: true,
     });
-    document.dispatchEvent(new Event("turbo:render"));
+    navWatcher.fireDidNavigate();
 
     // Submit should now be ignored.
     fireSubmit(form);
@@ -495,6 +579,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
     });
     controller.start();
 
@@ -534,6 +620,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: () => `corr-${++corrN}`,
       newRequestId: () => `req-${++reqN}`,
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
     });
 
     const { events: requestEvents, dispose: disposeRequests } = collectRequestEvents();
@@ -567,6 +655,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
     });
     controller.start();
 
@@ -609,6 +699,8 @@ describe("createQuizFlowController", () => {
       sendFrame,
       newCorrelationId: makeCounter("corr"),
       newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
       logger: { warn: (msg) => { warnCalls.push(msg); } },
     });
     controller.start();
@@ -632,5 +724,282 @@ describe("createQuizFlowController", () => {
     expect(sendFrame).not.toHaveBeenCalled();
 
     requestSubmitSpy.mockRestore();
+  });
+
+  // -------------------------------------------------------------------------
+  // ADO 13. Happy path ADO: click → quiz-ready → submit → quiz-passed → element.click()
+  // -------------------------------------------------------------------------
+
+  it("ADO happy path: quiz-passed triggers element.click()", async () => {
+    // Set ADO URL.
+    Object.defineProperty(window, "location", {
+      value: {
+        ...window.location,
+        href: "https://dev.azure.com/my-org/My%20Project/_git/myrepo/pullrequest/7",
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      const correlationId = frame.correlationId ?? "null";
+      if (frame.kind === "quiz-request") return makeQuizResponseFrame(correlationId);
+      if (frame.kind === "quiz-submit") return makeQuizResultFrame(correlationId, true);
+      return makeErrorFrame(correlationId);
+    });
+
+    const { events: resultEvents, dispose: disposeResult } = collectResultEvents();
+
+    // Use a container object to avoid TypeScript narrowing `null` through
+    // closures (TS 5.5+ narrows `let x: T | null` to `never` when both a
+    // null-assignment and a non-null assignment exist in separate closures).
+    const interceptorCtx: {
+      onBlocked: ((e: InterceptedApproveEvent) => void) | null;
+    } = { onBlocked: null };
+
+    const adoInterceptorFactory: InterceptorFactory = (deps) => {
+      interceptorCtx.onBlocked = deps.onBlocked;
+      return () => { interceptorCtx.onBlocked = null; };
+    };
+
+    const adoButton = document.createElement("button");
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: adoInterceptorFactory,
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    // Simulate ADO Approve click being intercepted.
+    interceptorCtx.onBlocked?.({
+      kind: "ado",
+      element: adoButton,
+      variant: "approve",
+      pr: adoPR as PRIdentifier & { kind: "ado" },
+    });
+
+    await vi.waitFor(() => expect(resultEvents.length).toBeGreaterThanOrEqual(1));
+    expect(resultEvents[0]?.outcome.kind).toBe("quiz-ready");
+
+    document.dispatchEvent(
+      new CustomEvent(DOM_EVENTS.quizSubmit, {
+        detail: {
+          requestId: "req-1",
+          quizId: "quiz-1",
+          answers: [{ questionId: "q1", chosenChoiceId: "a" }],
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(resultEvents.length).toBeGreaterThanOrEqual(2));
+    expect(resultEvents[1]?.outcome.kind).toBe("quiz-passed");
+
+    // The quiz-passed outcome confirms element.click() was the replay path
+    // (GitHub path would have called requestSubmit which is not spied here).
+    const requestSubmitSpy = vi.spyOn(HTMLFormElement.prototype, "requestSubmit");
+    expect(requestSubmitSpy).not.toHaveBeenCalled();
+    requestSubmitSpy.mockRestore();
+
+    disposeResult();
+  });
+
+  // -------------------------------------------------------------------------
+  // ADO 14. Failed quiz: element.click() NOT called
+  // -------------------------------------------------------------------------
+
+  it("ADO quiz-failed: element.click() NOT called", async () => {
+    Object.defineProperty(window, "location", {
+      value: {
+        ...window.location,
+        href: "https://dev.azure.com/my-org/My%20Project/_git/myrepo/pullrequest/7",
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      const correlationId = frame.correlationId ?? "null";
+      if (frame.kind === "quiz-request") return makeQuizResponseFrame(correlationId);
+      if (frame.kind === "quiz-submit") return makeQuizResultFrame(correlationId, false);
+      return makeErrorFrame(correlationId);
+    });
+
+    const { events: resultEvents, dispose: disposeResult } = collectResultEvents();
+
+    const adoButton = document.createElement("button");
+    const elementClickSpy = vi.spyOn(adoButton, "click");
+
+    const interceptorCtx: { onBlocked: ((e: InterceptedApproveEvent) => void) | null } = { onBlocked: null };
+
+    const adoInterceptorFactory: InterceptorFactory = (deps) => {
+      interceptorCtx.onBlocked = deps.onBlocked;
+      return () => { interceptorCtx.onBlocked = null; };
+    };
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: adoInterceptorFactory,
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    interceptorCtx.onBlocked?.({
+      kind: "ado",
+      element: adoButton,
+      variant: "approve",
+      pr: adoPR as PRIdentifier & { kind: "ado" },
+    });
+
+    await vi.waitFor(() => expect(resultEvents.length).toBeGreaterThanOrEqual(1));
+
+    document.dispatchEvent(
+      new CustomEvent(DOM_EVENTS.quizSubmit, {
+        detail: {
+          requestId: "req-1",
+          quizId: "quiz-1",
+          answers: [{ questionId: "q1", chosenChoiceId: "b" }],
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(resultEvents.length).toBeGreaterThanOrEqual(2));
+    expect(resultEvents[1]?.outcome.kind).toBe("quiz-failed");
+    expect(elementClickSpy).not.toHaveBeenCalled();
+
+    elementClickSpy.mockRestore();
+    disposeResult();
+  });
+
+  // -------------------------------------------------------------------------
+  // ADO 15. element.click() throws → error outcome dispatched, bypass reset
+  // -------------------------------------------------------------------------
+
+  it("ADO replay click throws: error outcome dispatched, bypass reset", async () => {
+    Object.defineProperty(window, "location", {
+      value: {
+        ...window.location,
+        href: "https://dev.azure.com/my-org/My%20Project/_git/myrepo/pullrequest/7",
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      const correlationId = frame.correlationId ?? "null";
+      if (frame.kind === "quiz-request") return makeQuizResponseFrame(correlationId);
+      if (frame.kind === "quiz-submit") return makeQuizResultFrame(correlationId, true);
+      return makeErrorFrame(correlationId);
+    });
+
+    const { events: resultEvents, dispose: disposeResult } = collectResultEvents();
+
+    const adoButton = document.createElement("button");
+    vi.spyOn(adoButton, "click").mockImplementation(() => { throw new Error("DOM error"); });
+
+    const interceptorCtx: { onBlocked: ((e: InterceptedApproveEvent) => void) | null } = { onBlocked: null };
+
+    const adoInterceptorFactory: InterceptorFactory = (deps) => {
+      interceptorCtx.onBlocked = deps.onBlocked;
+      return () => { interceptorCtx.onBlocked = null; };
+    };
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: adoInterceptorFactory,
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    interceptorCtx.onBlocked?.({
+      kind: "ado",
+      element: adoButton,
+      variant: "approve",
+      pr: adoPR as PRIdentifier & { kind: "ado" },
+    });
+
+    await vi.waitFor(() => expect(resultEvents.length).toBeGreaterThanOrEqual(1));
+
+    document.dispatchEvent(
+      new CustomEvent(DOM_EVENTS.quizSubmit, {
+        detail: {
+          requestId: "req-1",
+          quizId: "quiz-1",
+          answers: [{ questionId: "q1", chosenChoiceId: "a" }],
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(resultEvents.length).toBeGreaterThanOrEqual(3));
+
+    // quiz-passed emitted first, then error from click failure.
+    expect(resultEvents[1]?.outcome.kind).toBe("quiz-passed");
+    expect(resultEvents[2]?.outcome.kind).toBe("error");
+
+    disposeResult();
+  });
+
+  // -------------------------------------------------------------------------
+  // ADO 16. Navigation mid-flight drops bypass + pending
+  // -------------------------------------------------------------------------
+
+  it("ADO onDidNavigate mid-flight drops bypass and pending", async () => {
+    Object.defineProperty(window, "location", {
+      value: {
+        ...window.location,
+        href: "https://dev.azure.com/my-org/My%20Project/_git/myrepo/pullrequest/7",
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    const sendFrame = vi.fn((): Promise<Frame> => new Promise(() => { /* never */ }));
+    const adoButton = document.createElement("button");
+    const elementClickSpy = vi.spyOn(adoButton, "click");
+
+    const interceptorCtx: { onBlocked: ((e: InterceptedApproveEvent) => void) | null } = { onBlocked: null };
+    const navWatcher = makeTurboNavigationWatcher();
+
+    const adoInterceptorFactory: InterceptorFactory = (deps) => {
+      interceptorCtx.onBlocked = deps.onBlocked;
+      return () => { interceptorCtx.onBlocked = null; };
+    };
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: adoInterceptorFactory,
+      navigationWatcher: navWatcher,
+    });
+    controller.start();
+
+    interceptorCtx.onBlocked?.({
+      kind: "ado",
+      element: adoButton,
+      variant: "approve",
+      pr: adoPR as PRIdentifier & { kind: "ado" },
+    });
+
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+
+    // Navigate away.
+    navWatcher.fireWillNavigate();
+
+    // Even if sendFrame eventually resolved, pending is dropped.
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+    expect(elementClickSpy).not.toHaveBeenCalled();
+
+    elementClickSpy.mockRestore();
   });
 });

@@ -1,7 +1,8 @@
 import type { PRIdentifier } from "@lgtm-buzzer/core";
+import type { AdoInterceptedApproveEvent } from "./ado-vote-intercept.js";
 
 /**
- * The payload passed to `onBlocked` when an Approve form submission is
+ * The payload passed to `onBlocked` when a GitHub Approve form submission is
  * intercepted and needs to be held until the quiz result is known.
  */
 export type ApproveBlockedEvent = {
@@ -15,6 +16,17 @@ export type ApproveBlockedEvent = {
   /** The parsed PR identifier derived from `window.location.href`. */
   readonly pr: PRIdentifier;
 };
+
+/**
+ * Discriminated union over all platform-specific intercepted approve events.
+ *
+ * The `kind` field drives the replay branch in `quiz-flow.ts`:
+ * - `"github"` → `form.requestSubmit(submitter)` path.
+ * - `"ado"` → `element.click()` path.
+ */
+export type InterceptedApproveEvent =
+  | (ApproveBlockedEvent & { readonly kind: "github" })
+  | AdoInterceptedApproveEvent;
 
 /**
  * Dependencies for `setupApproveInterceptor`.
@@ -39,7 +51,7 @@ export type ApproveInterceptorDeps = {
    * Invoked when an Approve submit is intercepted. The controller uses this
    * to initiate the quiz round-trip and store the pending submit.
    */
-  readonly onBlocked: (e: ApproveBlockedEvent) => void;
+  readonly onBlocked: (e: ApproveBlockedEvent & { readonly kind: "github" }) => void;
 };
 
 /**
@@ -94,7 +106,7 @@ export const setupApproveInterceptor = (deps: ApproveInterceptorDeps): (() => vo
     event.preventDefault();
     event.stopPropagation();
 
-    onBlocked({ form, submitter, pr });
+    onBlocked({ kind: "github", form, submitter, pr });
   };
 
   doc.addEventListener("submit", handler, { capture: true });
