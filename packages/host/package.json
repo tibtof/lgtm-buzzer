@@ -21,7 +21,8 @@
   ],
   "scripts": {
     "build": "tsc -b",
-    "clean": "tsc -b --clean"
+    "clean": "tsc -b --clean",
+    "install:manifest": "node dist/install-manifest.js"
   },
   "dependencies": {
     "@lgtm-buzzer/adapter-ado": "*",
