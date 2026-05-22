@@ -102,10 +102,12 @@ describes principles, not file census.
 - **`protocol`**: `zod` is the only runtime dep. Types + zod schemas for
   every wire-format message. No `monadyssey` here — protocol must remain
   reusable from any consumer regardless of their FP stack.
-- **`core`**: `monadyssey` only. Use `Either` and `Option` for pure
-  domain logic. **No `IO` in core** — core is side-effect-free by
-  construction; ports describe effectful capabilities, adapters implement
-  them. Anything reaching for a second runtime dep in `core` is almost
+- **`core`**: `monadyssey` only, **and only the IO-free surface**
+  (`Either`, `Option`, `Eval`, `Ref`, `NonEmptyList`). `IO` and
+  `Schedule` are forbidden in `core` and enforced via ESLint
+  `no-restricted-imports` — core is side-effect-free by construction;
+  ports describe effectful capabilities, adapters implement them.
+  Anything reaching for a second runtime dep in `core` is almost
   certainly an adapter in disguise — stop and write the port instead.
 - **`adapters`**: `monadyssey` + `monadyssey-fetch` + `execa` + adapter-
   specific libs. All side-effecting work returns `IO<E, A>`. HTTP goes
@@ -322,9 +324,11 @@ export const spawnIO = (
    `spawnIO` that lets an exception leak past the `IO` boundary.
 2. **Cancellation kills the child.** When the surrounding `IO` is
    cancelled, send `SIGTERM` to the child immediately. After a grace
-   period (default 2s, configurable per call), send `SIGKILL`. Resolve
-   with `Err<SpawnError>{ kind: "cancelled", signal }`. A leaked child
-   process holding an LLM connection is a release-blocker bug.
+   period (**default 5s**, configurable per call), send `SIGKILL`.
+   Resolve with `Err<SpawnError>{ kind: "cancelled", signal }`. A leaked
+   child process holding an LLM connection is a release-blocker bug.
+   5s gives an LLM CLI room to flush its token buffer and close its
+   session file without making cancel-on-modal-close feel laggy.
 3. **stdin is single-shot.** If `stdin` is provided, write it once at
    process start and close the child's stdin. No streaming-input mode in
    v1.
@@ -381,11 +385,13 @@ second library.
   the unpacked extension into headless Chrome, navigates to a real
   `github.com` PR mock, asserts the quiz modal appears and the Approve
   button is gated.
-- **LLM prompt evals**: `promptfoo` in `packages/adapters/evals/`. The
-  suite asserts: (a) the generated quiz references at least one changed
-  function by name, (b) is not answerable from filenames alone, (c) has
-  exactly N questions, (d) includes at least one impact/edge-case
-  question. Without this, prompt tweaks are vibes-based.
+- **LLM prompt evals**: `promptfoo` in `packages/evals/` (its own
+  top-level workspace alongside `protocol`, `core`, `adapters/*`,
+  `host`, `extension`). The suite asserts: (a) the generated quiz
+  references at least one changed function by name, (b) is not
+  answerable from filenames alone, (c) has exactly N questions, (d)
+  includes at least one impact/edge-case question. Without this, prompt
+  tweaks are vibes-based.
 - Tests live next to the code they test (`foo.ts` + `foo.test.ts`).
 - Coverage target: 90% on `core` and `protocol`; 80% on adapters; smoke +
   contract tests on `host` and `extension`.
