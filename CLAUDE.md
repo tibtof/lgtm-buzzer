@@ -23,9 +23,11 @@ License: MIT
 | Module system | ESM only | MV3 service workers are ESM; no CJS interop |
 | Workspaces | npm workspaces | Stdlib of the ecosystem, zero extra tooling |
 | Architecture | Hexagonal (ports & adapters) | Clean boundaries between domain, I/O, and UI |
-| Domain style | Functional, pure-where-possible | Discriminated unions, immutable values, Result<T, E> |
-| Error model | `Result<T, E>` over throwing | Throws reserved for programmer errors, never expected failures |
-| Core deps | Zero runtime deps; zero Node, zero DOM | Core must be runnable in any JS env, embeddable in tests |
+| Domain style | Functional, pure-where-possible | Discriminated unions, immutable values, monadyssey idioms |
+| FP foundation | `monadyssey` (+ `monadyssey-fetch`) | One `IO` type and one `Either` across the monorepo; ZIO/cats-effect-style idioms |
+| Error model | `Either<E, A>` (pure) / `IO<E, A>` (effectful) over throw or raw `Promise` | Throws reserved for programmer errors; raw `Promise` only inside the `IO.of` boundary |
+| Validation | `zod` at every I/O boundary | TS types vanish at runtime; native messaging stdin is untrusted bytes |
+| Core deps | Only `monadyssey` allowed; no Node, no DOM, no I/O | monadyssey is pure (no I/O), so it doesn't violate the core's purity |
 | Initial browser | Chrome (MV3) | Largest user base, drives the constraints |
 | Later browser | Safari | Wraps the MV3 extension via the Xcode converter |
 | LLM integration | Local CLI via native messaging | No remote calls from the extension; user keeps their LLM choice |
@@ -52,9 +54,11 @@ License: MIT
   explicit context arguments. No module-level singletons.
 - **Discriminated unions over enums + booleans.** Make illegal states
   unrepresentable.
-- **Result<T, E>, not throw.** Reserve `throw` for programmer errors
-  (invariant violations, null where impossible). All expected failures
-  return a typed `Err`.
+- **Either / IO over throw or Promise.** Use `Either<E, A>` (from
+  monadyssey) for pure functions that can fail. Use `IO<E, A>` for
+  anything with side effects — including async work. Raw `Promise`
+  appears only inside an `IO.of(async () => …)` boundary. `throw` is
+  reserved for invariant violations (the equivalent of an assertion).
 
 ### Package layout
 
@@ -93,20 +97,45 @@ describes principles, not file census.
 
 ## Dependency rules
 
-- **`protocol`**: zero runtime deps. Types only. No `zod`/`io-ts` unless an
-  ADR justifies it; prefer hand-written discriminated unions.
-- **`core`**: zero runtime deps. No Node, no DOM. If you reach for a
-  dependency in `core`, you are almost certainly building an adapter in
-  disguise — stop and write the port instead.
-- **`adapters`**: may depend on Node stdlib and on adapter-specific libs
-  (e.g., `@octokit/*` for the GitHub adapter). One dep set per adapter; do
-  not pollute siblings.
-- **`host`**: minimal Node deps for stdio framing.
-- **`extension`**: browser/MV3 only; UI deps live here. No Node-only
-  packages.
-- **Approved licenses**: MIT, Apache-2.0, BSD-2/3, ISC.
+### Per-package policy (binding)
+
+- **`protocol`**: `zod` is the only runtime dep. Types + zod schemas for
+  every wire-format message. No `monadyssey` here — protocol must remain
+  reusable from any consumer regardless of their FP stack.
+- **`core`**: `monadyssey` only. Use `Either` and `Option` for pure
+  domain logic. **No `IO` in core** — core is side-effect-free by
+  construction; ports describe effectful capabilities, adapters implement
+  them. Anything reaching for a second runtime dep in `core` is almost
+  certainly an adapter in disguise — stop and write the port instead.
+- **`adapters`**: `monadyssey` + `monadyssey-fetch` + `execa` + adapter-
+  specific libs. All side-effecting work returns `IO<E, A>`. HTTP goes
+  through `monadyssey-fetch`. Subprocess work goes through `execa` wrapped
+  by the `spawnIO` helper (see Functional idioms #4). One dep set per
+  adapter; do not pollute siblings.
+- **`host`**: `monadyssey` for top-level wiring (the stdio read loop
+  produces `IO` values, not Promises), `pino` for structured logging to
+  stderr, `zod` for validating every incoming message before dispatch.
+- **`extension`**: default to plain TS + `zod`. Reach for `monadyssey`
+  only when a specific piece of logic genuinely benefits (e.g.,
+  cancellable LLM-status polling on modal close). Document any
+  monadyssey usage in `packages/extension/README.md`.
+
+### Version pinning
+
+- Pin `monadyssey` and `monadyssey-fetch` to an **exact** version in
+  every package.json that uses them — no `^`, no `~`. Bumps happen via
+  changesets, deliberately.
+- All other runtime deps use the project's default caret range.
+
+### Licenses
+
+- **Approved**: MIT, Apache-2.0, BSD-2/3, ISC.
 - **Rejected**: GPL, AGPL, LGPL, CC-BY-SA, proprietary.
+
+### Change control
+
 - New runtime deps in `core` or `protocol` require an ADR.
+- Any new dep in any package: license must be on the approved list.
 
 ---
 
@@ -129,34 +158,240 @@ describes principles, not file census.
 - No `console.log` in committed code outside the `host` entry and dev-only
   builds; use a small logger port instead.
 
-### Result<T, E> convention
+---
+
+## Functional idioms (binding)
+
+These six idioms are the project's FP contract. The reviewer agent enforces
+them on every PR.
+
+### 1. Functions that can fail return `Either<E, A>`, never throw
 
 ```ts
-export type Result<T, E> =
-  | { ok: true; value: T }
-  | { ok: false; error: E };
+import { Either, Left, Right } from "monadyssey";
 
-export const ok  = <T>(value: T): Result<T, never>  => ({ ok: true,  value });
-export const err = <E>(error: E): Result<never, E> => ({ ok: false, error });
+type ParseError = "empty" | "too-long";
+
+export const parseName = (input: string): Either<ParseError, string> => {
+  if (input.length === 0) return Left.of("empty");
+  if (input.length > 50)  return Left.of("too-long");
+  return Right.of(input);
+};
 ```
 
-Use a single `Result` type across the codebase, defined in `protocol`. Every
-expected failure path returns `Result`. Async work returns `Promise<Result<…>>`,
-not a rejected promise.
+### 2. Side effects return `IO<E, A>`, never raw `Promise`
+
+The only `Promise → IO` boundary is inside `IO.of(...)` at the adapter
+edge.
+
+```ts
+import { IO } from "monadyssey";
+
+type ReadError = { kind: "fs"; path: string; reason: string };
+
+export const readDiff = (path: string): IO<ReadError, string> =>
+  IO.of(
+    async () => fs.readFile(path, "utf8"),
+    (e): ReadError => ({ kind: "fs", path, reason: String(e) }),
+  );
+```
+
+### 3. Retries use `Schedule`, not hand-rolled loops or `setTimeout`
+
+```ts
+import { IO, Schedule } from "monadyssey";
+
+const policy = new Schedule({ recurs: 3, factor: 2, delay: 100 });
+
+export const retryNetwork = <A>(op: IO<NetworkError, A>): IO<NetworkError, A> =>
+  policy.retryIf(op, (e) => e.kind === "transient", (e) => e as NetworkError);
+```
+
+### 4. CLI invocations use `spawnIO`, never `execa` or `child_process` directly
+
+Only the file defining `spawnIO` may import `execa` or
+`node:child_process`. Every LLM adapter (`claude-cli`, `codex-cli`,
+`copilot-cli`) composes on top of `spawnIO`. See the **spawnIO contract**
+section below for the binding signature and behavior — this is the most
+important adapter primitive and the first one the dev agent will
+scaffold.
+
+```ts
+import { spawnIO } from "./spawn-io.js";
+
+const claudeQuiz = (diff: string): IO<SpawnError, SpawnOutput> =>
+  spawnIO("claude", ["--prompt", "Generate a quiz for this diff"], diff);
+```
+
+### 5. HTTP uses `monadyssey-fetch`, never raw `fetch` or `axios`
+
+The adapter exposes `IO<HttpError, A>` to the rest of the codebase. The
+implementation may use whatever the library calls its primary entry — the
+shape from the consumer side is `IO`, not `Promise<Response>`.
+
+```ts
+import type { IO } from "monadyssey";
+// import path / API may vary — confirm against the installed version
+import { Http } from "monadyssey-fetch";
+
+export const fetchPR = (id: string): IO<HttpError, PRData> =>
+  Http.get<PRData>(`/prs/${id}`);
+```
+
+### 6. Pattern-match with `.fold(...)`, not manual `isOk` checks
+
+```ts
+import type { Either } from "monadyssey";
+
+export const renderQuiz = (parsed: Either<ParseError, Quiz>): string =>
+  parsed.fold(
+    (error) => `Failed to parse quiz: ${error}`,
+    (quiz)  => `Quiz with ${quiz.questions.length} questions`,
+  );
+```
+
+Use the same shape for `Option.fold(ifNone, ifSome)` and
+`IO.fold(onFailure, onSuccess)`. Manual `if (result.type === "Right")`
+branches are allowed where `.fold` would force an awkward closure
+(narrowing for sequential work), but the default is `.fold`.
+
+### 7. All untrusted input passes through a `zod` schema before reaching domain code
+
+```ts
+import { z } from "zod";
+import { Either, Left, Right } from "monadyssey";
+
+const QuizRequestSchema = z.object({
+  prId: z.string().min(1),
+  diff: z.string(),
+});
+
+export type QuizRequest = z.infer<typeof QuizRequestSchema>;
+
+export const parseQuizRequest = (raw: unknown): Either<ParseError, QuizRequest> => {
+  const result = QuizRequestSchema.safeParse(raw);
+  return result.success
+    ? Right.of(result.data)
+    : Left.of({ kind: "schema", issues: result.error.issues });
+};
+```
+
+Boundaries that **must** validate before crossing into domain code:
+
+- Native messaging stdin in `host` (every framed message).
+- HTTP response bodies in `adapters` (GitHub, ADO, anything else).
+- File contents read by any adapter (config files, fixture files).
+- `JSON.parse` output anywhere.
+
+Schemas live in `protocol` and are imported by the boundary code; the
+domain code receives only `z.infer<typeof Schema>` types and never sees
+`unknown`.
+
+---
+
+## spawnIO contract (TODO for the first adapters ADR)
+
+The single most important adapter primitive. Get cancellation right — a
+forgotten child process holding an LLM connection is the worst-case bug.
+
+### Signature
+
+```ts
+type SpawnError =
+  | { kind: "spawn-failed";   reason: string }
+  | { kind: "process-failed"; exitCode: number; stderr: string }
+  | { kind: "cancelled";      signal: "SIGTERM" | "SIGKILL" };
+
+type SpawnOutput = {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number;
+};
+
+export const spawnIO = (
+  command: string,
+  args: readonly string[],
+  stdin?: string,
+): IO<SpawnError, SpawnOutput>;
+```
+
+### Behavior
+
+1. **Never throws.** Every failure mode lands in `IO`'s error channel as
+   a typed `SpawnError` variant. The reviewer rejects any code path in
+   `spawnIO` that lets an exception leak past the `IO` boundary.
+2. **Cancellation kills the child.** When the surrounding `IO` is
+   cancelled, send `SIGTERM` to the child immediately. After a grace
+   period (default 2s, configurable per call), send `SIGKILL`. Resolve
+   with `Err<SpawnError>{ kind: "cancelled", signal }`. A leaked child
+   process holding an LLM connection is a release-blocker bug.
+3. **stdin is single-shot.** If `stdin` is provided, write it once at
+   process start and close the child's stdin. No streaming-input mode in
+   v1.
+4. **stdout / stderr are buffered in full** into `SpawnOutput`. Streaming
+   output is out of scope for v1; the adapter that needs it builds a
+   different primitive.
+5. **Spawn is non-shell, fixed args.** Always `shell: false`; `args` is
+   `readonly string[]` so callers cannot mutate it after construction.
+   No user-controlled binary paths reach `spawnIO`; the caller resolves
+   the binary's absolute path before calling.
+6. **Distinguishes three failure shapes:**
+   - `spawn-failed` — the OS could not start the process (command not on
+     PATH, EACCES, etc.). Usually a configuration problem.
+   - `process-failed` — the process ran and exited non-zero. Usually a
+     retry / different-input problem.
+   - `cancelled` — the surrounding `IO` was cancelled and the child was
+     terminated.
+
+### Why this contract is binding before any LLM adapter lands
+
+Every LLM-CLI adapter is mostly a thin wrapper around `spawnIO`. If the
+contract is wrong, all three adapter implementations are wrong. The
+first adapter ADR scaffolds this helper, its tests (including a
+cancellation test that asserts the child is actually dead), and the
+typed errors — *before* any specific LLM adapter starts.
+
+---
+
+## Forbidden libraries
+
+Single FP foundation, full stop. The following are forbidden across the
+monorepo and enforced via ESLint `no-restricted-imports`:
+
+- `neverthrow`
+- `fp-ts` / `io-ts`
+- `effect`
+- `purify-ts`
+- `true-myth`
+- any other Result / Effect / Either / IO library
+
+**Why**: mixing FP stacks creates conversion friction at every boundary
+and forces every new contributor to learn two type ecosystems. One `IO`,
+one `Either`, one `Option`. If `monadyssey` is missing a primitive we
+need, file an upstream issue or extend it locally — do not bring in a
+second library.
 
 ---
 
 ## Testing
 
-- Framework: TBD (Vitest is the leading candidate — fast, ESM-native,
-  workspace-aware). Lock in via ADR before writing tests.
+- **Unit / contract tests**: Vitest (ESM-native, workspace-aware, alias
+  `@lgtm-buzzer/*` to source).
+- **Extension end-to-end**: Playwright in `packages/extension/e2e/`. Loads
+  the unpacked extension into headless Chrome, navigates to a real
+  `github.com` PR mock, asserts the quiz modal appears and the Approve
+  button is gated.
+- **LLM prompt evals**: `promptfoo` in `packages/adapters/evals/`. The
+  suite asserts: (a) the generated quiz references at least one changed
+  function by name, (b) is not answerable from filenames alone, (c) has
+  exactly N questions, (d) includes at least one impact/edge-case
+  question. Without this, prompt tweaks are vibes-based.
 - Tests live next to the code they test (`foo.ts` + `foo.test.ts`).
 - Coverage target: 90% on `core` and `protocol`; 80% on adapters; smoke +
   contract tests on `host` and `extension`.
-- Use plain fakes for ports — no mocking frameworks.
-- Contract tests live in `adapters/<name>/contract.test.ts` and run the same
-  scenarios the core would.
-- Extension UI: prefer Playwright for end-to-end against a stubbed host.
+- Use plain function fakes for ports — no mocking frameworks.
+- Contract tests live in `packages/adapters/<name>/src/contract.test.ts`
+  and run the same scenarios the core would.
 
 ---
 
@@ -235,15 +470,18 @@ hosted service, never add telemetry that includes diff content.
 
 ## Build, test, lint commands
 
-To be locked in by the first architect ADR. Expected shape:
+Locked in by the scaffold:
 
 ```bash
-npm install              # root install, hoists workspaces
-npm run build            # tsc -b across all workspaces
-npm run test             # vitest run across all workspaces
-npm run lint             # eslint or biome — TBD
-npm run check            # build + test + lint, the CI gate
+npm install              # root install, hoists workspaces, runs wxt prepare
+npm run build            # tsc -b for libs + wxt build for the extension
+npm run build:libs       # tsc -b only (skip the extension)
+npm run build:extension  # wxt build only
+npm test                 # vitest run across all packages
+npm run lint             # eslint . (flat config, enforces dep direction)
+npm run format           # prettier --write .
+npm run clean            # tsc -b --clean
 ```
 
-Until the ADR lands, agents should propose commands and note the gap; do not
-invent ad-hoc scripts that bypass the workspace structure.
+`npm run check` (build + test + lint, the CI gate) is a TODO for the first
+CI ADR.
