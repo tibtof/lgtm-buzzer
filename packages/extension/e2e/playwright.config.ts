@@ -27,7 +27,13 @@ export default defineConfig({
   reporter: [["list"], ["html", { open: "never" }]],
 
   use: {
-    headless: true,
+    // headless: false is binding — Chrome does NOT expose MV3 extension service
+    // workers to CDP in headless mode. `context.waitForEvent("serviceworker")`
+    // times out unconditionally with headless: true. See ADR-19 §spec-comment-1
+    // and ADR-25 §Context. This value is vestigial; each spec launches its own
+    // persistent context with headless: false via launchExtensionContext().
+    // On CI: use xvfb-run (#54).
+    headless: false,
     trace: "on-first-retry",
   },
 
