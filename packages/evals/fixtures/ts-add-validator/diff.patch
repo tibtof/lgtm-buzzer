@@ -1,0 +1,77 @@
+diff --git a/src/validation/email.ts b/src/validation/email.ts
+new file mode 100644
+--- /dev/null
++++ b/src/validation/email.ts
+@@ -0,0 +1,42 @@
++import { Either, Left, Right } from "monadyssey";
++
++/** Regex for RFC-5322-ish email validation (simplified). */
++const EMAIL_REGEX = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
++
++/** Maximum allowed length for an email address. */
++export const MAX_EMAIL_LENGTH = 254;
++
++export type EmailValidationError =
++  | { kind: "empty" }
++  | { kind: "too-long"; length: number; max: number }
++  | { kind: "format"; value: string };
++
++/**
++ * Validates an email address string.
++ *
++ * Returns Right<string> (the normalised lowercase email) on success.
++ * Returns Left<EmailValidationError> on any validation failure.
++ *
++ * @param raw - The raw input string to validate.
++ */
++export const validateEmail = (raw: string): Either<EmailValidationError, string> => {
++  const trimmed = raw.trim();
++
++  if (trimmed.length === 0) {
++    return Left.pure({ kind: "empty" });
++  }
++
++  if (trimmed.length > MAX_EMAIL_LENGTH) {
++    return Left.pure({ kind: "too-long", length: trimmed.length, max: MAX_EMAIL_LENGTH });
++  }
++
++  if (!EMAIL_REGEX.test(trimmed)) {
++    return Left.pure({ kind: "format", value: trimmed });
++  }
++
++  return Right.pure(trimmed.toLowerCase());
++};
+diff --git a/src/validation/email.test.ts b/src/validation/email.test.ts
+new file mode 100644
+--- /dev/null
++++ b/src/validation/email.test.ts
+@@ -0,0 +1,28 @@
++import { describe, it, expect } from "vitest";
++import { validateEmail, MAX_EMAIL_LENGTH } from "./email.js";
++
++describe("validateEmail", () => {
++  it("returns Right for a valid email", () => {
++    const result = validateEmail("User@Example.COM");
++    expect(result.isRight()).toBe(true);
++    result.fold(
++      () => {},
++      (email) => expect(email).toBe("user@example.com"),
++    );
++  });
++
++  it("returns Left.empty for blank input", () => {
++    const result = validateEmail("   ");
++    expect(result.isLeft()).toBe(true);
++    result.fold((err) => expect(err.kind).toBe("empty"), () => {});
++  });
++
++  it("returns Left.too-long when length exceeds MAX_EMAIL_LENGTH", () => {
++    const long = "a".repeat(MAX_EMAIL_LENGTH) + "@x.co";
++    const result = validateEmail(long);
++    expect(result.isLeft()).toBe(true);
++    result.fold(
++      (err) => expect(err.kind).toBe("too-long"),
++      () => {},
++    );
++  });
++});

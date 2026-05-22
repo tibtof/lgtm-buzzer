@@ -1,0 +1,29 @@
+{
+  "name": "@lgtm-buzzer/evals",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Promptfoo eval suite measuring quiz quality across LLM adapters (ADR-26).",
+  "license": "MIT",
+  "scripts": {
+    "pretest": "vitest run",
+    "test": "vitest run",
+    "evals": "node scripts/generate-tests.mjs && promptfoo eval -c promptfoo.config.yaml --output results/latest.json",
+    "evals:quick": "node scripts/generate-tests.mjs --quick && promptfoo eval -c promptfoo.config.yaml --filter-pattern 'ts-add-validator|dep-bump-only|docs-readme-update' --output results/latest-quick.json",
+    "evals:empty-quiz-control": "node scripts/generate-tests.mjs && promptfoo eval -c promptfoo.empty-quiz.config.yaml --output results/empty-quiz-control.json"
+  },
+  "dependencies": {
+    "@lgtm-buzzer/adapter-claude-api": "*",
+    "@lgtm-buzzer/adapter-claude-cli": "*",
+    "@lgtm-buzzer/adapter-codex-cli": "*",
+    "@lgtm-buzzer/adapter-copilot-cli": "*",
+    "@lgtm-buzzer/adapter-shared": "*",
+    "@lgtm-buzzer/core": "*",
+    "monadyssey": "2.0.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "promptfoo": "^0.103.6",
+    "vitest": "^4.1.7"
+  }
+}

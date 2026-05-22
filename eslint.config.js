@@ -296,4 +296,20 @@ export default tseslint.config(
       ],
     },
   },
+  // Evals workspace: re-apply forbidden FP libraries rule.
+  // Node APIs and DOM APIs are explicitly allowed (evals run in Node only).
+  // No dependency-direction constraints apply to evals — it imports from
+  // adapters/* and core (the correct inward direction) and is never imported.
+  {
+    files: ["packages/evals/**/*.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [...FORBIDDEN_FP_LIBS.paths],
+          patterns: [...FORBIDDEN_FP_LIBS.patterns],
+        },
+      ],
+    },
+  },
 );

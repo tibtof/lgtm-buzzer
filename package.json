@@ -13,7 +13,8 @@
     "packages/core",
     "packages/adapters/*",
     "packages/host",
-    "packages/extension"
+    "packages/extension",
+    "packages/evals"
   ],
   "scripts": {
     "build": "npm run build:libs && npm run build:extension",
@@ -27,7 +28,9 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "check": "npm run build && npm run test && npm run lint && npm run typecheck:tests",
-    "clean": "tsc -b --clean"
+    "clean": "tsc -b --clean",
+    "evals": "npm run evals --workspace=@lgtm-buzzer/evals --if-present",
+    "evals:quick": "npm run evals:quick --workspace=@lgtm-buzzer/evals --if-present"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

@@ -1,0 +1,4 @@
+{
+  "_comment": "EMPTY BASELINE — run `npm run evals` from packages/evals/ (or `npm run evals -w @lgtm-buzzer/evals` from the repo root) to populate. Commit the populated results in a separate PR after reviewing the scores. See packages/evals/README.md for full instructions.",
+  "results": []
+}

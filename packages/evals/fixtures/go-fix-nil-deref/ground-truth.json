@@ -1,0 +1,11 @@
+{
+  "expectedSymbols": [
+    "GetByID",
+    "ErrUserNotFound",
+    "UserStore",
+    "user == nil",
+    "store: user not found",
+    "TestGetByID_NilUser"
+  ],
+  "notes": "A one-line nil-pointer guard added before returning a user pointer. The diff also updates the ErrUserNotFound message prefix and adds two tests. The quiz should probe the nil guard position, the error sentinel value, and the updated error message."
+}

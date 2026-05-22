@@ -1,0 +1,13 @@
+{
+  "expectedSymbols": [
+    "orders_set_updated_at",
+    "orders_updated_at",
+    "created_at",
+    "updated_at",
+    "BEFORE UPDATE",
+    "TIMESTAMPTZ",
+    "1970-01-01",
+    "orders"
+  ],
+  "notes": "SQL migration adding audit columns with a trigger. Quiz should probe the backfill value for created_at, the trigger timing (BEFORE UPDATE), the rollback order (trigger then function then columns), and why the down migration uses DROP IF EXISTS."
+}
