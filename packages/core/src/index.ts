@@ -2,6 +2,12 @@ import type { Either } from "monadyssey";
 import { Right } from "monadyssey";
 
 export type { LogBindings, LogLevel, Logger } from "./ports/logger.js";
+export type { Diff, GenerateQuizInput, LLMProvider } from "./ports/llm-provider.js";
+export type {
+  Choice, ChoiceId, MultipleChoiceQuestion, Question,
+  QuestionId, Quiz, QuizId,
+} from "./quiz/quiz.js";
+export type { LLMProviderError } from "./quiz/errors.js";
 
 /**
  * Marker version constant for @lgtm-buzzer/core.
