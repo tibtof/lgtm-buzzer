@@ -16,18 +16,21 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean"
   },
   "dependencies": {
-    "@lgtm-buzzer/protocol": "*",
-    "@lgtm-buzzer/core": "*",
+    "@lgtm-buzzer/adapter-ado": "*",
     "@lgtm-buzzer/adapter-claude-cli": "*",
     "@lgtm-buzzer/adapter-codex-cli": "*",
     "@lgtm-buzzer/adapter-copilot-cli": "*",
     "@lgtm-buzzer/adapter-github": "*",
-    "@lgtm-buzzer/adapter-ado": "*"
+    "@lgtm-buzzer/core": "*",
+    "@lgtm-buzzer/protocol": "*",
+    "monadyssey": "2.0.1"
   }
 }

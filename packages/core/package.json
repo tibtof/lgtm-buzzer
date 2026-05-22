@@ -13,12 +13,15 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean"
   },
   "dependencies": {
-    "@lgtm-buzzer/protocol": "*"
+    "@lgtm-buzzer/protocol": "*",
+    "monadyssey": "2.0.1"
   }
 }
