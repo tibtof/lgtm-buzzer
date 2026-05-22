@@ -1,6 +1,6 @@
 import { defineContentScript } from "wxt/utils/define-content-script";
 import { browser } from "wxt/browser";
-import { createQuizFlowController } from "../src/lib/dom/index.js";
+import { createQuizFlowController, createQuizModal } from "../src/lib/dom/index.js";
 import type { Frame } from "@lgtm-buzzer/protocol";
 import { CSResponseSchema } from "../src/lib/cs-protocol.js";
 
@@ -59,5 +59,15 @@ export default defineContentScript({
     });
 
     controller.start();
+
+    const modal = createQuizModal({
+      doc: document,
+      logger: {
+        warn: (msg, ctx) => {
+          console.warn(`[lgtm-buzzer:modal] ${msg}`, ctx ?? {});
+        },
+      },
+    });
+    modal.start();
   },
 });

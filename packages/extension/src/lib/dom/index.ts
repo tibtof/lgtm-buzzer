@@ -34,3 +34,9 @@ export {
   type QuizFlowLogger,
   type SendFrameFn,
 } from "./quiz-flow.js";
+
+export {
+  createQuizModal,
+  type QuizModal,
+  type QuizModalDeps,
+} from "./modal.js";
