@@ -13,7 +13,8 @@ describe("LLMProvider port — type-only smoke", () => {
   });
 
   it("Diff is a string alias", () => {
-    expectTypeOf<Diff>().toBeString();
+    // Updated by ADR-12: Diff is now branded.
+    expectTypeOf<Diff>().toMatchTypeOf<string>();
   });
 
   it("LLMProvider id is string and generateQuiz is a function", () => {

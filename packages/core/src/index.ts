@@ -3,6 +3,8 @@ import { Right } from "monadyssey";
 
 export type { LogBindings, LogLevel, Logger } from "./ports/logger.js";
 export type { Diff, GenerateQuizInput, LLMProvider } from "./ports/llm-provider.js";
+export type { PRIdentifier, VCSProvider, VCSProviderError, UnsupportedURL } from "./ports/vcs-provider.js";
+export { parsePRIdentifier } from "./ports/vcs-provider.js";
 export type {
   Choice, ChoiceId, MultipleChoiceQuestion, Question,
   QuestionId, Quiz, QuizId,
