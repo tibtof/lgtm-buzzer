@@ -336,7 +336,7 @@ const renderQuestion = (
   question: QuizDTO["questions"][number],
   groupName: string,
 ): { block: HTMLElement; getSelected: () => string | null } => {
-  const block = el(doc, "div", { class: "question-block" });
+  const block = el(doc, "div", { class: "question-block", "data-question": question.id });
 
   const prompt = el(doc, "p", { class: "question-prompt" });
   prompt.textContent = question.prompt;
@@ -354,6 +354,7 @@ const renderQuestion = (
       type: "radio",
       name: groupName,
       value: choice.id,
+      "data-choice": choice.id,
     }) as HTMLInputElement;
     radio.setAttribute("aria-label", choice.label);
 
@@ -572,6 +573,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
 
     host = doc.createElement("div");
     host.setAttribute("data-lgtm-modal-host", "");
+    host.setAttribute("data-testid", "lgtm-buzzer-quiz-modal");
     shadow = host.attachShadow({ mode: "open" });
 
     const styleEl = doc.createElement("style");
@@ -628,7 +630,10 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         subtitle.textContent = "Preparing your quiz…";
         content.appendChild(renderLoading(doc));
         // Cancel button.
-        const cancelBtn = textEl(doc, "button", "Cancel", { class: "btn btn-secondary" });
+        const cancelBtn = textEl(doc, "button", "Cancel", {
+          class: "btn btn-secondary",
+          "data-testid": "lgtm-buzzer-quiz-cancel",
+        });
         cancelBtn.addEventListener("click", () => { handleCancel(requestId); });
         actions.appendChild(cancelBtn);
         break;
@@ -640,6 +645,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
 
         const submitBtn = textEl(doc, "button", "Submit answers", {
           class: "btn btn-primary",
+          "data-testid": "lgtm-buzzer-quiz-submit",
         }) as HTMLButtonElement;
         submitBtn.type = "submit";
 
@@ -655,7 +661,10 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           handleSubmit(requestId, quiz.id);
         });
 
-        const cancelBtn = textEl(doc, "button", "Cancel", { class: "btn btn-secondary" });
+        const cancelBtn = textEl(doc, "button", "Cancel", {
+          class: "btn btn-secondary",
+          "data-testid": "lgtm-buzzer-quiz-cancel",
+        });
         cancelBtn.addEventListener("click", () => { handleCancel(requestId); });
 
         actions.appendChild(cancelBtn);

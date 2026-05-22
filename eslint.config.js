@@ -274,6 +274,15 @@ export default tseslint.config(
       ],
     },
   },
+  // e2e tests run in Node via Playwright — node:* and default exports are allowed.
+  // Narrow override: browser-side bans for entrypoints/** and src/** are unchanged.
+  {
+    files: ["packages/extension/e2e/**/*.ts"],
+    rules: {
+      "no-restricted-imports": "off",
+      "no-restricted-syntax": "off",
+    },
+  },
   // Adapters and host may not import forbidden FP libraries.
   {
     files: ["packages/adapters/**/*.ts", "packages/host/**/*.ts"],

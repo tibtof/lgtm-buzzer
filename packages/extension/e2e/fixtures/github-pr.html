@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>tibtof/lgtm-buzzer · Pull Request #1</title>
+</head>
+<body>
+  <h1>Fix: improve review gate (#1)</h1>
+
+  <!--
+    Minimal GitHub-style approve form.
+    The wire-stable contract is:
+      <input name="pull_request_review[event]" value="approve">
+    Server-side parameter; GitHub cannot change it without breaking their API.
+  -->
+  <form id="approve-form" action="/owner/repo/pull/1/reviews" method="post">
+    <input type="hidden" name="pull_request_review[event]" value="approve" />
+    <button id="approve-btn" type="submit">Approve</button>
+  </form>
+
+  <!--
+    Bubble-phase listener that marks body when the form submit goes through.
+    The CS capture-phase listener has first refusal; if it calls preventDefault
+    the form never reaches here. Only when the bypass flag is set (quiz passed)
+    does requestSubmit() escape the capture handler — and this listener fires.
+  -->
+  <script>
+    document.querySelector('#approve-form').addEventListener('submit', function () {
+      document.body.setAttribute('data-form-submitted', 'true');
+    });
+  </script>
+</body>
+</html>

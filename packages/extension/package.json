@@ -10,13 +10,16 @@
     "build": "wxt build",
     "zip": "wxt zip",
     "compile": "wxt prepare && tsc --noEmit -p tsconfig.json",
-    "postinstall": "wxt prepare"
+    "postinstall": "wxt prepare",
+    "test:e2e": "playwright test --config=e2e/playwright.config.ts",
+    "test:e2e:install": "playwright install chromium"
   },
   "dependencies": {
     "@lgtm-buzzer/core": "*",
     "@lgtm-buzzer/protocol": "*"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "jsdom": "^26.1.0",
     "wxt": "^0.20.26"
   }
