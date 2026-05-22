@@ -12,6 +12,7 @@ const ROOT = resolve(new URL("..", import.meta.url).pathname);
 const TEST_PROJECTS = [
   "packages/protocol/tsconfig.test.json",
   "packages/core/tsconfig.test.json",
+  "packages/adapters/_shared/tsconfig.test.json",
   "packages/adapters/claude-cli/tsconfig.test.json",
   "packages/adapters/codex-cli/tsconfig.test.json",
   "packages/adapters/copilot-cli/tsconfig.test.json",

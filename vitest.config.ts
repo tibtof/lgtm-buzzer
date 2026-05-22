@@ -18,6 +18,9 @@ export default defineConfig({
     alias: {
       "@lgtm-buzzer/protocol": r("./packages/protocol/src/index.ts"),
       "@lgtm-buzzer/core": r("./packages/core/src/index.ts"),
+      "@lgtm-buzzer/adapter-shared": r(
+        "./packages/adapters/_shared/src/index.ts",
+      ),
       "@lgtm-buzzer/adapter-claude-cli": r(
         "./packages/adapters/claude-cli/src/index.ts",
       ),
