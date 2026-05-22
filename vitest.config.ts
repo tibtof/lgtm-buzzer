@@ -49,7 +49,7 @@ export default defineConfig({
         test: {
           name: "node",
           environment: "node",
-          include: ["packages/**/*.test.ts"],
+          include: ["packages/**/*.test.ts", "scripts/**/*.test.ts"],
           exclude: [
             ...sharedExclude,
             // DOM tests handled by the jsdom project below.

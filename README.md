@@ -6,6 +6,23 @@ native messaging host.
 
 ---
 
+## Download a release
+
+Pre-built artifacts are available on the
+[GitHub Releases page](https://github.com/tibtof/lgtm-buzzer/releases).
+Each release ships two files:
+
+- **`lgtm-buzzer-extension-v<version>.zip`** — Chrome MV3 extension. Load it
+  in Chrome as an unpacked extension (`chrome://extensions → Developer mode →
+  Load unpacked`) or install via the Chrome Web Store when available.
+- **`lgtm-buzzer-host-v<version>.tar.gz`** — Native messaging host. Extract
+  and run the included installer; no `npm install` required. Requires Node 22+
+  on your PATH.
+
+See **[docs/release.md](docs/release.md)** for the maintainer release guide.
+
+---
+
 ## Status: M2 vertical slice — Chrome + Claude CLI + GitHub
 
 The M2 slice is complete. You can install the extension today, load it in

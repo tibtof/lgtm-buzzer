@@ -23,7 +23,53 @@ const NATIVE_HOST_NAME = "com.lgtm_buzzer.host" as const;
 const MANIFEST_FILENAME = `${NATIVE_HOST_NAME}.json` as const;
 
 // ---------------------------------------------------------------------------
-// Pure helper
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+/** Input for `renderManifestTemplate`. */
+export type RenderManifestTemplateInput = {
+  readonly template: string;
+  readonly hostBinaryPath: string;
+  readonly extensionId: string;
+};
+
+/**
+ * Substitutes `__HOST_BINARY_PATH__` and `__EXTENSION_ID__` in the manifest
+ * template string. Both placeholders are replaced with properly JSON-string-
+ * escaped values so the result remains valid JSON.
+ *
+ * @param input - The template text and the two placeholder values.
+ * @returns The template with both placeholders substituted.
+ * @throws {Error} if either placeholder is absent from the template
+ *   (invariant: template is authored alongside the installer).
+ */
+export const renderManifestTemplate = (input: RenderManifestTemplateInput): string => {
+  const { template, hostBinaryPath, extensionId } = input;
+
+  if (!template.includes("__HOST_BINARY_PATH__")) {
+    throw new Error(
+      "renderManifestTemplate: template is missing the __HOST_BINARY_PATH__ placeholder",
+    );
+  }
+  if (!template.includes("__EXTENSION_ID__")) {
+    throw new Error(
+      "renderManifestTemplate: template is missing the __EXTENSION_ID__ placeholder",
+    );
+  }
+
+  // JSON-encode the values so special chars (backslash, quote) are safely escaped.
+  // JSON.stringify produces a quoted string like `"/abs/path"`, so we slice off the
+  // surrounding quotes to get only the escaped interior.
+  const escapedBinaryPath = JSON.stringify(hostBinaryPath).slice(1, -1);
+  const escapedExtensionId = JSON.stringify(extensionId).slice(1, -1);
+
+  return template
+    .replace(/__HOST_BINARY_PATH__/g, escapedBinaryPath)
+    .replace(/__EXTENSION_ID__/g, escapedExtensionId);
+};
+
+// ---------------------------------------------------------------------------
+// buildManifest
 // ---------------------------------------------------------------------------
 
 /** Input for `buildManifest`. */
@@ -110,12 +156,24 @@ export const buildManifest = (input: BuildManifestInput): BuildManifestResult =>
 // ---------------------------------------------------------------------------
 
 /**
- * Resolves the absolute path to `packages/host/dist/cli.js` relative to this
- * file, which lives at `packages/host/dist/install-manifest.js` after build.
+ * Resolves the absolute path to the host binary relative to this file.
+ *
+ * Supports two layouts:
+ * - **Bundled tarball layout**: `index.js` lives next to `install-manifest.js`
+ *   (both are bundled files produced by `scripts/release.mjs`).
+ * - **Dev layout**: `cli.js` lives next to `install-manifest.js` inside
+ *   `packages/host/dist/` after a normal `tsc -b` build.
+ *
+ * The bundled path is checked first so the tarball install flow works without
+ * any `dist/` directory present.
  */
 const resolveHostBinaryPath = (): string => {
   const thisFile = fileURLToPath(import.meta.url);
   const distDir = path.dirname(thisFile);
+  // Bundled tarball layout: index.js next to install-manifest.js.
+  const bundled = path.join(distDir, "index.js");
+  if (fs.existsSync(bundled)) return bundled;
+  // Dev layout: cli.js next to install-manifest.js inside packages/host/dist/.
   return path.join(distDir, "cli.js");
 };
 
