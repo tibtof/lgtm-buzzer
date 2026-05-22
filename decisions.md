@@ -3392,3 +3392,181 @@ Coverage target: 80% on adapter (per CLAUDE.md §Testing).
 - **Reversibility high.** Three independent files (prompt/response/provider); each is a one-file swap.
 - **Forward compat**: factory shape supports per-adapter timeout/model/binary; per-call inputs stay diff + questionCount only.
 - **Binding for reviewer**: (a) diff bytes in stdin only — test #2; (b) `buildPrompt` 2-param signature; (c) no `--bare`, no prompt positional; (d) `Cancelled` not manufactured into Err; (e) error mapping §7 exhaustive.
+
+---
+
+## ADR-15: First `VCSProvider` implementation — `github` adapter fetching PR diff via the GitHub REST API
+**Date**: 2026-05-22
+**Issue**: #37
+**Status**: Accepted
+
+### Context
+
+M2's first concrete `VCSProvider`. GitHub is v1 target. Upstream primitives in place: `VCSProvider` port + `VCSProviderError` + `Diff` + `PRIdentifier` (ADR-12), `Cancelled` runtime (ADR-10), `monadyssey-fetch@2.0.1` already pinned.
+
+Seven adapter-specific questions resolved below.
+
+### Decision
+
+#### 1 — Endpoint: `GET /repos/{owner}/{repo}/pulls/{number}` with `Accept: application/vnd.github.v3.diff`
+
+Single request. Response body IS the raw unified diff (no JSON envelope). Diff-only invariant enforced two ways: type contract (`fetchDiff → Diff`), reviewer attention. **No `/files`, `/commits`, `/comments`, `/reviews` endpoints are reached on any path.**
+
+URL builder (pure):
+
+```ts
+export const buildPullDiffUrl = (
+  baseUrl: string,
+  pr: Extract<PRIdentifier, { kind: "github" }>,
+): string => {
+  const trimmed = baseUrl.replace(/\/+$/, "");
+  return `${trimmed}/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}/pulls/${pr.number}`;
+};
+```
+
+#### 2 — `monadyssey-fetch@2.0.1` API (verified)
+
+CLAUDE.md idiom #5's `Http.get(...)` was illustrative. Actual v2.0.1 API is instantiable `HttpClient`:
+
+```ts
+import { HttpClient, HttpError, type Options } from "monadyssey-fetch";
+
+const client = new HttpClient({
+  baseUrl,
+  defaultHeaders: {
+    Accept: "application/vnd.github.v3.diff",
+    Authorization: `Bearer ${token}`,
+    "User-Agent": "lgtm-buzzer-github-adapter/0.0.0",
+    "X-GitHub-Api-Version": "2022-11-28",
+  },
+  timeout: timeoutMs,
+});
+
+const io = client.get(path, { responseType: "text", observe: "response" });
+// IO<HttpError, Response>
+```
+
+`observe: "response"` exposes status + body. `responseType: "text"` avoids JSON.parse on the diff body. Read text via `IO.of(() => response.text(), e => …)` if the library doesn't combine both options.
+
+#### 3 — Auth: PAT injected at factory construction
+
+```ts
+export type GithubAdapterConfig = {
+  readonly token: string;             // required PAT (classic or fine-grained)
+  readonly baseUrl?: string;           // default "https://api.github.com"
+  readonly timeoutMs?: number;         // default 30_000
+  readonly maxBytes?: number;          // default 2 MiB
+  readonly userAgent?: string;
+};
+```
+
+Adapter does NOT read env vars or files. Host wiring (#49) decides provenance. Token NEVER appears in `VCSProviderError.detail` or `raw` payload, never logged.
+
+#### 4 — Error mapping (binding per ADR-12 §Decision 3)
+
+| Source | VCSProviderError |
+|---|---|
+| `HttpError.status >= 400` (incl. 401/403/404/429/5xx) | `transport { status, detail: rawMessage }` |
+| `HttpError.status === 0` (network/TLS) | `transport { detail: rawMessage }` (no status) |
+| HttpClient timeout | `timeout { afterMs }` |
+| Body fails `looksLikeUnifiedDiff` | `malformed-response { detail, raw: body.slice(0, 8192) }` |
+| Body exceeds `maxBytes` | `malformed-response { detail: \`diff-too-large: ${bytes}\` }` |
+| Caller cancels | `Cancelled` runtime (NEVER manufactured into Err) |
+
+`raw` clipped to 8 KiB (same convention as ADR-14). Reviewer enforces: token MUST NOT appear in `detail` or `raw`.
+
+#### 5 — Structural validation: unified-diff sniff (not strict parse)
+
+```ts
+const looksLikeUnifiedDiff = (s: string): boolean => {
+  if (s.length === 0) return true;             // empty PR is legal
+  return /^diff --git /m.test(s) || /^--- /m.test(s);
+};
+```
+
+Catches HTML error pages. Strict parsing out of scope — that's the LLM's job.
+
+#### 6 — Diff size cap: 2 MiB hard ceiling (configurable)
+
+`Buffer.byteLength(body, "utf8") > maxBytes` → `malformed-response { detail: "diff-too-large: <bytes>" }`. Defense in depth; QuizSession (#38) may add its own ceiling.
+
+#### 7 — httptape integration
+
+**Binary assumed on PATH**. Two equivalent install paths documented in `packages/adapters/github/README.md`:
+1. `go install github.com/httptape/httptape/cmd/httptape@latest`.
+2. Docker: `docker run --rm -p <port>:8080 -v $(pwd)/fixtures:/fixtures tibtof/httptape serve --fixtures /fixtures`.
+
+Vitest globalSetup spawns `httptape serve --fixtures ./fixtures --port 0`, parses bound port from stderr, exposes via `LGTM_BUZZER_GH_HTTPTAPE_URL` env. Teardown kills on SIGTERM. Skips contract tests (with explicit warn) if httptape binary not found.
+
+Recording: `npm run record:github` gated by `LGTM_BUZZER_GH_TOKEN`. `httptape.sanitize.json` (committed) redacts `Authorization` headers, `X-GitHub-Token` headers, user emails, ETags before fixtures touch disk.
+
+#### 8 — File layout
+
+New (≥10):
+- `src/url.ts` + `.test.ts` — `buildPullDiffUrl` (pure).
+- `src/errors.ts` + `.test.ts` — `mapHttpError`.
+- `src/http.ts` + `.test.ts` — `HttpClient` wrapper.
+- `src/provider.ts` + `.test.ts` — `createGithubVcsProvider` + fake-HttpClient tests.
+- `src/contract.test.ts` — httptape-backed contract tests.
+- `vitest.globalSetup.ts`, `vitest.config.ts`, `httptape.sanitize.json`, `fixtures/`, `README.md`.
+
+Modified (3):
+- `src/index.ts` — replace smoke export.
+- `package.json` — add `zod@^3` dep, `record:github` script.
+- `tsconfig.json` — no changes expected.
+
+Existing smoke test files may be replaced; preserve any unique assertions before deleting.
+
+#### 9 — Factory signature
+
+```ts
+export type GithubAdapterDeps = {
+  readonly config: GithubAdapterConfig;
+  readonly httpClient?: HttpClient;   // injectable for tests
+};
+
+export declare const createGithubVcsProvider: (deps: GithubAdapterDeps) => VCSProvider;
+```
+
+Returns a `VCSProvider` whose `id === "github"`. Guards against non-`github` `PRIdentifier` early-return with `transport { detail: "wrong-vcs" }`.
+
+### Affected workspaces
+
+`packages/adapters/github/` only. Adds `zod@^3`. No reach into host/extension/other adapters.
+
+### Test strategy
+
+**`url.test.ts`** (≥6): happy; owner/repo encoding; trailing-slash normalization; port baseUrl; GitHub Enterprise.
+
+**`errors.test.ts`** (≥6): 401/403/404/429/500 → `transport { status }`; status 0 → `transport` without status.
+
+**`http.test.ts`** (≥4): HttpClient defaults asserted; timeout respected; `responseType: "text"`; no implicit JSON parse.
+
+**`provider.test.ts`** with fake HttpClient (≥10):
+1. Happy path: exactly one HTTP call to `/repos/owner/repo/pulls/123` with the diff Accept header.
+2. **Diff-only binding**: HTTP call list contains ONLY the diff endpoint; no /files /commits /comments /reviews paths.
+3. **No token in error payload**: simulated 401 → detail does NOT contain the token string.
+4. 404, 401, 429, 5xx mappings.
+5. Network failure → `transport` without status.
+6. Body fails sniff → `malformed-response { detail: "not-unified-diff", raw }`.
+7. Body > maxBytes → `malformed-response { detail: "diff-too-large: <bytes>" }`.
+8. Empty body → `Ok("" as Diff)`.
+9. Wrong-VCS guard: `fetchDiff({ kind: "ado", ... })` → `Err<transport { detail: "wrong-vcs" }>` without HTTP call.
+10. `provider.id === "github"`.
+11. Cancellation propagates as `Cancelled` (NOT manufactured).
+
+**`contract.test.ts`** with httptape sidecar (≥5): real `HttpClient` against `localhost:<httptape-port>` with recorded fixtures. Same scenarios as 1, 4, 5, 6, 7 above. Skipped with explicit warn if httptape unavailable.
+
+Coverage target: 80% on adapter; ≥95% on pure helpers.
+
+### Consequences
+
+- First real `VCSProvider`. Template for #47 (ADO).
+- `monadyssey-fetch@2.0.1` API documented for future adapter ADRs.
+- Diff-only invariant mechanically enforced.
+- httptape sidecar pattern established; CI install tracked separately.
+- 2 MiB ceiling defensible; revisit after dogfooding.
+- One new runtime dep (`zod` in adapter; MIT, already on allowlist).
+- Cancellation never manufactured into Err (ADR-10 + ADR-12).
+- Reversibility high. Independent files for URL builder, error mapper, body sniff, provider factory.
+- **Reviewer-binding**: (a) only diff endpoint hit (test #2); (b) no token in detail/raw (test #3); (c) Cancelled never Err (test #11); (d) 2 MiB ceiling enforced (test #7); (e) error mapping exhaustive (errors.test.ts).
