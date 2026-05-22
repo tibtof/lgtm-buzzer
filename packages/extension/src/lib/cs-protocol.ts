@@ -2,13 +2,17 @@ import { z } from "zod";
 import { FrameSchema } from "@lgtm-buzzer/protocol";
 
 /**
- * Zod schema for messages sent by content scripts to the service worker.
+ * Zod schema for messages sent by content scripts (or the options page) to
+ * the service worker.
  *
- * Currently the only variant is `send-frame`, which asks the SW to forward
- * a validated `Frame` to the native host and await the reply.
+ * - `send-frame` — asks the SW to forward a validated `Frame` to the native
+ *   host and await the reply.
+ * - `open-options` — asks the SW to call `chrome.runtime.openOptionsPage()`.
+ *   Added by ADR-23 to support the "Configure in options" link in the modal.
  */
 export const CSRequestSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("send-frame"), frame: FrameSchema }),
+  z.object({ kind: z.literal("open-options") }),
 ]);
 
 /** A validated message from a content script to the service worker. */

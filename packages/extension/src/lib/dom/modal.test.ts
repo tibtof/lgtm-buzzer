@@ -88,10 +88,11 @@ const fireQuizError = (
   doc: Document,
   requestId = "req-1",
   message = "host disconnected",
+  reason: "internal" | "missing-credentials" | "bad-credentials" = "internal",
 ): void => {
   const detail: QuizResultEventDetail = {
     requestId,
-    outcome: { kind: "error", reason: "internal", message },
+    outcome: { kind: "error", reason, message },
   };
   emitDOMEvent(doc, DOM_EVENTS.quizResult, detail);
 };
@@ -550,6 +551,44 @@ describe("createQuizModal", () => {
     const cancelBtn = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-cancel']");
     expect(cancelBtn).not.toBeNull();
     expect(cancelBtn!.tagName.toLowerCase()).toBe("button");
+  });
+
+  // ADR-23: missing-credentials renders "Configure in options" link
+  it("missing-credentials error renders 'Configure in options' link (ADR-23)", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document, "req-mc");
+    fireQuizError(document, "req-mc", "credentials required", "missing-credentials");
+
+    const shadow = getShadow(document)!;
+    const configLink = shadow.querySelector("[data-testid='lgtm-buzzer-configure-options']");
+    expect(configLink).not.toBeNull();
+    expect(configLink!.textContent).toContain("Configure credentials");
+  });
+
+  // ADR-23: clicking the "Configure in options" link emits the openOptions DOM event
+  it("clicking configure-options link emits lgtm-buzzer:open-options event", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    const openOptionsEvents: Event[] = [];
+    const handler = (e: Event): void => { openOptionsEvents.push(e); };
+    document.addEventListener("lgtm-buzzer:open-options", handler);
+
+    fireQuizRequest(document, "req-oo");
+    fireQuizError(document, "req-oo", "credentials required", "missing-credentials");
+
+    const shadow = getShadow(document)!;
+    const configLink = shadow.querySelector<HTMLAnchorElement>(
+      "[data-testid='lgtm-buzzer-configure-options']",
+    );
+    expect(configLink).not.toBeNull();
+    configLink!.click();
+
+    expect(openOptionsEvents).toHaveLength(1);
+
+    document.removeEventListener("lgtm-buzzer:open-options", handler);
   });
 
   beforeEach(() => {

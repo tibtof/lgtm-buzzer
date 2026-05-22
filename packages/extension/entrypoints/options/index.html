@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LGTM Buzzer — Options</title>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 14px;
+        color: #24292f;
+        background: #f6f8fa;
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        max-width: 520px;
+        margin: 0 auto;
+        background: #ffffff;
+        border: 1px solid #d0d7de;
+        border-radius: 8px;
+        padding: 24px;
+      }
+      h1 { font-size: 20px; font-weight: 600; margin: 0 0 20px 0; }
+      h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px 0; }
+      label {
+        display: block;
+        font-weight: 500;
+        margin-bottom: 4px;
+      }
+      select, input[type="password"] {
+        width: 100%;
+        padding: 6px 10px;
+        border: 1px solid #d0d7de;
+        border-radius: 6px;
+        font-size: 14px;
+        margin-bottom: 12px;
+      }
+      [data-lgtm-no-creds], [data-lgtm-unknown-adapter] {
+        font-size: 13px;
+        color: #656d76;
+        margin: 0 0 12px 0;
+      }
+      [data-lgtm-unknown-adapter] { color: #9a6700; }
+      [data-lgtm-actions] {
+        display: flex;
+        gap: 8px;
+        margin-top: 16px;
+      }
+      button {
+        padding: 6px 16px;
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+        border: 1px solid #d0d7de;
+        background: #f6f8fa;
+        color: #24292f;
+      }
+      button:hover:not(:disabled) { background: #e9ecef; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      [data-lgtm-banner] {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-radius: 6px;
+        padding: 10px 14px;
+        margin-bottom: 14px;
+        font-size: 13px;
+      }
+      [data-lgtm-banner-kind="success"] {
+        background: #dafbe1;
+        color: #1a7f37;
+        border: 1px solid #a7f3d0;
+      }
+      [data-lgtm-banner-kind="error"] {
+        background: #fff0f0;
+        color: #cf222e;
+        border: 1px solid #ffc1c1;
+      }
+      [data-lgtm-banner-kind="warning"] {
+        background: #fff8c5;
+        color: #9a6700;
+        border: 1px solid #eac54f;
+      }
+      [data-lgtm-banner-kind="info"] {
+        background: #ddf4ff;
+        color: #0969da;
+        border: 1px solid #54aeff;
+      }
+      [data-lgtm-dismiss] {
+        background: none;
+        border: none;
+        cursor: pointer;
+        font-size: 16px;
+        padding: 0 0 0 8px;
+        color: inherit;
+      }
+      [data-lgtm-footnote] {
+        font-size: 12px;
+        color: #656d76;
+        margin-top: 20px;
+      }
+      section[data-lgtm-section="adapters"] { margin-bottom: 8px; }
+    </style>
+  </head>
+  <body>
+    <main id="lgtm-options-root"></main>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

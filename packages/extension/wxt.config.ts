@@ -7,7 +7,7 @@ export default defineConfig({
     name: "LGTM-Buzzer",
     description: "Quiz yourself on the diff before approving PRs.",
     version: "0.0.0",
-    permissions: [],
+    permissions: ["storage"],
     host_permissions: [
       "*://github.com/*",
       "*://dev.azure.com/*",
