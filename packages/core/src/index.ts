@@ -1,5 +1,5 @@
-import type { Result } from "@lgtm-buzzer/protocol";
-import { ok } from "@lgtm-buzzer/protocol";
+import type { Either } from "monadyssey";
+import { Right } from "monadyssey";
 
 /**
  * Marker version constant for @lgtm-buzzer/core.
@@ -10,5 +10,6 @@ import { ok } from "@lgtm-buzzer/protocol";
  */
 export const CORE_VERSION = "0.0.0" as const;
 
-/** Smoke export that exercises the @lgtm-buzzer/protocol dependency. */
-export const ready = (): Result<typeof CORE_VERSION, never> => ok(CORE_VERSION);
+/** Smoke export that exercises the monadyssey Either dependency. */
+export const ready = (): Either<never, typeof CORE_VERSION> =>
+  Right.pure(CORE_VERSION);

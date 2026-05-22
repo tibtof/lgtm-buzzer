@@ -7,9 +7,9 @@ describe("adapter-ado", () => {
   });
 
   it("adapterInfo reports core version", () => {
-    expect(adapterInfo()).toEqual({
-      ok: true,
-      value: { id: "ado", coreVersion: "0.0.0" },
+    expect(adapterInfo().fold(() => null, (v) => v)).toEqual({
+      id: "ado",
+      coreVersion: "0.0.0",
     });
   });
 });
