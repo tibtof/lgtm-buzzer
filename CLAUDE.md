@@ -30,8 +30,8 @@ License: MIT
 | Core deps | Only `monadyssey` allowed; no Node, no DOM, no I/O | monadyssey is pure (no I/O), so it doesn't violate the core's purity |
 | Initial browser | Chrome (MV3) | Largest user base, drives the constraints |
 | Later browser | Safari | Wraps the MV3 extension via the Xcode converter |
-| LLM integration | Local CLI via native messaging | No remote calls from the extension; user keeps their LLM choice |
-| LLM providers (v1) | Claude Code, Codex, `gh copilot` | All three are CLI-first and locally invoked |
+| LLM access | Host-process integrations only (CLI subprocess or HTTP API) | Browser extension never makes LLM calls; the host is the single integration point. User keeps their LLM choice and credentials |
+| LLM integrations (v1) | Claude Code CLI, Codex CLI, `gh copilot` CLI, Anthropic API (host-held key) | Mix of subprocess-based and HTTP-based adapters. API keys (when used) live in host config, never in extension storage. User picks per session |
 | Quiz input | The actual diff, never the PR description/title | Prevents "LGTM-by-marketing" — see Key differentiator |
 | Distribution | Browser stores + the native host as a separate installable | Stores can't ship native binaries |
 | Repository structure | Single monorepo through v1.0 | Wire-format schemas in `protocol` bind extension + host in lockstep; cross-cutting changes are one PR, not coordinated multi-repo bumps. Reassess only if release cadences genuinely diverge post-v1.0 |
