@@ -7,9 +7,9 @@ describe("adapter-copilot-cli", () => {
   });
 
   it("adapterInfo reports core version", () => {
-    expect(adapterInfo()).toEqual({
-      ok: true,
-      value: { id: "copilot-cli", coreVersion: "0.0.0" },
+    expect(adapterInfo().fold(() => null, (v) => v)).toEqual({
+      id: "copilot-cli",
+      coreVersion: "0.0.0",
     });
   });
 });

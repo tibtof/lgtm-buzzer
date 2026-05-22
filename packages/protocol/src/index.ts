@@ -1,15 +1,13 @@
 /**
- * Discriminated success/failure tuple shared across LGTM-Buzzer.
+ * `@lgtm-buzzer/protocol` — shared wire-format and domain DTO surface.
  *
- * Reserve `throw` for invariant violations; every expected failure path
- * returns a `Result<T, E>` with a structured `E`.
+ * This package will host zod schemas for native-messaging frames and
+ * domain DTOs (issue #5 and the M1 wire-format issues #7/#8). For now
+ * the file is intentionally empty: the placeholder Result type was
+ * removed in ADR-5 in favour of the FP foundation's Either (from
+ * `monadyssey`) used directly by `core` and the adapters.
+ *
+ * `protocol` must remain reusable from any FP stack and therefore
+ * does not import `monadyssey` (per CLAUDE.md per-package policy).
  */
-export type Result<T, E> =
-  | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly error: E };
-
-/** Wrap a value as a successful Result. */
-export const ok = <T>(value: T): Result<T, never> => ({ ok: true, value });
-
-/** Wrap an error as a failed Result. */
-export const err = <E>(error: E): Result<never, E> => ({ ok: false, error });
+export {};

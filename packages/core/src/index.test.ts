@@ -6,7 +6,7 @@ describe("core", () => {
     expect(CORE_VERSION).toBe("0.0.0");
   });
 
-  it("ready() returns the version wrapped in a Result", () => {
-    expect(ready()).toEqual({ ok: true, value: "0.0.0" });
+  it("ready() returns the version wrapped in an Either", () => {
+    expect(ready().fold(() => "left", (v) => v)).toBe("0.0.0");
   });
 });

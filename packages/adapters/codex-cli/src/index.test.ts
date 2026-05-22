@@ -7,9 +7,9 @@ describe("adapter-codex-cli", () => {
   });
 
   it("adapterInfo reports core version", () => {
-    expect(adapterInfo()).toEqual({
-      ok: true,
-      value: { id: "codex-cli", coreVersion: "0.0.0" },
+    expect(adapterInfo().fold(() => null, (v) => v)).toEqual({
+      id: "codex-cli",
+      coreVersion: "0.0.0",
     });
   });
 });

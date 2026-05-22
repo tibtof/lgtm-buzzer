@@ -7,9 +7,9 @@ describe("adapter-github", () => {
   });
 
   it("adapterInfo reports core version", () => {
-    expect(adapterInfo()).toEqual({
-      ok: true,
-      value: { id: "github", coreVersion: "0.0.0" },
+    expect(adapterInfo().fold(() => null, (v) => v)).toEqual({
+      id: "github",
+      coreVersion: "0.0.0",
     });
   });
 });
