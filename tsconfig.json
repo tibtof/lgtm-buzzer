@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/protocol" },
     { "path": "./packages/core" },
+    { "path": "./packages/adapters/_shared" },
     { "path": "./packages/adapters/claude-cli" },
     { "path": "./packages/adapters/codex-cli" },
     { "path": "./packages/adapters/copilot-cli" },
