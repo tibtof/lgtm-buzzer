@@ -1603,3 +1603,238 @@ The dev pastes the four grep results into the PR body under `## Verification`.
 - **Reversibility.** ~150 LoC across 4 new + 4 modified files. Replacing pino later is a single-adapter swap behind the port.
 - **No license burden.** Pino is MIT.
 - **PM's open question resolved.** Default level `info`; env-var override `LGTM_BUZZER_LOG_LEVEL`.
+
+---
+
+## ADR-7: Wire-format envelope schema for native-messaging frames (absorbs ping/pong from #8)
+**Date**: 2026-05-22
+**Issue**: #7 (also absorbs #8)
+**Status**: Accepted
+
+### Context
+
+Every native-messaging frame between the MV3 extension and the host crosses an untrusted stdio boundary. Per CLAUDE.md §Functional idioms #7, every such frame must pass through a `zod` schema before reaching domain code, and per the per-package policy `zod` is the only runtime dep `protocol` is allowed to carry.
+
+Why this ADR absorbs #8: a discriminated union with zero variants is structurally degenerate. Defining ping + pong + error in the same ADR makes the envelope contract real, makes the parse helper testable end-to-end, and gives #10/#11/#12 a concrete fixture. #8 collapses to a thin dev-only follow-up.
+
+Resolved open questions:
+
+- **#7 — protocol version slot?** Yes. Numeric major (`v: z.literal(1)`). Wire shape only; host binary SemVer stays in `package.json`.
+- **#8 — does ping carry a payload?** Yes, optional caller-chosen `nonce` (non-empty string). Pong echoes it back. Optional so empty-ping liveness probes work, but the slot exists so dev-harness can assert round-trip integrity.
+
+CLAUDE.md per-package policy: `protocol` may import `zod` and nothing else. **No `monadyssey` in protocol.** The parse helper exposes zod's native `SafeParseReturnType` (structurally an Either) rather than `Either<E, A>`. Host wraps it in `IO.ofSync` at the call site.
+
+### Decision
+
+Five new source files plus five test files under `packages/protocol/src/`, and replace the ADR-5 stub in `src/index.ts` with re-exports.
+
+#### Wire-shape choices (binding)
+
+| Choice | Decision | Rationale |
+|---|---|---|
+| Protocol version | `v: z.literal(1)` (numeric major) | Wire shape only |
+| Discriminator | `kind` | Matches idiom #6 conventions elsewhere |
+| Correlation id | `correlationId: z.string().min(1).nullable()` | Opaque caller-generated; `null` reserved for unsolicited host events |
+| Payload slot | Refined per `kind` via `z.discriminatedUnion("kind", [...])` | Type-safe dispatch |
+| Error envelope | Real variant of the union, `kind: "error"` | Same shape as every other frame |
+| Validation helper | `parseFrame(raw): z.SafeParseReturnType<Frame, Frame>` | Lives in `protocol`; no monadyssey leak |
+
+#### Affected workspaces
+
+Only `packages/protocol`. Dependency-direction unchanged. `protocol`'s only runtime dep remains `zod`.
+
+#### Types
+
+All types inferred via `z.infer<typeof Schema>` and exported alongside schemas.
+
+**`packages/protocol/src/envelope.ts`**:
+
+```ts
+import { z } from "zod";
+import { PingFrameSchema } from "./messages/ping.js";
+import { PongFrameSchema } from "./messages/pong.js";
+import { ErrorFrameSchema } from "./messages/error.js";
+
+export const PROTOCOL_VERSION = 1 as const;
+
+export const EnvelopeBase = {
+  v: z.literal(PROTOCOL_VERSION),
+  correlationId: z.string().min(1).nullable(),
+} as const;
+
+export const FrameSchema = z.discriminatedUnion("kind", [
+  PingFrameSchema,
+  PongFrameSchema,
+  ErrorFrameSchema,
+]);
+
+export type Frame = z.infer<typeof FrameSchema>;
+export type FrameKind = Frame["kind"];
+```
+
+**`packages/protocol/src/messages/ping.ts`**:
+
+```ts
+import { z } from "zod";
+import { EnvelopeBase } from "../envelope.js";
+
+export const PingPayloadSchema = z.object({
+  nonce: z.string().min(1).optional(),
+});
+
+export type PingPayload = z.infer<typeof PingPayloadSchema>;
+
+export const PingFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("ping"),
+  payload: PingPayloadSchema,
+});
+
+export type PingFrame = z.infer<typeof PingFrameSchema>;
+```
+
+**`packages/protocol/src/messages/pong.ts`**: mirrors ping (nonce optional, non-empty when present, echoes the ping's nonce semantically).
+
+**`packages/protocol/src/messages/error.ts`**:
+
+```ts
+import { z } from "zod";
+import { EnvelopeBase } from "../envelope.js";
+
+export const ErrorReasonSchema = z.enum([
+  "schema-violation",
+  "unknown-message",
+  "version-mismatch",
+  "internal",
+]);
+
+export type ErrorReason = z.infer<typeof ErrorReasonSchema>;
+
+export const ErrorPayloadSchema = z.object({
+  reason: ErrorReasonSchema,
+  message: z.string().min(1),
+  details: z.unknown().optional(),
+});
+
+export type ErrorPayload = z.infer<typeof ErrorPayloadSchema>;
+
+export const ErrorFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("error"),
+  payload: ErrorPayloadSchema,
+});
+
+export type ErrorFrame = z.infer<typeof ErrorFrameSchema>;
+```
+
+**Critical**: `ErrorPayload.message` and `ErrorPayload.details` must NEVER carry diff content (CLAUDE.md §Key differentiator). Host adapter enforces redaction; the schema documents the contract via TSDoc.
+
+#### Functions and methods
+
+**`packages/protocol/src/parse.ts`**:
+
+```ts
+import { z } from "zod";
+import { FrameSchema, type Frame } from "./envelope.js";
+
+export const parseFrame = (
+  raw: unknown,
+): z.SafeParseReturnType<Frame, Frame> => FrameSchema.safeParse(raw);
+```
+
+`parseFrame` is synchronous and pure. Returns zod's native `{ success: true; data } | { success: false; error: ZodError }` result type. Host wraps in `IO.ofSync` at the call site (issue #10).
+
+#### File layout
+
+**Modified**: `packages/protocol/src/index.ts` (replace ADR-5 stub with re-exports).
+
+**New source**: `envelope.ts`, `messages/ping.ts`, `messages/pong.ts`, `messages/error.ts`, `parse.ts`.
+
+**New tests**: `envelope.test.ts`, `messages/ping.test.ts`, `messages/pong.test.ts`, `messages/error.test.ts`, `parse.test.ts`.
+
+**`packages/protocol/src/index.ts`** re-exports:
+
+```ts
+export {
+  PROTOCOL_VERSION,
+  FrameSchema,
+  type Frame,
+  type FrameKind,
+} from "./envelope.js";
+
+export {
+  PingPayloadSchema,
+  PingFrameSchema,
+  type PingPayload,
+  type PingFrame,
+} from "./messages/ping.js";
+
+export {
+  PongPayloadSchema,
+  PongFrameSchema,
+  type PongPayload,
+  type PongFrame,
+} from "./messages/pong.js";
+
+export {
+  ErrorReasonSchema,
+  ErrorPayloadSchema,
+  ErrorFrameSchema,
+  type ErrorReason,
+  type ErrorPayload,
+  type ErrorFrame,
+} from "./messages/error.js";
+
+export { parseFrame } from "./parse.js";
+```
+
+`EnvelopeBase` is NOT re-exported (composition helper internal to protocol).
+
+#### Sequence
+
+1. Create `packages/protocol/src/envelope.ts`.
+2. Create `packages/protocol/src/messages/ping.ts`, `pong.ts`, `error.ts`.
+3. Create `packages/protocol/src/parse.ts`.
+4. Replace `packages/protocol/src/index.ts` with the re-export block.
+5. Create five `*.test.ts` files.
+6. `npm run check` — all four gate commands green.
+7. Commit on branch `feat/7-envelope-schema`. Title: `feat(protocol): wire-format envelope, ping/pong, and error frames (#7, absorbs #8)`.
+
+#### Error cases
+
+| Failure | Where caught | How surfaced on the wire |
+|---|---|---|
+| `v` is not `1` | `parseFrame` literal mismatch | Host writes `ErrorFrame` with `reason: "version-mismatch"` |
+| Unknown `kind` | `parseFrame` discriminator rejects | `reason: "unknown-message"` |
+| Payload fails schema | `parseFrame` nested rejection | `reason: "schema-violation"` |
+| `correlationId` empty/missing | `parseFrame` rejects | `reason: "schema-violation"` |
+| `correlationId: null` on a request | Parses fine; dispatcher business | n/a at parse time |
+| Dispatcher throws | Host concern | `reason: "internal"` + redacted message |
+| `JSON.parse` throws upstream | Parser concern | `reason: "schema-violation"` |
+
+`parseFrame` itself never throws. zod's `safeParse` is total over `unknown`.
+
+#### Test strategy
+
+`envelope.test.ts` (10 cases): well-formed ping/pong/error parses; missing/wrong `v`; missing/unknown `kind`; missing/null/empty `correlationId`.
+
+`messages/ping.test.ts` (4): nonce present, omitted, empty (fails), wrong type (fails).
+
+`messages/pong.test.ts`: mirrors ping.
+
+`messages/error.test.ts` (5): every reason enum value; unknown reason fails; empty message fails; details optional; details unknown shape parses.
+
+`parse.test.ts`: happy path for each variant with TS narrowing; garbage input (`"hello"`, `null`, `42`, `[]`) returns `{ success: false }` without throwing; instanceof ZodError check.
+
+**Coverage target**: 90% on `protocol`.
+
+### Consequences
+
+- `protocol` has a real public surface: 9 schema constants and 10 inferred TS types. ADR-5's stub is gone; M1 issues #10/#11 consume `FrameSchema` and `parseFrame` directly.
+- **#8 collapses to a thin dev-only follow-up.** Architect routing on #8 is just "READY_FOR_DEV, see ADR-7".
+- **Forward compatibility**: bumping `PROTOCOL_VERSION` from `1` to `2` is a deliberate wire break. If later releases need rolling upgrades, the union can accept multiple version literals. Out of scope for v1.
+- **No `monadyssey` leak.** `parseFrame` returning zod's native result type is the deliberate workaround.
+- **No new runtime dependencies.** License diff: none.
+- **Security posture**: improves. Every byte from stdin will (post-#10) pass through `parseFrame`. Error envelope provides structured failure response without crashing.
+- **Key-differentiator posture**: schemas don't carry PR text. `ErrorPayload.message`/`details` flagged as redaction-required in TSDoc.
+- **Reversibility**: high. Single workspace, no consumers yet, no data persisted.
