@@ -67,6 +67,96 @@ describe("createPinoLogger", () => {
     expect(out).not.toContain("NESTED PROMPT");
   });
 
+  describe("ADR-22: credential redaction", () => {
+    it("5a. { credentials: { apiKey: 'x' } } — top-level credentials field censored", async () => {
+      const { stream, output } = makeCapture();
+      const logger = createPinoLogger({ destination: stream });
+
+      logger.info("cred test", { credentials: { apiKey: "TOP_LEVEL_CRED_VALUE" } });
+      await flush();
+
+      const out = output();
+      expect(out).not.toContain("TOP_LEVEL_CRED_VALUE");
+      expect(out).toContain("[Redacted]");
+    });
+
+    it("5b. { payload: { credentials: { apiKey: 'x' } } } — payload.credentials censored", async () => {
+      const { stream, output } = makeCapture();
+      const logger = createPinoLogger({ destination: stream });
+
+      logger.info("payload cred test", {
+        payload: { credentials: { apiKey: "PAYLOAD_CRED_VALUE" } },
+      });
+      await flush();
+
+      const out = output();
+      expect(out).not.toContain("PAYLOAD_CRED_VALUE");
+      expect(out).toContain("[Redacted]");
+    });
+
+    it("5c. { pat: 'ghp_secret' } — *.pat censored", async () => {
+      const { stream, output } = makeCapture();
+      const logger = createPinoLogger({ destination: stream });
+
+      logger.info("pat test", { pat: "ghp_PAT_SECRET_VALUE" });
+      await flush();
+
+      const out = output();
+      expect(out).not.toContain("ghp_PAT_SECRET_VALUE");
+      expect(out).toContain("[Redacted]");
+    });
+
+    it("5d. { token: 'abc123' } — *.token censored", async () => {
+      const { stream, output } = makeCapture();
+      const logger = createPinoLogger({ destination: stream });
+
+      logger.info("token test", { token: "TOKEN_SECRET_VALUE" });
+      await flush();
+
+      const out = output();
+      expect(out).not.toContain("TOKEN_SECRET_VALUE");
+      expect(out).toContain("[Redacted]");
+    });
+
+    it("5e. { 'x-api-key': 'hdr_secret' } — *.x-api-key censored", async () => {
+      const { stream, output } = makeCapture();
+      const logger = createPinoLogger({ destination: stream });
+
+      logger.info("x-api-key test", { "x-api-key": "XAPIKEY_SECRET_VALUE" });
+      await flush();
+
+      const out = output();
+      expect(out).not.toContain("XAPIKEY_SECRET_VALUE");
+      expect(out).toContain("[Redacted]");
+    });
+
+    it("5f. nested { foo: { credentials: { pat: 'ghp_x' } } } — *.credentials censored", async () => {
+      const { stream, output } = makeCapture();
+      const logger = createPinoLogger({ destination: stream });
+
+      logger.info("nested cred test", {
+        foo: { credentials: { pat: "NESTED_CRED_VALUE" } },
+      });
+      await flush();
+
+      const out = output();
+      expect(out).not.toContain("NESTED_CRED_VALUE");
+      expect(out).toContain("[Redacted]");
+    });
+
+    it("5g. { apiKey: 'sk-ant-xxx' } — *.apiKey censored", async () => {
+      const { stream, output } = makeCapture();
+      const logger = createPinoLogger({ destination: stream });
+
+      logger.info("apiKey test", { apiKey: "APIKEY_SECRET_VALUE" });
+      await flush();
+
+      const out = output();
+      expect(out).not.toContain("APIKEY_SECRET_VALUE");
+      expect(out).toContain("[Redacted]");
+    });
+  });
+
   describe("4. level resolution from env", () => {
     it("LGTM_BUZZER_LOG_LEVEL=debug enables debug messages", async () => {
       const { stream, output } = makeCapture();

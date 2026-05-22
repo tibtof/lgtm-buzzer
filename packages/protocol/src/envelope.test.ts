@@ -1,6 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { FrameSchema } from "./envelope.js";
 
+const VALID_LIST_ADAPTERS_REQUEST = {
+  v: 1,
+  kind: "list-adapters-request",
+  correlationId: "cid-lar",
+  payload: {},
+};
+
+const VALID_LIST_ADAPTERS_RESPONSE = {
+  v: 1,
+  kind: "list-adapters-response",
+  correlationId: "cid-lars",
+  payload: {
+    llm: ["claude-cli", "codex-cli", "copilot-cli", "claude-api"],
+    vcs: ["github", "ado"],
+  },
+};
+
 const VALID_PING = {
   v: 1,
   kind: "ping",
@@ -154,6 +171,23 @@ describe("FrameSchema", () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.data.kind).toBe("quiz-result");
+    }
+  });
+
+  // ADR-22: new frame kinds
+  it("parses a well-formed list-adapters-request frame", () => {
+    const result = FrameSchema.safeParse(VALID_LIST_ADAPTERS_REQUEST);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("list-adapters-request");
+    }
+  });
+
+  it("parses a well-formed list-adapters-response frame", () => {
+    const result = FrameSchema.safeParse(VALID_LIST_ADAPTERS_RESPONSE);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("list-adapters-response");
     }
   });
 });

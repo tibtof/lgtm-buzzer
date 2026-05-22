@@ -8,25 +8,31 @@
  * code 1.
  *
  * Dispatch table:
- *   ping          → pong (echoes nonce + correlationId)
- *   error         → warn + ignore (extension should not send error frames)
- *   quiz-request  → fetch diff, generate quiz, send quiz-response
- *   quiz-submit   → score submission, send quiz-result
- *   decode failure → write ErrorFrame with reason "schema-violation"
+ *   ping                   → pong (echoes nonce + correlationId)
+ *   error                  → warn + ignore (extension should not send error frames)
+ *   list-adapters-request  → list-adapters-response (returns registered adapter IDs)
+ *   quiz-request           → fetch diff, generate quiz, send quiz-response
+ *   quiz-submit            → score submission, send quiz-result
+ *   decode failure         → write ErrorFrame with reason "schema-violation"
  *
- * Required environment variables:
- *   LGTM_BUZZER_GH_TOKEN  GitHub personal access token (classic or fine-grained).
- *                         Required when handling quiz-request frames with pr.kind="github".
- *                         If missing, an ErrorFrame { reason: "internal" } is returned.
+ * Adapter selection (ADR-22):
+ *   Adapter IDs and credentials are supplied per-request in the quiz-request
+ *   payload by the extension. The extension options page (#50) is the only
+ *   supported credential source. No environment variables are used for
+ *   adapter selection or authentication.
+ *
+ *   Defaults (when fields are absent, preserving M2 behaviour):
+ *     llmAdapterId → "claude-cli"
+ *     vcsAdapterId → "github"
  *
  * Optional environment variables:
- *   LGTM_BUZZER_LLM        LLM adapter to use: "cli" (default) | "api" (not yet in M2).
  *   LGTM_BUZZER_LOG_LEVEL  pino log level: trace|debug|info|warn|error|fatal|silent (default: info).
  */
 import process from "node:process";
 
 import { PROTOCOL_VERSION } from "@lgtm-buzzer/protocol";
 import type { Frame } from "@lgtm-buzzer/protocol";
+import { spawnIO } from "@lgtm-buzzer/adapter-shared";
 
 import { createPinoLogger } from "./logger.js";
 import { createFrameReader } from "./framing/reader.js";
@@ -34,6 +40,7 @@ import { createFrameWriter } from "./framing/writer.js";
 import type { DecodeError } from "./framing/errors.js";
 import { createSessionStore } from "./session-store.js";
 import { createDispatcher } from "./dispatcher.js";
+import { createDefaultAdapterRegistry } from "./registry.js";
 
 // ---------------------------------------------------------------------------
 // Decode-error helper
@@ -75,11 +82,17 @@ const main = async (): Promise<void> => {
   const frames = readerResult.value;
   const write = createFrameWriter({ sink: process.stdout, logger });
   const store = createSessionStore();
+
+  // Construct the adapter registry once at startup (ADR-22).
+  // Adapter instances are built per-request inside the registry; the registry
+  // itself holds no mutable state.
+  const registry = createDefaultAdapterRegistry({ spawnIO });
+
   const { dispatch } = createDispatcher({
     write,
     store,
     logger,
-    env: process.env,
+    registry,
   });
 
   let streamFailed = false;

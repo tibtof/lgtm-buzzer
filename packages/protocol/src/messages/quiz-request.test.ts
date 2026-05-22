@@ -80,4 +80,73 @@ describe("QuizRequestFrameSchema", () => {
     });
     expect(result.success).toBe(false);
   });
+
+  // ADR-22: optional adapter selection + credentials fields
+  it("parses a quiz-request with all three new optional fields present", () => {
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: {
+        pr: GITHUB_PR,
+        questionCount: 3,
+        llmAdapterId: "claude-api",
+        vcsAdapterId: "github",
+        credentials: { apiKey: "sk-ant-xxx", pat: "ghp_yyy" },
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.payload.llmAdapterId).toBe("claude-api");
+      expect(result.data.payload.vcsAdapterId).toBe("github");
+      expect(result.data.payload.credentials?.["apiKey"]).toBe("sk-ant-xxx");
+    }
+  });
+
+  it("parses a quiz-request with only pr + questionCount (legacy envelope — no new fields)", () => {
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: { pr: GITHUB_PR, questionCount: 5 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.payload.llmAdapterId).toBeUndefined();
+      expect(result.data.payload.vcsAdapterId).toBeUndefined();
+      expect(result.data.payload.credentials).toBeUndefined();
+    }
+  });
+
+  it("rejects when credentials contains a non-string value", () => {
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: {
+        pr: GITHUB_PR,
+        questionCount: 3,
+        credentials: { apiKey: 12345 },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects when llmAdapterId is an empty string", () => {
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: {
+        pr: GITHUB_PR,
+        questionCount: 3,
+        llmAdapterId: "",
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects when vcsAdapterId is an empty string", () => {
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: {
+        pr: GITHUB_PR,
+        questionCount: 3,
+        vcsAdapterId: "",
+      },
+    });
+    expect(result.success).toBe(false);
+  });
 });

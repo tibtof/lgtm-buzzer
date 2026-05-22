@@ -8,6 +8,11 @@ export const ErrorReasonSchema = z.enum([
   "version-mismatch",
   "internal",
   "unknown-quiz-id",
+  // new in ADR-22: adapter registry errors
+  "unsupported-llm-adapter",
+  "unsupported-vcs-adapter",
+  "bad-credentials",
+  "missing-credentials",
 ]);
 
 /** Discriminated reason for a wire-level error. */
