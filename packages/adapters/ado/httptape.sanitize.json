@@ -1,0 +1,24 @@
+{
+  "version": "1",
+  "rules": [
+    {
+      "action": "redact_headers",
+      "headers": [
+        "Authorization",
+        "X-VSS-E2EID",
+        "X-VSS-UserData",
+        "X-TFS-Session",
+        "Cookie",
+        "Set-Cookie",
+        "X-Api-Key"
+      ]
+    },
+    {
+      "action": "redact_headers",
+      "headers": [
+        "ETag",
+        "Last-Modified"
+      ]
+    }
+  ]
+}

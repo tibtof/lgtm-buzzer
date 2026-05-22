@@ -1,12 +1,23 @@
-import type { Either } from "monadyssey";
-import { Right } from "monadyssey";
-import { CORE_VERSION } from "@lgtm-buzzer/core";
-
-/** Stable identifier for the ado VCS adapter. */
-export const ADAPTER_ID = "ado" as const;
-
-/** Smoke export: proves the monadyssey + core imports resolve. */
-export const adapterInfo = (): Either<
-  never,
-  { readonly id: typeof ADAPTER_ID; readonly coreVersion: typeof CORE_VERSION }
-> => Right.pure({ id: ADAPTER_ID, coreVersion: CORE_VERSION });
+/**
+ * Public API for the Azure DevOps VCS adapter.
+ *
+ * Usage:
+ * ```ts
+ * import { createAdoVcsProvider } from "@lgtm-buzzer/adapter-ado";
+ *
+ * const provider = createAdoVcsProvider({
+ *   config: { token: process.env.ADO_TOKEN ?? "" },
+ * });
+ * ```
+ *
+ * Note (v1): `fetchDiff` returns
+ * `malformed-response { detail: "ado-multi-call-not-yet-implemented" }` for all
+ * ADO PRs. Multi-call orchestration is deferred to a future ADR. The wrong-VCS
+ * guard, PAT-not-in-errors, and all structural invariants are fully enforced.
+ */
+export { createAdoVcsProvider, ADAPTER_ID } from "./provider.js";
+export type { AdoAdapterConfig, AdoAdapterDeps } from "./provider.js";
+export { buildPullDiffUrl } from "./url.js";
+export { mapHttpError } from "./errors.js";
+export { createAdoHttpClient } from "./http.js";
+export type { HttpClientConfig } from "./http.js";
