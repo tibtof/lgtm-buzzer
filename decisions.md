@@ -4405,3 +4405,39 @@ Runtime budget: <60s. Achievable (~5-10s dev hardware, ~15-25s CI cold-start).
 - Diff-only invariant unaffected (stub generates canned quiz from zero input; no LLM invoked).
 - Reversibility high. A future "real host" variant can coexist as a sibling spec.
 - Security: no real github.com, no credentials, no network egress, no LLM calls. Stub never bundled into production.
+
+---
+
+## End-of-M2 summary — 2026-05-22
+
+M2 ("First vertical slice — Chrome + claude-cli + GitHub") complete. All 14 issues closed (#32–#44 + #51 pulled forward + #62 ADR-10 clarification).
+
+**Architecture**: 11 new ADRs (ADR-9 spawnIO → ADR-19 Playwright e2e). Type-enforced diff-only invariant at four layers (port return type, identifier shape, TSDoc, reviewer grep gates). Logger redaction backstop. CS isolated-world for the bypass flag (page JS can't see it). Form-submit interception in capture phase (resilient to GitHub DOM churn). Pure aggregate composing IO ports without `IO` runtime usage in `core`.
+
+**Key primitives shipped**:
+- `spawnIO` (adapter-shared) — SIGTERM→5s→SIGKILL choreography, `IO<SpawnError, SpawnOutput>`.
+- `LLMProvider` / `VCSProvider` ports in core (type-only IO carve-out scoped to `ports/**`).
+- `Quiz` / `MultipleChoiceQuestion` / branded IDs / `LLMProviderError` / `VCSProviderError`.
+- `parsePRIdentifier(url)` for both GitHub and ADO URLs.
+- `FrameSchema` extended with quiz-request/-response/-submit/-result; `unknown-quiz-id` ErrorReason.
+- claude-cli adapter (stdin-only diff, JSON-output envelope, prompt-injection-safe SYSTEM prompt).
+- github adapter (single-endpoint diff fetch, httptape contract tests, 2 MiB cap).
+- QuizSession pure scoring functions (no IO in core).
+- Host dispatcher composing IO ports per ADR-16 §Sequence.
+- Native-messaging manifest installer (macOS + Linux).
+- MV3 service worker with lazy port + correlation map.
+- Content script form-submit capture + DOM-event bus.
+- Vanilla-DOM quiz modal in Shadow DOM.
+- Getting-started walkthrough.
+- Playwright happy-path e2e with SW-stub.
+
+**Final state**: 70-ish files net new across the workspace tree. `npm run check` green (build + 406+ tests + lint + typecheck:tests). `npm run test:e2e` green on dev hardware (~1.7s). End-to-end product not yet usable (no codex/copilot/ADO; UX is minimum viable; no CI workflow yet) — those are M3 scope.
+
+**Carry-forward notes for M3**:
+- The wire format reserves `kind: "free-text"` discriminant slot but only `multiple-choice` is implemented.
+- `Cancelled` runtime outcome at monadyssey@2.0.1 is the canonical cancellation surface (ADR-10) — adapters never manufacture `Err<cancelled>`.
+- The httptape sidecar pattern from ADR-15 generalizes to ADO (#47).
+- The content-script DOM-event bus from ADR-18 generalizes to ADO interceptor (#48).
+- The modal data-testid contract from ADR-19 §7 is binding for any future modal redesign.
+
+Onward to M3.
