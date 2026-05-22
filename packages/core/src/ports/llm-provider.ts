@@ -1,9 +1,10 @@
 import type { IO } from "monadyssey";
 import type { Quiz } from "../quiz/quiz.js";
 import type { LLMProviderError } from "../quiz/errors.js";
+import type { Diff } from "./vcs-provider.js";
 
-/** Unified-diff payload. Placeholder until #34 (VCSProvider). */
-export type Diff = string;
+/** Re-export of the canonical branded Diff type from the VCSProvider port (ADR-12). */
+export type { Diff } from "./vcs-provider.js";
 
 /**
  * Diff-only invariant (binding per CLAUDE.md §Key differentiator).
