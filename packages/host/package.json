@@ -31,6 +31,7 @@
     "@lgtm-buzzer/adapter-github": "*",
     "@lgtm-buzzer/core": "*",
     "@lgtm-buzzer/protocol": "*",
-    "monadyssey": "2.0.1"
+    "monadyssey": "2.0.1",
+    "pino": "^10.3.1"
   }
 }

@@ -1,6 +1,8 @@
 import type { Either } from "monadyssey";
 import { Right } from "monadyssey";
 
+export type { LogBindings, LogLevel, Logger } from "./ports/logger.js";
+
 /**
  * Marker version constant for @lgtm-buzzer/core.
  *
