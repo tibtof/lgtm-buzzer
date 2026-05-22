@@ -3570,3 +3570,164 @@ Coverage target: 80% on adapter; ≥95% on pure helpers.
 - Cancellation never manufactured into Err (ADR-10 + ADR-12).
 - Reversibility high. Independent files for URL builder, error mapper, body sniff, provider factory.
 - **Reviewer-binding**: (a) only diff endpoint hit (test #2); (b) no token in detail/raw (test #3); (c) Cancelled never Err (test #11); (d) 2 MiB ceiling enforced (test #7); (e) error mapping exhaustive (errors.test.ts).
+
+---
+
+## ADR-16: `QuizSession` aggregate in `core` as pure scoring functions composing `LLMProvider` + `VCSProvider`
+**Date**: 2026-05-22
+**Issue**: #38
+**Status**: Accepted
+
+### Context
+
+M2's domain piece that ties LLMProvider (#33) and VCSProvider (#34) together: fetch diff, generate quiz, store correct answers, score submissions. The host dispatcher (#39) is thin wiring around this.
+
+Three constraints collide: (1) ADR-4 forbids IO in core; (2) the ports the aggregate consumes return IO; (3) diff-only invariant must be type-enforced.
+
+Four shapes considered:
+- (a) Aggregate returns IO, extend the ports/** carve-out to quiz/ — defeats ADR-4.
+- (b) Class with constructor-injected ports returning `Promise<Either<...>>` — bleeds Promises past the IO boundary.
+- (c) **Pure functions** over Quiz + SubmittedAnswers; orchestration in host (#39) — selected.
+- (d) Ref-based state machine — YAGNI; host has its own Map per ADR-13.
+
+**Decision: (c).** Diff-only invariant remains type-encoded: Quiz already lacks a Diff (ADR-11); the aggregate has no slot to receive PR-derived text.
+
+### Decision
+
+#### 1. Aggregate — three pure functions
+
+```ts
+// packages/core/src/quiz/session.ts
+import type { Either } from "monadyssey";
+import { Left, Right } from "monadyssey";
+import type { ChoiceId, QuestionId, Quiz } from "./quiz.js";
+
+export type SubmittedAnswer = {
+  readonly questionId: QuestionId;
+  readonly chosenChoiceId: ChoiceId;
+};
+
+export type SubmittedAnswers = ReadonlyArray<SubmittedAnswer>;
+
+export type AnswerKey = ReadonlyMap<QuestionId, ChoiceId>;
+
+export type PerQuestionResult = {
+  readonly questionId: QuestionId;
+  readonly correct: boolean;
+  readonly explanation?: string;
+};
+
+export type Score = {
+  readonly correct: number;
+  readonly total: number;
+  readonly perQuestion: ReadonlyArray<PerQuestionResult>;
+};
+
+export type ScoreError =
+  | { readonly kind: "unknown-question-id"; readonly questionId: QuestionId }
+  | { readonly kind: "duplicate-question-id"; readonly questionId: QuestionId };
+
+/** Extract correct-answer key from a Quiz. Pure. */
+export const pickCorrectAnswers = (quiz: Quiz): AnswerKey;
+
+/**
+ * Score a submission against an answer key.
+ * - Unanswered → counted incorrect.
+ * - Unknown questionId → Left<unknown-question-id>.
+ * - Duplicate questionId → Left<duplicate-question-id>.
+ * - Wrong chosenChoiceId → correct: false (treated as not-the-right-answer).
+ * - explanation is NOT populated here; caller attaches from original Quiz when building wire frame.
+ */
+export const scoreSubmission = (
+  answerKey: AnswerKey,
+  submitted: SubmittedAnswers,
+): Either<ScoreError, Score>;
+
+/** Pass iff correct/total >= threshold. Default 1.0 (100%). Total 0 → false. */
+export const decidePassed = (score: Score, threshold?: number): boolean;
+```
+
+#### 2. Policy decisions (binding)
+
+| Choice | Decision |
+|---|---|
+| Pass threshold v1 | 1.0 (100% correct); #49 may override via threshold parameter |
+| Threshold representation | Fraction [0, 1], not absolute count |
+| Unanswered question | Counted incorrect (wire allows partial submits per ADR-13) |
+| Duplicate questionId in submission | `Left<duplicate-question-id>` (ambiguous intent) |
+| Unknown questionId | `Left<unknown-question-id>` (stale UI / tampering / off-by-one) |
+| Wrong chosenChoiceId (not in choices) | `correct: false` (treated as not-the-right-answer; no extra Quiz plumbing needed) |
+
+`decidePassed`'s threshold is a parameter, not module state. No `process.env` lookups in the aggregate.
+
+#### 3. Session state — NOT in the aggregate
+
+Host owns `Map<QuizId, AnswerKey>` (ADR-13). Aggregate provides `pickCorrectAnswers` for insertion + `scoreSubmission` for lookup-and-score. No `SessionStore` port — YAGNI v1.
+
+#### 4. Diff-only invariant (KEY DIFFERENTIATOR)
+
+The aggregate consumes Quiz (no Diff per ADR-11) + SubmittedAnswers (only questionId + chosenChoiceId). Type-encoded: no slot exists for PR-derived text. A `expectTypeOf<Quiz>().not.toHaveProperty("diff" | "description" | "title" | "commits" | "comments")` test pins this at compile time.
+
+### Affected workspaces
+
+`packages/core` only. No new deps. No `eslint.config.js` change (`quiz/` is not in `ports/**`; the IO carve-out does NOT leak here).
+
+### Types / Functions
+
+Per §1. Three exported functions; no classes, no Ref, no globals.
+
+### File layout
+
+**New (2)**: `packages/core/src/quiz/session.ts`, `packages/core/src/quiz/session.test.ts`.
+
+**Modified (1)**: `packages/core/src/index.ts` — add 6 type re-exports + 3 function re-exports.
+
+No `quiz/index.ts` barrel (consistent with ADR-11).
+
+### Sequence (informational — binding for #39's host dispatcher)
+
+```
+1. vcsProvider.fetchDiff(pr): IO<VCSProviderError, Diff>             [IO, host wires]
+2. llmProvider.generateQuiz({ diff, questionCount }): IO<LLMProviderError, Quiz>  [IO, host wires]
+3. pickCorrectAnswers(quiz) → AnswerKey                              [PURE — this ADR]
+4. hostMap.set(quiz.id, answerKey)                                   [host state]
+5. strip correctChoiceId, build QuizResponseFrame                    [host, per ADR-13]
+... user answers ...
+6. answerKey = hostMap.get(quizId); none → ErrorFrame                [host]
+7. scoreSubmission(answerKey, answers): Either<ScoreError, Score>    [PURE — this ADR]
+8. decidePassed(score) → passed                                       [PURE — this ADR]
+9. hostMap.delete(quizId)                                             [host; no replay]
+10. build QuizResultFrame { passed, correct, total, perQuestion }    [host, per ADR-13]
+```
+
+**Diff-flow audit**: Diff reaches LLM at step 2 only. The aggregate (steps 3/7/8) never sees the diff.
+
+### Error cases
+
+Per §2 policy. No `throw`. Functions are total over typed inputs.
+
+### Test strategy
+
+`packages/core/src/quiz/session.test.ts`:
+
+- **`pickCorrectAnswers`** (3 cases): single-question, multi-question, key-order matches Quiz.questions order.
+- **`scoreSubmission` happy** (5 cases): all correct; all wrong; mixed; partial submission (unanswered counted incorrect); single-question all-correct.
+- **`scoreSubmission` errors** (3 cases): unknown questionId → Left<unknown-question-id>; duplicate questionId → Left<duplicate-question-id>; empty submission `[]` → defensive Right<Score{ correct: 0, total: N }>.
+- **`decidePassed`** (6 cases): 100% + threshold 1.0 → true; less than 100% + threshold 1.0 → false; 0% + any threshold → false (unless 0); 80%+threshold 0.8 → true; 79%+threshold 0.8 → false; total 0 → false defensively.
+- **Property test (1)**: monotonicity — flipping a wrong answer to correct can never decrease `decidePassed`. Use a hand-rolled generator with a small fixed quiz (no new dev-dep on fast-check yet).
+- **Type-level invariant** (3 expectTypeOf cases): Quiz lacks diff/description/title/commits/comments; SubmittedAnswer is exactly `{ questionId, chosenChoiceId }`; AnswerKey preserves branded ID types.
+- **Lint regression** (informational, pasted in PR Verification): adding `import { IO } from "monadyssey"` (value or type-only) to `quiz/session.ts` fails lint — the ports/** carve-out doesn't leak to `quiz/`.
+
+Coverage target: 90% on core. Achievable with table-driven cases.
+
+### Consequences
+
+- Aggregate is pure. `core/src/quiz/` does NOT become a second IO carve-out zone. ADR-4 boundary preserved.
+- Orchestration moves to host (#39). §Sequence is binding for #39 — dispatcher uses exactly this composition to preserve the diff-only audit trail.
+- **Diff-only invariant gains a sixth enforcement layer** (ADR-13 listed five): aggregate has no parameter for non-diff text.
+- Pass threshold is policy, not architecture. v1 hardcodes 1.0; #49 may override.
+- Session storage stays host-side. No SessionStore port — YAGNI v1.
+- No new deps. Hand-rolled property generator avoids fast-check for now.
+- Reversibility high. If a v2 needs IO-returning aggregates, separate ADR can extend ports/** carve-out OR move composition to host fully.
+- Security: aggregate is the single composition point that feeds the LLM (via #39's wiring). Keeping it pure + Quiz-only locks the diff-only invariant at the aggregate boundary. Reviewer for #39 verifies §Sequence is followed.
+- Binding for #39 (must wire per §Sequence), #41 (consumes ADR-13 frames), #43 (modal). Extension never re-implements scoring.
