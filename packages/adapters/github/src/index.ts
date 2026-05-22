@@ -1,12 +1,18 @@
-import type { Either } from "monadyssey";
-import { Right } from "monadyssey";
-import { CORE_VERSION } from "@lgtm-buzzer/core";
-
-/** Stable identifier for the github VCS adapter. */
-export const ADAPTER_ID = "github" as const;
-
-/** Smoke export: proves the monadyssey + core imports resolve. */
-export const adapterInfo = (): Either<
-  never,
-  { readonly id: typeof ADAPTER_ID; readonly coreVersion: typeof CORE_VERSION }
-> => Right.pure({ id: ADAPTER_ID, coreVersion: CORE_VERSION });
+/**
+ * Public API for the GitHub VCS adapter.
+ *
+ * Usage:
+ * ```ts
+ * import { createGithubVcsProvider } from "@lgtm-buzzer/adapter-github";
+ *
+ * const provider = createGithubVcsProvider({
+ *   config: { token: process.env.GH_TOKEN ?? "" },
+ * });
+ * ```
+ */
+export { createGithubVcsProvider, ADAPTER_ID } from "./provider.js";
+export type { GithubAdapterConfig, GithubAdapterDeps } from "./provider.js";
+export { buildPullDiffUrl } from "./url.js";
+export { mapHttpError } from "./errors.js";
+export { createGithubHttpClient } from "./http.js";
+export type { HttpClientConfig } from "./http.js";

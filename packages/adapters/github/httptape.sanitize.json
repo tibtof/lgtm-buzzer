@@ -1,0 +1,22 @@
+{
+  "version": "1",
+  "rules": [
+    {
+      "action": "redact_headers",
+      "headers": [
+        "Authorization",
+        "X-GitHub-Token",
+        "Cookie",
+        "Set-Cookie",
+        "X-Api-Key"
+      ]
+    },
+    {
+      "action": "redact_headers",
+      "headers": [
+        "ETag",
+        "Last-Modified"
+      ]
+    }
+  ]
+}
