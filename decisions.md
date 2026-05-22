@@ -2349,3 +2349,61 @@ Coverage target: every `SpawnError` variant has at least one forcing test.
 - Security: this primitive doesn't touch PR text; the diff-only invariant is enforced at each LLM adapter (one layer up).
 - Reversibility: high. If `IO.cancellable` semantics change or we want `execa` (Windows), only `spawn-io.ts` changes — public types, tests, callers stay identical.
 - Binding for #36/#45/#46: every LLM-CLI adapter delegates ALL subprocess lifecycle here. If cancellation is wrong, all three adapters are wrong. The 8 tests above ARE the contract.
+
+---
+
+## ADR-10: Clarify ADR-9 cancellation outcome — monadyssey v2.0.1 yields `Cancelled`, not `Err<SpawnError.cancelled>`
+**Date**: 2026-05-22
+**Issue**: #62
+**Status**: Accepted (amends ADR-9 by addition)
+
+### Context
+
+ADR-9 §Decision 3 stated: "the IO interpreter never sees a `Cancelled` runtime outcome from this helper — cancellation is reified into `SpawnError`'s `cancelled` variant." This was wrong at `monadyssey@2.0.1`.
+
+Verified during PR #61's review:
+
+- `monadyssey/dist/monadyssey.d.ts` types `Fiber<E, A>.join()` as `Promise<Ok<A> | Err<E> | Cancelled>`.
+- The runtime interpreter's abort-check loop fires AFTER the `Lift` case settles, discarding the typed `Err<SpawnError{kind:"cancelled"}>` that `liftSpawnError` correctly builds. The result observable to callers is `{ type: "Cancelled" }` — a separate Fiber.join outcome — not the typed Err.
+
+The PID-kill choreography from ADR-9 §Decision 4 is unaffected: SIGTERM, grace, SIGKILL all still fire correctly. Children are demonstrably killed (PR #61 tests #5 and #6 probe `process.kill(pid, 0)` for ESRCH after the join resolves).
+
+### Decision
+
+**Document the actual runtime behavior so future architects designing on top of `spawnIO` write correct switch/fold cases.**
+
+At `monadyssey@2.0.1`, `spawnIO`'s `IO<SpawnError, SpawnOutput>` resolves as follows when interpreted via `fiber.join()`:
+
+| Outcome | Fiber.join() result |
+|---|---|
+| Process exited code 0 | `Ok<SpawnOutput>` |
+| Process exited code != 0 | `Err<SpawnError{kind:"process-failed", ...}>` |
+| OS could not start process | `Err<SpawnError{kind:"spawn-failed", ...}>` |
+| Surrounding IO cancelled | `Cancelled` (NOT `Err<SpawnError{kind:"cancelled"}>`) |
+
+Callers MUST handle all three outcomes (`Ok`, `Err`, `Cancelled`), not just the two from `Either`. The `.fold` and pattern-matching idioms (#6) need a third branch for the `Cancelled` case.
+
+**The `SpawnError.cancelled` variant remains defined.** Two reasons:
+
+1. **Forward compatibility.** A future monadyssey version may fix the interpreter to surface the typed `Err`. When that happens, callers will already handle `cancelled` via their `Err<SpawnError>` branch with no code change required.
+2. **Documentation.** The variant tells future architects what the conceptual contract is (cancellation IS a typed failure shape), even if the runtime currently bypasses it.
+
+### Affected workspaces
+
+`decisions.md` only.
+
+### Sequence
+
+None — documentation amendment.
+
+### Test strategy
+
+Verification of the actual v2.0.1 behavior is already present in `packages/adapters/_shared/src/spawn-io.test.ts` tests #5 and #6: both assert `joined.type === "Cancelled"` after cancellation, and probe `process.kill(pid, 0)` for ESRCH. These tests are the canonical reference for what spawnIO callers can expect at v2.0.1.
+
+### Consequences
+
+- **Downstream architects (#36 / #45 / #46 / #59)** designing LLM-CLI adapters MUST handle `Cancelled` as a separate `fiber.join()` outcome, not assume it'll arrive as `Err<SpawnError.cancelled>`.
+- **No code change required** in `spawn-io.ts` — the implementation is correct; only ADR-9's Decision 3 wording was wrong.
+- **If monadyssey ever fixes this upstream**, callers that already handle `Cancelled` separately remain correct; callers that also (defensively) match on `Err<SpawnError.cancelled>` start receiving real values there. Both shapes are forward-compatible.
+- **No security impact.** The PID-kill safety contract is unaffected.
+- **No reversibility concerns.** This is documentation only.
