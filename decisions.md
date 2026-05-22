@@ -3117,3 +3117,278 @@ Coverage target: 90% on `protocol` (CLAUDE.md). Achievable — new schemas are p
 - **What this ADR does NOT decide**: pass-threshold policy (#38), session TTL (#39), per-question feedback completeness (#39). Wire permits any host policy.
 - **Reversibility**: high. No downstream consumers yet (#38, #39, #41 land later). Mistakes here are one-PR fixes.
 - **Security**: every quiz-flow byte from stdin passes through `parseFrame`. Extension cannot infer correct answers from `quiz-response`. Host cannot leak diff bytes into any wire payload — no field shaped for them.
+
+---
+
+## ADR-14: First `LLMProvider` implementation — `claude-cli` adapter shelling out to the Claude Code CLI via `spawnIO`
+**Date**: 2026-05-22
+**Issue**: #36
+**Status**: Accepted
+
+### Context
+
+M2's vertical slice needs the first concrete `LLMProvider` adapter (ADR-11). Claude Code CLI is the v1 choice. All upstream primitives are in place: `spawnIO` (ADR-9/10), `LLMProvider` port + `LLMProviderError` (ADR-11), `Diff` branded (ADR-12), `Quiz` domain types (ADR-11).
+
+Six adapter-specific questions the upstream ADRs deferred:
+1. CLI invocation shape (flags, mode).
+2. Prompt transport (argv vs stdin — KEY DIFFERENTIATOR).
+3. Response schema (LLMs don't always emit clean JSON).
+4. `correctChoiceIndex` (int) vs `correctChoice` (string match).
+5. Timeout strategy (spawnIO has none in v1).
+6. ID minting for branded `QuizId`/`QuestionId`/`ChoiceId`.
+
+### Decision
+
+#### 1 — CLI invocation: `claude --print --output-format json` with prompt via stdin
+
+Args (fixed, no diff bytes):
+```ts
+["--print", "--output-format", "json", "--model", config.model, "--permission-mode", "default"]
+```
+
+**Binding constraints**:
+- **No prompt in argv.** No positional prompt, no `--append-system-prompt`. Argv is logged by `ps`/audit tools.
+- `--output-format json` outer envelope; adapter parses envelope, then extracts the model's JSON output.
+- No streaming flags.
+- Default `config.binary = "claude"`, `config.model = "sonnet"`.
+- `--bare` deliberately NOT used (preserves user's local CLI hooks/plugins).
+
+#### 2 — Prompt transport: stdin only (KEY DIFFERENTIATOR)
+
+```ts
+// packages/adapters/claude-cli/src/prompt.ts
+export const buildPrompt = (diff: Diff, questionCount: number): string => {
+  return `${SYSTEM_PROMPT}\n\nUSER:\n${buildUserMessage(diff, questionCount)}\n`;
+};
+```
+
+`buildPrompt` signature has exactly 2 parameters — the diff and the question count. Adding a third parameter requires an ADR amendment.
+
+##### Prompt template (binding for v1)
+
+```
+SYSTEM:
+You generate multiple-choice quizzes that test whether a code reviewer
+has actually read a pull-request diff.
+
+You will receive a unified diff between <DIFF> and </DIFF> markers. Use
+ONLY the diff content. Do not invent, infer, or reference any context
+that is not present in the diff (no commit messages, no PR description,
+no external file content).
+
+Generate exactly N multiple-choice questions where N is provided in the
+USER message.
+
+Each question MUST:
+- Reference a concrete change in the diff.
+- Be answerable from the diff alone — not from filenames or boilerplate.
+- Have between 2 and 6 plausible answer choices, with exactly one correct.
+- Include at least one question that probes an edge case or impact concern.
+
+Respond with a JSON object ONLY (no markdown fences, no commentary).
+Schema:
+
+{
+  "questions": [
+    {
+      "prompt": "<question text>",
+      "choices": ["<choice 1>", "<choice 2>", ...],
+      "correctChoiceIndex": <0-based integer>,
+      "explanation": "<short post-submit explanation, optional>"
+    }
+  ]
+}
+
+If the diff is empty or too short, respond with: { "questions": [] }
+(The adapter surfaces this as malformed-response.)
+
+USER:
+Generate <N> multiple-choice questions from the following diff.
+
+<DIFF>
+<diff bytes interpolated verbatim>
+</DIFF>
+```
+
+#### 3 — Response parsing: tolerant pre-parse + strict zod
+
+```ts
+const ClaudePrintEnvelopeSchema = z.object({
+  type: z.literal("result"),
+  subtype: z.enum(["success", "error_max_turns", "error_during_execution"]).optional(),
+  result: z.string().min(1),
+});
+
+const LlmQuestionSchema = z.object({
+  prompt: z.string().min(1),
+  choices: z.array(z.string().min(1)).min(2).max(6),
+  correctChoiceIndex: z.number().int().min(0),
+  explanation: z.string().min(1).optional(),
+});
+
+const LlmQuizSchema = z.object({
+  questions: z.array(LlmQuestionSchema).min(1),
+});
+```
+
+Parse pipeline:
+1. `JSON.parse(stdout)` → `ClaudePrintEnvelopeSchema`. Fail → `malformed-response { detail: "envelope-parse-failed", raw }`.
+2. Extract `envelope.result`.
+3. Strip ```` ```json ... ``` ```` fences if present (tolerant regex).
+4. `JSON.parse` the model text → `LlmQuizSchema`. Fail → `malformed-response`.
+5. Cross-check `correctChoiceIndex < choices.length`. Out-of-bounds → `malformed-response { detail: "correctChoiceIndex out of range" }`.
+6. Empty `questions` → `malformed-response { detail: "empty-quiz" }`.
+7. Map to `core.Quiz` via injected `IdGenerator`.
+
+`raw` clipped to 8 KiB.
+
+#### 4 — `correctChoiceIndex` (int) over `correctChoice` (string)
+
+Locked. Index is unambiguous; string match fails on whitespace/punctuation drift.
+
+#### 5 — Timeout in the adapter via `Schedule.timeout`
+
+`spawnIO` v1 has no timeout option (ADR-9 §Consequences). Adapter composes:
+
+```ts
+const withTimeout = Schedule.timeout(spawn, deps.timeoutMs ?? 60_000);
+```
+
+Budget exhaustion → `Err<LLMProviderError.timeout { afterMs }>`. Caller-cancel → `Cancelled` runtime outcome (ADR-10 unchanged).
+
+**Note for dev**: if monadyssey@2.0.1's `Schedule.timeout` doesn't surface budget exhaustion as `Err` (only as `Cancelled`), escalate via `NEEDS_CLARIFICATION`. The contract is binding: timeout = `Err<timeout>`, cancellation = `Cancelled`.
+
+Default `timeoutMs = 60_000`.
+
+#### 6 — `IdGenerator` (injected, default UUID v4)
+
+```ts
+// packages/adapters/claude-cli/src/ids.ts
+export type IdGenerator = {
+  readonly quizId: () => QuizId;
+  readonly questionId: () => QuestionId;
+  readonly choiceId: () => ChoiceId;
+};
+
+export const defaultIdGenerator = (): IdGenerator => ({
+  quizId: () => crypto.randomUUID() as QuizId,
+  questionId: () => crypto.randomUUID() as QuestionId,
+  choiceId: () => crypto.randomUUID() as ChoiceId,
+});
+```
+
+Brand casts at the construction site (same pattern as ADR-12's `as Diff`). Tests inject a deterministic counter-based generator.
+
+#### 7 — Error mapping (binding)
+
+| Source | LLMProviderError |
+|---|---|
+| `SpawnError.spawn-failed` | `subprocess { reason: "spawn-failed", detail }` |
+| `SpawnError.process-failed { exitCode, stderr }` | `subprocess { reason: "process-failed", exitCode, stderr, detail: \`exit ${exitCode}\` }` |
+| Schedule.timeout exhausted | `timeout { afterMs }` |
+| Envelope JSON.parse throws | `malformed-response { detail: "envelope-parse-failed", raw }` |
+| Envelope schema fail | `malformed-response { detail: "envelope-schema: <issues>", raw }` |
+| Model output JSON.parse throws | `malformed-response { detail: "model-output-not-json", raw }` |
+| LlmQuizSchema fail | `malformed-response { detail: "quiz-schema: <issues>", raw }` |
+| correctChoiceIndex OOB | `malformed-response { detail: "correctChoiceIndex out of range" }` |
+| Empty questions | `malformed-response { detail: "empty-quiz" }` |
+| Caller cancellation | `Cancelled` runtime (NOT manufactured into Err) |
+| `transport` | unused — kept for HTTP adapter #59 |
+
+### Affected workspaces
+
+`packages/adapters/claude-cli/` only. Adds workspace dep on `@lgtm-buzzer/adapter-shared`.
+
+### Types
+
+```ts
+export type ClaudeCliConfig = {
+  readonly binary?: string;          // default "claude"
+  readonly model?: string;           // default "sonnet"
+  readonly timeoutMs?: number;       // default 60_000
+  readonly graceMs?: number;         // default 5000
+};
+
+export type ClaudeCliDeps = {
+  readonly spawnIO: typeof spawnIO;
+  readonly ids?: IdGenerator;
+  readonly config?: ClaudeCliConfig;
+};
+
+export declare const createClaudeCliProvider: (deps: ClaudeCliDeps) => LLMProvider;
+```
+
+### Functions
+
+- `buildPrompt(diff, questionCount): string` — pure.
+- `parseResponse(stdout, ids): Either<LLMProviderError, Quiz>` — pure.
+- `createClaudeCliProvider(deps): LLMProvider` — factory.
+- `defaultIdGenerator(): IdGenerator` — uses `crypto.randomUUID()`.
+
+### File layout
+
+New (8):
+- `src/provider.ts` — factory.
+- `src/prompt.ts` — `SYSTEM_PROMPT` + `buildPrompt`.
+- `src/response.ts` — schemas + `parseResponse`.
+- `src/ids.ts` — `IdGenerator` + `defaultIdGenerator`.
+- `src/prompt.test.ts`, `response.test.ts`, `provider.test.ts`, `integration.test.ts` (the last is `.skip` by default).
+
+Modified (3):
+- `src/index.ts` — barrel: export factory + types.
+- `package.json` — add `@lgtm-buzzer/adapter-shared`, `monadyssey`, `zod` deps.
+- `tsconfig.json` — add `{ "path": "../_shared" }` to references.
+
+### Sequence
+
+Per-call flow:
+1. Caller invokes `provider.generateQuiz({ diff, questionCount: 3 })`.
+2. `buildPrompt(diff, 3)` produces stdin string.
+3. Fixed argv constructed (no diff bytes).
+4. `deps.spawnIO("claude", args, prompt, { graceMs: 5000 })`.
+5. Wrap in `Schedule.timeout(io, 60_000)`.
+6. `spawnIO` writes prompt to stdin, closes it, buffers stdout/stderr.
+7. On success → `parseResponse(stdout, ids)` → `Quiz`. On any error → mapped per §7.
+
+**Diff-flow audit**: diff bytes appear only at step 6 (`child.stdin.write`). Never in argv, never in error payloads (raw is clipped + contains LLM response not input prompt).
+
+### Error cases
+
+All 11 rows in §7. No `throw` in expected-failure paths. `Cancelled` propagates unchanged.
+
+### Test strategy
+
+**`prompt.test.ts`** (≥10 cases): happy path; question count interpolation; `buildPrompt.length === 2` (signature size); no prompt-injection bait in SYSTEM ("ignore previous instructions", "you are a senior engineer", "LGTM", "Claude" — absent); JSON-output instruction present; `<DIFF>` markers exactly once each; newlines preserved; backticks don't break format.
+
+**`response.test.ts`** (≥10 cases): happy path; markdown fence with/without `json` language; invalid envelope JSON; envelope schema fail; model output invalid JSON; LlmQuizSchema fail; `correctChoiceIndex` OOB; empty questions; `raw` clipped to 8 KiB; `explanation` optional present/absent.
+
+**`provider.test.ts`** (≥8 cases) with fake `spawnIO`:
+1. Happy path: command + fixed argv asserted exactly.
+2. **Diff in stdin, NOT in argv** (binding): `calls[0].stdin` contains diff; `calls[0].args.join(" ")` does NOT contain diff; `<DIFF>` does not appear in args. **Reviewer-enforced**.
+3. No prompt positional: args length = 7 (fixed-argv length).
+4. `spawn-failed` mapping.
+5. `process-failed` mapping (with exitCode + stderr).
+6. Malformed envelope mapping.
+7. Malformed model output mapping.
+8. Timeout (if monadyssey API supports clean synthetic-time test — else `.skip` with comment).
+9. Cancellation: fake returns Cancelled → adapter propagates as Cancelled (NOT Err).
+10. Custom binary/model: factory config respected.
+11. `provider.id === "claude-cli"`.
+
+**`integration.test.ts`** — single `.skip` test invoking real `claude`. Not in CI.
+
+Coverage target: 80% on adapter (per CLAUDE.md §Testing).
+
+### Consequences
+
+- **First real LLMProvider.** Template for #45, #46, #59.
+- **Diff-only invariant mechanically enforced.** `buildPrompt`'s 2-parameter signature + contract test #2 catch stdin-only violations.
+- **stdin-over-argv security ratchet.** Contract test catches accidents.
+- **`correctChoiceIndex` over `correctChoice`** locks in unambiguous answer mapping.
+- **`Cancelled` plumbed correctly** (ADR-10) — adapter does NOT translate to Err.
+- **Timeout lives in adapter, not `spawnIO`.** v1 contract unchanged.
+- **One new dep: `zod` in adapter** (already in protocol).
+- **`--bare` NOT used.** User's CLI config (hooks, plugins) is preserved. Future ADR may revisit if it becomes a support issue.
+- **Reversibility high.** Three independent files (prompt/response/provider); each is a one-file swap.
+- **Forward compat**: factory shape supports per-adapter timeout/model/binary; per-call inputs stay diff + questionCount only.
+- **Binding for reviewer**: (a) diff bytes in stdin only — test #2; (b) `buildPrompt` 2-param signature; (c) no `--bare`, no prompt positional; (d) `Cancelled` not manufactured into Err; (e) error mapping §7 exhaustive.
