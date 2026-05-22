@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { ADAPTER_ID, adapterInfo } from "./index.js";
+import { ADAPTER_ID, createClaudeCliProvider } from "./index.js";
 
-describe("adapter-claude-cli", () => {
-  it("has the expected adapter id", () => {
+describe("adapter-claude-cli index", () => {
+  it("exports ADAPTER_ID as 'claude-cli'", () => {
     expect(ADAPTER_ID).toBe("claude-cli");
   });
 
-  it("adapterInfo reports core version", () => {
-    expect(adapterInfo().fold(() => null, (v) => v)).toEqual({
-      id: "claude-cli",
-      coreVersion: "0.0.0",
+  it("exports createClaudeCliProvider as a function", () => {
+    expect(typeof createClaudeCliProvider).toBe("function");
+  });
+
+  it("createClaudeCliProvider returns a provider with the correct id", () => {
+    const provider = createClaudeCliProvider({
+      // minimal stub spawnIO — never called in this test
+      spawnIO: () => {
+        throw new Error("should not be called");
+      },
     });
+    expect(provider.id).toBe("claude-cli");
   });
 });
