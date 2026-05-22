@@ -1,3 +1,20 @@
+/**
+ * Quiz modal for LGTM-Buzzer.
+ *
+ * Implements the state machine, accessibility, error UX, focus trap, and
+ * aria-live announcements described in ADR-24.
+ *
+ * State machine (ADR-24 §Decision 1):
+ *   idle → generating → ready → submitting → passed | failed | error
+ *
+ * Cancel during `generating` (Option A — ADR-24 §Decision 6):
+ *   The modal emits `quiz-cancel` and transitions to `idle`. The host
+ *   continues generating; its reply is eventually discarded by the CS.
+ *   FOLLOW-UP: Implement Option B (quiz-cancel-request wire frame +
+ *   host fiber cancellation) in a separate issue.
+ *   See packages/extension/README.md for the a11y commitments and cancel note.
+ */
+
 import type { QuizDTO, QuizResultPayload } from "@lgtm-buzzer/protocol";
 import {
   DOM_EVENTS,
@@ -7,33 +24,44 @@ import {
   addDOMEventListener,
   type DOMEventLogger,
 } from "./dom-events.js";
+import { classifyError, errorClassToUI } from "./error-classes.js";
+import { createFocusTrap } from "./focus-trap.js";
+import type { FocusTrap } from "./focus-trap.js";
 
 // DOM event name for "open options page" (ADR-23).
 const OPEN_OPTIONS_EVENT = "lgtm-buzzer:open-options";
 
 // ---------------------------------------------------------------------------
-// State machine
+// State machine (ADR-24 §Decision 1)
 // ---------------------------------------------------------------------------
 
 /**
  * The internal state of the quiz modal.
  *
- * State transitions:
- *   idle → loading        (on quiz-request event)
- *   loading → quiz-active (on quiz-ready outcome)
- *   loading → error       (on error outcome)
- *   quiz-active → submitting (on submit button click)
- *   submitting → result   (on quiz-passed / quiz-failed outcome)
- *   submitting → error    (on error outcome)
- *   result → idle         (on dismiss / try-again)
- *   error → idle          (on dismiss)
- *   * → idle              (on quiz-cancel)
+ * State transitions (ADR-24):
+ *   idle → generating          (on quiz-request DOM event)
+ *   generating → ready         (on outcome:quiz-ready)
+ *   generating → error         (on outcome:error)
+ *   generating → idle          (on Cancel button | Esc  → emits quiz-cancel)
+ *   ready → submitting         (on Submit button with all questions answered)
+ *   ready → idle               (on Cancel button | Esc  → emits quiz-cancel)
+ *   submitting → passed        (on outcome:quiz-passed)
+ *   submitting → failed        (on outcome:quiz-failed)
+ *   submitting → error         (on outcome:error)
+ *   submitting → idle          (on Esc → emits quiz-cancel)
+ *   passed → idle              (on Dismiss button | Esc — NO quiz-cancel)
+ *   failed → generating        (on Try Again button → emits quiz-retry)
+ *   failed → idle              (on Dismiss button | Esc → emits quiz-cancel)
+ *   error → generating         (on Retry CTA → emits quiz-retry)
+ *   error → idle               (on Open Options CTA → emits quiz-cancel + open-options)
+ *   error → idle               (on Install Host CTA → emits quiz-cancel)
+ *   error → idle               (on Dismiss button | Esc → emits quiz-cancel)
  */
 type ModalState =
   | { readonly kind: "idle" }
-  | { readonly kind: "loading"; readonly requestId: string }
+  | { readonly kind: "generating"; readonly requestId: string }
   | {
-      readonly kind: "quiz-active";
+      readonly kind: "ready";
       readonly requestId: string;
       readonly quiz: QuizDTO;
     }
@@ -43,16 +71,20 @@ type ModalState =
       readonly quiz: QuizDTO;
     }
   | {
-      readonly kind: "result";
+      readonly kind: "passed";
       readonly requestId: string;
-      readonly passed: boolean;
+      readonly result: QuizResultPayload;
+    }
+  | {
+      readonly kind: "failed";
+      readonly requestId: string;
       readonly result: QuizResultPayload;
     }
   | {
       readonly kind: "error";
       readonly requestId: string;
-      readonly message: string;
       readonly reason: string;
+      readonly message: string;
     };
 
 // ---------------------------------------------------------------------------
@@ -73,7 +105,11 @@ const MODAL_CSS = `
     align-items: center;
     justify-content: center;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    animation: lgtm-fadein 0.15s ease;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .backdrop {
+      animation: lgtm-fadein 0.15s ease;
+    }
   }
   @keyframes lgtm-fadein {
     from { opacity: 0; }
@@ -82,14 +118,22 @@ const MODAL_CSS = `
   .panel {
     background: #ffffff;
     color: #24292f;
-    border-radius: 8px;
+    border-radius: 12px;
     box-shadow: 0 8px 32px rgba(0,0,0,0.24);
     padding: 24px;
-    max-width: 560px;
+    max-width: 600px;
     width: calc(100vw - 48px);
     max-height: calc(100vh - 96px);
     overflow-y: auto;
     box-sizing: border-box;
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    clip-path: inset(50%);
+    overflow: hidden;
+    white-space: nowrap;
   }
   h2 {
     margin: 0 0 8px 0;
@@ -116,24 +160,56 @@ const MODAL_CSS = `
     border: 2px solid #d0d7de;
     border-top-color: #0969da;
     border-radius: 50%;
-    animation: lgtm-spin 0.75s linear infinite;
     flex-shrink: 0;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .spinner {
+      animation: lgtm-spin 0.75s linear infinite;
+    }
   }
   @keyframes lgtm-spin {
     to { transform: rotate(360deg); }
   }
-  .question-block {
-    margin-bottom: 20px;
+  .skeleton-group {
+    margin-bottom: 16px;
+  }
+  .skeleton-prompt {
+    height: 14px;
+    border-radius: 4px;
+    background: #eaeef2;
+    margin-bottom: 8px;
+  }
+  .skeleton-choices {
+    display: flex;
+    gap: 8px;
+  }
+  .skeleton-choice {
+    height: 14px;
+    border-radius: 4px;
+    background: #eaeef2;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .skeleton-prompt,
+    .skeleton-choice {
+      animation: lgtm-pulse 1.5s ease-in-out infinite;
+    }
+  }
+  @keyframes lgtm-pulse {
+    0%, 100% { opacity: 0.4; }
+    50%       { opacity: 0.8; }
+  }
+  fieldset {
+    margin: 0 0 20px 0;
     border: 1px solid #d0d7de;
     border-radius: 6px;
     padding: 14px;
   }
-  .question-prompt {
+  legend {
     font-size: 14px;
     font-weight: 600;
-    margin: 0 0 10px 0;
     line-height: 1.45;
     color: #24292f;
+    padding: 0 4px;
   }
   .choice-label {
     display: flex;
@@ -192,6 +268,14 @@ const MODAL_CSS = `
   .btn-secondary:hover {
     background: #f3f4f6;
   }
+  .btn-danger {
+    background: #cf222e;
+    color: #ffffff;
+    border-color: rgba(31,35,40,0.15);
+  }
+  .btn-danger:hover {
+    background: #b91c1c;
+  }
   .result-banner {
     border-radius: 6px;
     padding: 12px 14px;
@@ -242,7 +326,13 @@ const MODAL_CSS = `
     color: #656d76;
     margin: 0 0 12px 0;
   }
-  .error-msg {
+  .error-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: #24292f;
+    margin: 0 0 8px 0;
+  }
+  .error-body {
     font-size: 14px;
     color: #24292f;
     margin: 0 0 16px 0;
@@ -314,9 +404,9 @@ const textEl = <K extends keyof HTMLElementTagNameMap>(
 // ---------------------------------------------------------------------------
 
 /**
- * Renders the loading state panel body.
+ * Renders a skeleton + spinner panel for `generating` state.
  */
-const renderLoading = (doc: Document): DocumentFragment => {
+const renderGenerating = (doc: Document): DocumentFragment => {
   const frag = doc.createDocumentFragment();
 
   const loadingDiv = el(doc, "div", { class: "loading" });
@@ -328,31 +418,45 @@ const renderLoading = (doc: Document): DocumentFragment => {
   loadingDiv.appendChild(label);
   frag.appendChild(loadingDiv);
 
+  // Two skeleton question blocks.
+  for (let i = 0; i < 2; i++) {
+    const group = el(doc, "div", { class: "skeleton-group", "aria-hidden": "true" });
+
+    const prompt = el(doc, "div", { class: "skeleton-prompt" });
+    prompt.style.width = i === 0 ? "80%" : "65%";
+    group.appendChild(prompt);
+
+    const choices = el(doc, "div", { class: "skeleton-choices" });
+    for (const w of ["30%", "25%", "28%"]) {
+      const choice = el(doc, "div", { class: "skeleton-choice" });
+      choice.style.width = w;
+      choices.appendChild(choice);
+    }
+    group.appendChild(choices);
+    frag.appendChild(group);
+  }
+
   return frag;
 };
 
 /**
- * Renders one multiple-choice question block.
- * Returns the block element and a getter for the selected choice id.
+ * Renders one multiple-choice question as a `<fieldset>` + `<legend>`.
+ * Returns the fieldset element and a getter for the selected choice id.
  */
 const renderQuestion = (
   doc: Document,
   question: QuizDTO["questions"][number],
   groupName: string,
-): { block: HTMLElement; getSelected: () => string | null } => {
-  const block = el(doc, "div", { class: "question-block", "data-question": question.id });
+): { fieldset: HTMLFieldSetElement; getSelected: () => string | null } => {
+  const fieldset = doc.createElement("fieldset");
+  fieldset.setAttribute("data-question", question.id);
 
-  const prompt = el(doc, "p", { class: "question-prompt" });
-  prompt.textContent = question.prompt;
-  block.appendChild(prompt);
-
-  const radioContainer = el(doc, "div", {
-    role: "radiogroup",
-    "aria-label": question.prompt,
-  });
+  const legend = el(doc, "legend");
+  legend.textContent = question.prompt;
+  fieldset.appendChild(legend);
 
   for (const choice of question.choices) {
-    const label = el(doc, "label", { class: "choice-label" });
+    const labelEl = el(doc, "label", { class: "choice-label" });
 
     const radio = el(doc, "input", {
       type: "radio",
@@ -365,28 +469,26 @@ const renderQuestion = (
     const choiceText = doc.createElement("span");
     choiceText.textContent = choice.label;
 
-    label.appendChild(radio);
-    label.appendChild(choiceText);
-    radioContainer.appendChild(label);
+    labelEl.appendChild(radio);
+    labelEl.appendChild(choiceText);
+    fieldset.appendChild(labelEl);
   }
 
-  block.appendChild(radioContainer);
-
   const getSelected = (): string | null => {
-    const checked = radioContainer.querySelector<HTMLInputElement>(
+    const checked = fieldset.querySelector<HTMLInputElement>(
       `input[name="${groupName}"]:checked`,
     );
     return checked?.value ?? null;
   };
 
-  return { block, getSelected };
+  return { fieldset, getSelected };
 };
 
 /**
- * Renders the quiz-active panel body.
+ * Renders the `ready` (quiz-active) panel body.
  * Returns the fragment and a getter for collected answers.
  */
-const renderQuizActive = (
+const renderReady = (
   doc: Document,
   quiz: QuizDTO,
   submitBtn: HTMLButtonElement,
@@ -399,12 +501,12 @@ const renderQuizActive = (
 
   for (const [idx, question] of quiz.questions.entries()) {
     const groupName = `lgtm-q-${idx}`;
-    const { block, getSelected } = renderQuestion(doc, question, groupName);
+    const { fieldset, getSelected } = renderQuestion(doc, question, groupName);
     selectors.push({ questionId: question.id, getSelected });
-    frag.appendChild(block);
+    frag.appendChild(fieldset);
 
     // Update submit button enabled state on any radio change.
-    block.addEventListener("change", () => {
+    fieldset.addEventListener("change", () => {
       const allAnswered = selectors.every((s) => s.getSelected() !== null);
       submitBtn.disabled = !allAnswered;
     });
@@ -514,54 +616,18 @@ const renderFailed = (
   return frag;
 };
 
-/**
- * Renders the error panel body.
- *
- * When `reason` is `"missing-credentials"` or `"bad-credentials"`, an
- * additional "Configure in extension options" link is rendered (ADR-23).
- */
-const renderError = (doc: Document, message: string, reason?: string): DocumentFragment => {
-  const frag = doc.createDocumentFragment();
-
-  const banner = el(doc, "div", { class: "result-banner result-error" });
-  banner.textContent = "⚠️ Something went wrong.";
-  frag.appendChild(banner);
-
-  const msg = el(doc, "p", { class: "error-msg" });
-  msg.textContent = message;
-  frag.appendChild(msg);
-
-  if (reason === "missing-credentials" || reason === "bad-credentials") {
-    const configLink = el(doc, "a", {
-      href: "#",
-      "data-action": "open-options",
-      "data-testid": "lgtm-buzzer-configure-options",
-    });
-    configLink.textContent = "Configure credentials in the LGTM-Buzzer options page";
-    configLink.addEventListener("click", (e) => {
-      e.preventDefault();
-      doc.dispatchEvent(
-        new CustomEvent(OPEN_OPTIONS_EVENT, { bubbles: false }),
-      );
-    });
-    frag.appendChild(configLink);
-  }
-
-  return frag;
-};
-
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
 /**
  * Creates the quiz modal that responds to DOM events emitted by the quiz flow
- * controller (ADR-18).
+ * controller (ADR-18, ADR-24).
  *
  * The modal is mounted once on `document.body` (idempotent) and uses a Shadow
  * DOM for style isolation. It subscribes to `lgtm-buzzer:quiz-request` and
- * `lgtm-buzzer:quiz-result`, and dispatches `lgtm-buzzer:quiz-submit` and
- * `lgtm-buzzer:quiz-cancel` back to `document`.
+ * `lgtm-buzzer:quiz-result`, and dispatches `lgtm-buzzer:quiz-submit`,
+ * `lgtm-buzzer:quiz-cancel`, and `lgtm-buzzer:quiz-retry` back to `document`.
  *
  * @param deps - Injected dependencies: `doc` and optional `logger`.
  */
@@ -575,13 +641,19 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
   // Current state.
   let state: ModalState = { kind: "idle" };
 
-  // Snapshot of the quiz when in quiz-active or submitting, so result render
+  // Snapshot of the quiz when in ready or submitting, so result render
   // can show per-question prompts.
   let activeQuiz: QuizDTO | null = null;
 
-  // collectAnswers is wired during quiz-active render; valid only in that state.
+  // collectAnswers is wired during ready render; valid only in that state.
   let collectAnswers: (() => ReadonlyArray<{ questionId: string; chosenChoiceId: string }>) | null =
     null;
+
+  // Focus trap — created lazily on first non-idle render; reused thereafter.
+  let focusTrap: FocusTrap | null = null;
+
+  // aria-live region — a persistent element that announces state transitions.
+  let liveRegion: HTMLElement | null = null;
 
   // ---------------------------------------------------------------------------
   // Mount
@@ -607,6 +679,40 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
   };
 
   // ---------------------------------------------------------------------------
+  // aria-live announcement
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Updates the `aria-live` region with a new announcement.
+   *
+   * The region is a persistent element — it is NOT torn down and re-mounted
+   * per state, because destroying and recreating it resets the live-region
+   * announcement for screen readers.
+   */
+  const announce = (text: string): void => {
+    if (liveRegion !== null) {
+      liveRegion.textContent = text;
+    }
+  };
+
+  /** Returns the aria-live announcement text for the current state. */
+  const announcementForState = (s: ModalState): string => {
+    switch (s.kind) {
+      case "idle":        return "";
+      case "generating":  return "Generating quiz from the diff";
+      case "ready":
+        return `Quiz ready, ${activeQuiz?.questions.length ?? 0} question${(activeQuiz?.questions.length ?? 0) === 1 ? "" : "s"}`;
+      case "submitting":  return "Checking answers";
+      case "passed":      return "Quiz passed";
+      case "failed":      return "Quiz failed";
+      case "error": {
+        const cls = classifyError(s.reason as Parameters<typeof classifyError>[0], s.message);
+        return `Error: ${errorClassToUI(cls).title}`;
+      }
+    }
+  };
+
+  // ---------------------------------------------------------------------------
   // Show / hide
   // ---------------------------------------------------------------------------
 
@@ -616,10 +722,13 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
    */
   const render = (): void => {
     if (shadow === null) return;
+
+    // Deactivate old focus trap before rebuilding the DOM.
+    focusTrap?.deactivate();
+
     if (state.kind === "idle") {
-      // Remove backdrop if present.
-      const existing = shadow.querySelector(".backdrop");
-      existing?.remove();
+      shadow.querySelector(".backdrop")?.remove();
+      liveRegion = null;
       return;
     }
 
@@ -630,29 +739,44 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
     backdrop.className = "backdrop";
     backdrop.setAttribute("role", "dialog");
     backdrop.setAttribute("aria-modal", "true");
-    backdrop.setAttribute("aria-label", "PR Quiz");
+    backdrop.setAttribute("aria-labelledby", "lgtm-buzzer-modal-title");
     backdrop.setAttribute("tabindex", "-1");
+
+    // aria-busy during generating and submitting.
+    const busy = state.kind === "generating" || state.kind === "submitting";
+    backdrop.setAttribute("aria-busy", busy ? "true" : "false");
 
     const panel = doc.createElement("div");
     panel.className = "panel";
+    panel.setAttribute("tabindex", "-1");
+
+    // Persistent aria-live region (created once per modal-open, kept across renders).
+    const statusDiv = el(doc, "div", {
+      role: "status",
+      "aria-live": "polite",
+      "aria-atomic": "true",
+      class: "sr-only",
+    });
+    liveRegion = statusDiv;
+    panel.appendChild(statusDiv);
 
     // Header.
-    const heading = textEl(doc, "h2", "LGTM Buzzer");
+    const heading = textEl(doc, "h2", "LGTM Buzzer", { id: "lgtm-buzzer-modal-title" });
     const subtitle = el(doc, "p", { class: "subtitle" });
 
     // Content area.
     const content = doc.createElement("div");
     content.setAttribute("data-lgtm-content", "");
 
-    // Actions area (only certain states have buttons).
+    // Actions area.
     const actions = el(doc, "div", { class: "actions" });
 
     switch (state.kind) {
-      case "loading": {
+      case "generating": {
         const { requestId } = state;
         subtitle.textContent = "Preparing your quiz…";
-        content.appendChild(renderLoading(doc));
-        // Cancel button.
+        content.appendChild(renderGenerating(doc));
+
         const cancelBtn = textEl(doc, "button", "Cancel", {
           class: "btn btn-secondary",
           "data-testid": "lgtm-buzzer-quiz-cancel",
@@ -662,7 +786,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         break;
       }
 
-      case "quiz-active": {
+      case "ready": {
         const { requestId, quiz } = state;
         subtitle.textContent = `${quiz.questions.length} question${quiz.questions.length === 1 ? "" : "s"} — answer all to submit.`;
 
@@ -672,17 +796,11 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         }) as HTMLButtonElement;
         submitBtn.type = "submit";
 
-        const { fragment, collectAnswers: ca } = renderQuizActive(
-          doc,
-          quiz,
-          submitBtn,
-        );
+        const { fragment, collectAnswers: ca } = renderReady(doc, quiz, submitBtn);
         collectAnswers = ca;
         content.appendChild(fragment);
 
-        submitBtn.addEventListener("click", () => {
-          handleSubmit(requestId, quiz.id);
-        });
+        submitBtn.addEventListener("click", () => { handleSubmit(requestId, quiz.id); });
 
         const cancelBtn = textEl(doc, "button", "Cancel", {
           class: "btn btn-secondary",
@@ -696,47 +814,79 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
       }
 
       case "submitting": {
+        const { requestId } = state;
         subtitle.textContent = "Checking answers…";
-        content.appendChild(renderLoading(doc));
+        content.appendChild(renderGenerating(doc));
+
+        const cancelBtn = textEl(doc, "button", "Cancel", {
+          class: "btn btn-secondary",
+          "data-testid": "lgtm-buzzer-quiz-cancel",
+        });
+        cancelBtn.addEventListener("click", () => { handleCancel(requestId); });
+        actions.appendChild(cancelBtn);
         break;
       }
 
-      case "result": {
-        const { requestId, passed, result } = state;
-        const quiz = activeQuiz;
-        if (passed) {
-          subtitle.textContent = "Well done!";
-          content.appendChild(
-            renderPassed(doc, result, quiz ?? { id: "", questions: [] }),
-          );
-          // Provide a dismiss button for accessibility.
-          const dismissBtn = textEl(doc, "button", "Dismiss", {
-            class: "btn btn-secondary",
-          });
-          dismissBtn.addEventListener("click", () => { closeModal(); });
-          actions.appendChild(dismissBtn);
-        } else {
-          subtitle.textContent = "Approval blocked.";
-          content.appendChild(
-            renderFailed(doc, result, quiz ?? { id: "", questions: [] }),
-          );
+      case "passed": {
+        subtitle.textContent = "Well done!";
+        content.appendChild(
+          renderPassed(doc, state.result, activeQuiz ?? { id: "", questions: [] }),
+        );
 
-          const dismissBtn = textEl(doc, "button", "Dismiss", {
-            class: "btn btn-secondary",
-          });
-          dismissBtn.addEventListener("click", () => {
-            emitDOMEvent(doc, DOM_EVENTS.quizCancel, { requestId });
-            closeModal();
-          });
-          actions.appendChild(dismissBtn);
-        }
+        const dismissBtn = textEl(doc, "button", "Dismiss", {
+          class: "btn btn-secondary",
+        });
+        dismissBtn.addEventListener("click", () => { closeModal(); });
+        actions.appendChild(dismissBtn);
+        break;
+      }
+
+      case "failed": {
+        const { requestId } = state;
+        subtitle.textContent = "Approval blocked.";
+        content.appendChild(
+          renderFailed(doc, state.result, activeQuiz ?? { id: "", questions: [] }),
+        );
+
+        const dismissBtn = textEl(doc, "button", "Dismiss", {
+          class: "btn btn-secondary",
+        });
+        dismissBtn.addEventListener("click", () => {
+          emitDOMEvent(doc, DOM_EVENTS.quizCancel, { requestId });
+          closeModal();
+        });
+
+        const tryAgainBtn = textEl(doc, "button", "Try Again", {
+          class: "btn btn-primary",
+          "data-testid": "lgtm-buzzer-quiz-retry",
+        });
+        tryAgainBtn.addEventListener("click", () => {
+          emitDOMEvent(doc, DOM_EVENTS.quizRetry, { requestId });
+          // Modal transitions to generating via the quiz-request event emitted
+          // by the CS's onQuizRetry handler — no direct transition here.
+        });
+
+        actions.appendChild(dismissBtn);
+        actions.appendChild(tryAgainBtn);
         break;
       }
 
       case "error": {
-        const { requestId, message, reason } = state;
+        const { requestId, reason, message } = state;
+        const cls = classifyError(reason as Parameters<typeof classifyError>[0], message);
+        const uiSpec = errorClassToUI(cls);
+
         subtitle.textContent = "An error occurred.";
-        content.appendChild(renderError(doc, message, reason));
+
+        const errBanner = el(doc, "div", { class: "result-banner result-error" });
+        errBanner.textContent = "⚠️ Something went wrong.";
+        content.appendChild(errBanner);
+
+        const errTitle = textEl(doc, "p", uiSpec.title, { class: "error-title" });
+        content.appendChild(errTitle);
+
+        const errBody = textEl(doc, "p", uiSpec.body, { class: "error-body" });
+        content.appendChild(errBody);
 
         const dismissBtn = textEl(doc, "button", "Dismiss", {
           class: "btn btn-secondary",
@@ -746,6 +896,57 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           closeModal();
         });
         actions.appendChild(dismissBtn);
+
+        if (uiSpec.cta !== undefined) {
+          const { label, action } = uiSpec.cta;
+          switch (action.kind) {
+            case "retry": {
+              const retryBtn = textEl(doc, "button", label, {
+                class: "btn btn-primary",
+                "data-testid": "lgtm-buzzer-quiz-retry",
+              });
+              retryBtn.addEventListener("click", () => {
+                emitDOMEvent(doc, DOM_EVENTS.quizRetry, { requestId });
+              });
+              actions.appendChild(retryBtn);
+              break;
+            }
+            case "open-options": {
+              // Keep backward-compat with ADR-23: also renders configure link.
+              const optBtn = textEl(doc, "button", label, {
+                class: "btn btn-primary",
+                "data-testid": "lgtm-buzzer-configure-options",
+                "data-action": "open-options",
+              });
+              optBtn.addEventListener("click", () => {
+                doc.dispatchEvent(new CustomEvent(OPEN_OPTIONS_EVENT, { bubbles: false }));
+                emitDOMEvent(doc, DOM_EVENTS.quizCancel, { requestId });
+                closeModal();
+              });
+              actions.appendChild(optBtn);
+              break;
+            }
+            case "install-host": {
+              const { url } = action;
+              const installLink = textEl(doc, "a", label, {
+                href: url,
+                target: "_blank",
+                rel: "noopener",
+                class: "btn btn-primary",
+                "data-testid": "lgtm-buzzer-install-host",
+              });
+              installLink.addEventListener("click", () => {
+                emitDOMEvent(doc, DOM_EVENTS.quizCancel, { requestId });
+                closeModal();
+              });
+              actions.appendChild(installLink);
+              break;
+            }
+            case "dismiss":
+              // Already have dismiss button.
+              break;
+          }
+        }
         break;
       }
     }
@@ -757,8 +958,12 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
     backdrop.appendChild(panel);
     shadow.appendChild(backdrop);
 
-    // Focus the backdrop for keyboard navigation.
-    (backdrop as HTMLElement).focus();
+    // Update aria-live announcement for the new state.
+    announce(announcementForState(state));
+
+    // Activate focus trap on the panel.
+    focusTrap = createFocusTrap({ doc, container: panel });
+    focusTrap.activate();
   };
 
   // ---------------------------------------------------------------------------
@@ -766,14 +971,53 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
   // ---------------------------------------------------------------------------
 
   const transition = (next: ModalState): void => {
+    const prev = state;
     state = next;
+
+    // Validate transition: warn on invalid but always proceed.
+    const valid = isValidTransition(prev.kind, next.kind);
+    if (!valid) {
+      logger?.warn("[lgtm-buzzer:modal] invalid state transition — proceeding anyway", {
+        from: prev.kind,
+        to: next.kind,
+      });
+    }
+
     render();
   };
 
   const closeModal = (): void => {
+    focusTrap?.deactivate();
+    focusTrap = null;
+    liveRegion = null;
     activeQuiz = null;
     collectAnswers = null;
     transition({ kind: "idle" });
+  };
+
+  // ---------------------------------------------------------------------------
+  // Transition validation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Returns `true` if the `from → to` transition is a legal move in the
+   * state machine. Invalid transitions log a warning and no-op the guard
+   * (the transition always proceeds — UI consistency > correctness assertion).
+   */
+  const isValidTransition = (from: ModalState["kind"], to: ModalState["kind"]): boolean => {
+    // from idle
+    if (from === "idle" && to === "generating") return true;
+    // from generating
+    if (from === "generating" && (to === "ready" || to === "error" || to === "idle")) return true;
+    // from ready
+    if (from === "ready" && (to === "submitting" || to === "idle")) return true;
+    // from submitting
+    if (from === "submitting" && (to === "passed" || to === "failed" || to === "error" || to === "idle")) return true;
+    // from passed / failed / error
+    if ((from === "passed" || from === "failed" || from === "error") && to === "idle") return true;
+    // from failed / error → generating (retry)
+    if ((from === "failed" || from === "error") && to === "generating") return true;
+    return false;
   };
 
   // ---------------------------------------------------------------------------
@@ -790,7 +1034,10 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
     const answers = collectAnswers();
     if (answers.length === 0) return;
 
-    transition({ kind: "submitting", requestId, quiz: activeQuiz! });
+    const quiz = activeQuiz;
+    if (quiz === null) return;
+
+    transition({ kind: "submitting", requestId, quiz });
 
     emitDOMEvent(doc, DOM_EVENTS.quizSubmit, {
       requestId,
@@ -800,7 +1047,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
   };
 
   // ---------------------------------------------------------------------------
-  // Keyboard handler
+  // Keyboard handler (Esc)
   // ---------------------------------------------------------------------------
 
   const handleKeyDown = (event: Event): void => {
@@ -808,6 +1055,14 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
     if (kbEvent.key !== "Escape") return;
     const current = state;
     if (current.kind === "idle") return;
+
+    // In `passed` state: Esc dismisses without emitting quiz-cancel.
+    // The approval is already through.
+    if (current.kind === "passed") {
+      closeModal();
+      return;
+    }
+
     emitDOMEvent(doc, DOM_EVENTS.quizCancel, { requestId: current.requestId });
     closeModal();
   };
@@ -818,7 +1073,9 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
 
   const onQuizRequest = (detail: { requestId: string }): void => {
     ensureMounted();
-    transition({ kind: "loading", requestId: detail.requestId });
+    // If we get a new quiz-request while in any non-idle state (e.g., from
+    // a retry), transition to generating with the new requestId.
+    transition({ kind: "generating", requestId: detail.requestId });
   };
 
   const onQuizResult = (detail: {
@@ -834,15 +1091,14 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
     switch (outcome.kind) {
       case "quiz-ready": {
         activeQuiz = outcome.quiz;
-        transition({ kind: "quiz-active", requestId, quiz: outcome.quiz });
+        transition({ kind: "ready", requestId, quiz: outcome.quiz });
         break;
       }
 
       case "quiz-passed": {
         transition({
-          kind: "result",
+          kind: "passed",
           requestId,
-          passed: true,
           result: outcome.result,
         });
         break;
@@ -850,9 +1106,8 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
 
       case "quiz-failed": {
         transition({
-          kind: "result",
+          kind: "failed",
           requestId,
-          passed: false,
           result: outcome.result,
         });
         break;
@@ -862,8 +1117,8 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         transition({
           kind: "error",
           requestId,
-          message: outcome.message,
           reason: outcome.reason,
+          message: outcome.message,
         });
         break;
       }
@@ -898,12 +1153,15 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         disposeRequest();
         disposeResult();
         doc.removeEventListener("keydown", handleKeyDown);
+        focusTrap?.deactivate();
+        focusTrap = null;
         host?.remove();
         host = null;
         shadow = null;
         state = { kind: "idle" };
         activeQuiz = null;
         collectAnswers = null;
+        liveRegion = null;
       };
     },
   };

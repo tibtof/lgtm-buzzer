@@ -1,6 +1,26 @@
 import { FrameSchema, type Frame } from "@lgtm-buzzer/protocol";
 import type { CorrelationMap } from "./correlation.js";
 
+// ---------------------------------------------------------------------------
+// Error marker strings (exported for use in error-classes.ts — ADR-24)
+// Consumers import these to avoid string-literal drift.
+// ---------------------------------------------------------------------------
+
+/**
+ * Marker strings emitted by `createPortClient` as error frame messages.
+ *
+ * `classifyError` in `error-classes.ts` imports these to recognise
+ * transport failures without duplicating the string literals.
+ */
+export const PORT_ERROR_MARKERS = {
+  /** Emitted when the native-messaging port disconnects unexpectedly. */
+  hostDisconnected: "host disconnected",
+  /** Emitted when the request timer fires before a reply arrives. */
+  hostNoResponse: "host did not respond",
+  /** Prefix emitted when `connect()` throws synchronously. */
+  connectFailed: "connect failed:",
+} as const;
+
 /**
  * Minimal interface over `chrome.runtime.Port` that is injectable in tests.
  *

@@ -5,6 +5,7 @@ import {
   QuizResultEventDetailSchema,
   QuizSubmitEventDetailSchema,
   QuizCancelEventDetailSchema,
+  QuizRetryEventDetailSchema,
   emitDOMEvent,
   addDOMEventListener,
 } from "./dom-events.js";
@@ -50,6 +51,7 @@ describe("DOM_EVENTS constants", () => {
     expect(DOM_EVENTS.quizResult).toBe("lgtm-buzzer:quiz-result");
     expect(DOM_EVENTS.quizSubmit).toBe("lgtm-buzzer:quiz-submit");
     expect(DOM_EVENTS.quizCancel).toBe("lgtm-buzzer:quiz-cancel");
+    expect(DOM_EVENTS.quizRetry).toBe("lgtm-buzzer:quiz-retry");
   });
 });
 
@@ -255,6 +257,23 @@ describe("QuizCancelEventDetailSchema", () => {
 
   it("rejects missing requestId", () => {
     const result = QuizCancelEventDetailSchema.safeParse({});
+    expect(result.success).toBe(false);
+  });
+});
+
+describe("QuizRetryEventDetailSchema", () => {
+  it("accepts a valid retry detail", () => {
+    const result = QuizRetryEventDetailSchema.safeParse({ requestId: "req-retry-1" });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects missing requestId", () => {
+    const result = QuizRetryEventDetailSchema.safeParse({});
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects empty requestId", () => {
+    const result = QuizRetryEventDetailSchema.safeParse({ requestId: "" });
     expect(result.success).toBe(false);
   });
 });
