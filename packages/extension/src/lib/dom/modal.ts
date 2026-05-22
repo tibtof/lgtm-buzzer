@@ -8,6 +8,9 @@ import {
   type DOMEventLogger,
 } from "./dom-events.js";
 
+// DOM event name for "open options page" (ADR-23).
+const OPEN_OPTIONS_EVENT = "lgtm-buzzer:open-options";
+
 // ---------------------------------------------------------------------------
 // State machine
 // ---------------------------------------------------------------------------
@@ -49,6 +52,7 @@ type ModalState =
       readonly kind: "error";
       readonly requestId: string;
       readonly message: string;
+      readonly reason: string;
     };
 
 // ---------------------------------------------------------------------------
@@ -512,8 +516,11 @@ const renderFailed = (
 
 /**
  * Renders the error panel body.
+ *
+ * When `reason` is `"missing-credentials"` or `"bad-credentials"`, an
+ * additional "Configure in extension options" link is rendered (ADR-23).
  */
-const renderError = (doc: Document, message: string): DocumentFragment => {
+const renderError = (doc: Document, message: string, reason?: string): DocumentFragment => {
   const frag = doc.createDocumentFragment();
 
   const banner = el(doc, "div", { class: "result-banner result-error" });
@@ -523,6 +530,22 @@ const renderError = (doc: Document, message: string): DocumentFragment => {
   const msg = el(doc, "p", { class: "error-msg" });
   msg.textContent = message;
   frag.appendChild(msg);
+
+  if (reason === "missing-credentials" || reason === "bad-credentials") {
+    const configLink = el(doc, "a", {
+      href: "#",
+      "data-action": "open-options",
+      "data-testid": "lgtm-buzzer-configure-options",
+    });
+    configLink.textContent = "Configure credentials in the LGTM-Buzzer options page";
+    configLink.addEventListener("click", (e) => {
+      e.preventDefault();
+      doc.dispatchEvent(
+        new CustomEvent(OPEN_OPTIONS_EVENT, { bubbles: false }),
+      );
+    });
+    frag.appendChild(configLink);
+  }
 
   return frag;
 };
@@ -711,9 +734,9 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
       }
 
       case "error": {
-        const { requestId, message } = state;
+        const { requestId, message, reason } = state;
         subtitle.textContent = "An error occurred.";
-        content.appendChild(renderError(doc, message));
+        content.appendChild(renderError(doc, message, reason));
 
         const dismissBtn = textEl(doc, "button", "Dismiss", {
           class: "btn btn-secondary",
@@ -840,6 +863,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           kind: "error",
           requestId,
           message: outcome.message,
+          reason: outcome.reason,
         });
         break;
       }

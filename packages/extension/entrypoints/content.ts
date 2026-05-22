@@ -113,5 +113,10 @@ export default defineContentScript({
       },
     });
     modal.start();
+
+    // ADR-23: forward "open options page" requests from the modal to the SW.
+    document.addEventListener("lgtm-buzzer:open-options", () => {
+      void browser.runtime.sendMessage({ kind: "open-options" });
+    });
   },
 });

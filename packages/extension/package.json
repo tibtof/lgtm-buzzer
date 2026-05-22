@@ -16,7 +16,8 @@
   },
   "dependencies": {
     "@lgtm-buzzer/core": "*",
-    "@lgtm-buzzer/protocol": "*"
+    "@lgtm-buzzer/protocol": "*",
+    "monadyssey": "2.0.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",

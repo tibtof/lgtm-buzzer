@@ -5125,3 +5125,1073 @@ Coverage target: ~90% on `src/lib/dom/**` (unchanged from ADR-18). The new files
 - **No e2e for ADO in v1.** #51 covers GitHub only. ADO smoke is manual. This is the right trade-off — ADO e2e requires either a paid ADO instance or a non-trivial DOM fixture; defer until selector volatility justifies it.
 - **Reversibility high.** Two new files, four modified. Swapping the recognizer strategy is one file. Swapping the SPA navigation strategy is one file.
 - **Binding for the reviewer**: (a) ADO recognizer must not read any element under PR-content containers (grep gate); (b) `setupAdoVoteInterceptor` must call `stopImmediatePropagation`; (c) `quiz-flow.ts` must branch replay on `blocked.kind` and never call `requestSubmit` on the ADO path; (d) module-scoped bypass flag is shared between platforms but consumed identically; (e) `host_permissions` and `matches` must list both modern and legacy ADO hosts; (f) zero new runtime deps; (g) no `console.log` in committed code — only the injected `logger.warn`.
+
+---
+
+## ADR-22 (2026-05-22): Host runtime config layer — adapter registry, per-request credentials, list-adapters frame
+**Date**: 2026-05-22
+**Issue**: #49
+**Status**: Accepted
+
+### Context
+
+M2 hard-wires `claude-cli` (LLM) + `github` (VCS), reading `LGTM_BUZZER_LLM` and `LGTM_BUZZER_GH_TOKEN` from `process.env` in `host/adapter-registry.ts`. M3 grows this matrix to **four LLM adapters** (`claude-cli`, `codex-cli`, `copilot-cli`, `claude-api`) and **two VCS adapters** (`github`, `ado`). The host needs a way to (a) discover available adapters, (b) be told which pair to use per quiz request, (c) accept credentials safely.
+
+Three downstream consumers are blocked on this:
+
+1. **#50** — extension options page. The user picks the adapter and supplies credentials (PAT, API key). With nowhere to send them, the page cannot exist.
+2. **#59 v2** — `claude-api` adapter currently has no API-key source on the host side beyond a TODO env var.
+3. **#48** — ADO content script ships real diffs to the host once the ADO VCS adapter is selectable per-request.
+
+Five forces shape the design:
+
+- **Statelessness of the host.** The extension is the source of truth for user preferences (options page → `chrome.storage.local`). Pushing state into the host creates a second sync surface and a fresh persistence problem.
+- **Diff-only invariant.** Adapter selection and credentials are non-diff-derived; the wire format must keep diff bytes off the wire and credentials separable from prompt construction.
+- **Credential blast radius.** PATs and API keys are sensitive. They MUST NEVER appear in logs, error payloads, or stderr. ADR-6's pino REDACT_PATHS list must grow to cover the new fields.
+- **Backwards compatibility.** The protocol envelope `v` is currently `1`. Bumping it forces lockstep version checks across host + extension just to add optional fields. Optional-fields-with-defaults is strictly cheaper.
+- **No eager spawning.** The composition root must construct only the active adapter pair. Constructing all four LLM adapters at startup wastes effort and may fail on missing optional credentials (e.g., no API key).
+
+The issue's "config file vs. wire message" open question is resolved in favour of **wire message**: the options page is the user's source of truth; the host stays stateless w.r.t. preferences.
+
+### Decision
+
+A **host-side adapter registry** maps stable adapter IDs to ephemeral factory functions; the **wire format** carries the chosen IDs and per-request credentials on every `quiz-request`; the extension discovers available adapters via a new `list-adapters-request` / `list-adapters-response` frame pair.
+
+#### Affected workspaces
+
+- `packages/protocol/` — three new fields on `quiz-request.payload`, two new frame kinds, four new `ErrorReason` variants. No envelope structural change; `v` stays at `1`.
+- `packages/host/` — replaces `adapter-registry.ts`'s ad-hoc env-driven selection with a typed registry; dispatcher threads adapter IDs + credentials per request.
+- `packages/extension/` — no changes in this ADR (the options page itself is #50). The SW already speaks `Frame` opaquely (ADR-17 §7); new fields ride through without code change.
+
+**Dependency arrows reaffirmed**:
+
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+```
+
+No new arrows. No `core` change at all (the `LLMProvider` / `VCSProvider` ports remain the host-side contract; adapter factories already take `creds` as part of their `config`).
+
+#### Wire-shape choices (binding)
+
+| Choice | Decision |
+|---|---|
+| Where adapter selection lives | **Extension-driven** (the user's source of truth; options page in #50). Host validates the requested ID; on miss, returns a typed error frame. |
+| Envelope version | **Stays `v: 1`**. New fields are optional with defaults. |
+| Default adapter pair when fields omitted | `{ llm: "claude-cli", vcs: "github" }` — preserves M2 behaviour. |
+| Credentials transport | **Inside the same `quiz-request` payload**. Short-lived; the host MUST NOT persist them. Adapter instance built per-request, dropped after the response. |
+| Credentials shape | Discriminated union by adapter ID; each adapter declares its own zod schema in its workspace. |
+| Adapter discovery | New `list-adapters-request` → `list-adapters-response` frame pair. Payload: `{ llm: string[]; vcs: string[] }`. |
+| New error reasons | `unsupported-llm-adapter`, `unsupported-vcs-adapter`, `bad-credentials`, `missing-credentials`. |
+| Credential redaction | Extended ADR-6 REDACT_PATHS — added `payload.credentials`, `*.credentials`, `*.apiKey`, `*.pat`. |
+
+#### Types
+
+##### protocol — `packages/protocol/src/messages/credentials.ts` (new)
+
+The credentials bag is an open zod record at the protocol layer (the host validates per-adapter). Protocol does NOT know adapter-specific shapes; it knows only "credentials may be present, may be absent, must be a JSON object when present".
+
+```ts
+// packages/protocol/src/messages/credentials.ts
+import { z } from "zod";
+
+/**
+ * Wire-format credentials bag. The protocol layer keeps this schema deliberately
+ * loose — per-adapter shape validation happens in the host's adapter registry
+ * (`packages/host/src/registry.ts`). Allowing arbitrary string-keyed string
+ * values here lets the protocol carry today's PAT / API-key bags AND tomorrow's
+ * additional fields (refresh tokens, regional endpoints) without an envelope
+ * bump.
+ *
+ * SECURITY: This object is logged NOWHERE. ADR-6's REDACT_PATHS must censor
+ * `payload.credentials`, `*.credentials`, `*.apiKey`, `*.pat`.
+ */
+export const CredentialsBagSchema = z.record(z.string(), z.string());
+export type CredentialsBag = z.infer<typeof CredentialsBagSchema>;
+```
+
+##### protocol — extended `quiz-request.ts`
+
+```ts
+// packages/protocol/src/messages/quiz-request.ts
+export const QuizRequestPayloadSchema = z.object({
+  pr: PRIdentifierSchema,
+  questionCount: z.number().int().min(1).max(10),
+  /** Stable LLM-adapter ID. Optional — host defaults to "claude-cli". */
+  llmAdapterId: z.string().min(1).optional(),
+  /** Stable VCS-adapter ID. Optional — host defaults to "github". */
+  vcsAdapterId: z.string().min(1).optional(),
+  /** Per-adapter credentials bag. Validated by the host's registry per adapter ID. */
+  credentials: CredentialsBagSchema.optional(),
+});
+```
+
+`payload.credentials` MUST remain the ONLY field carrying secrets. Diff bytes still never appear in any wire message (`fetchDiff` runs host-side only).
+
+##### protocol — new `list-adapters` frames
+
+```ts
+// packages/protocol/src/messages/list-adapters-request.ts
+export const ListAdaptersRequestPayloadSchema = z.object({});
+export const ListAdaptersRequestFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("list-adapters-request"),
+  payload: ListAdaptersRequestPayloadSchema,
+});
+export type ListAdaptersRequestFrame = z.infer<typeof ListAdaptersRequestFrameSchema>;
+```
+
+```ts
+// packages/protocol/src/messages/list-adapters-response.ts
+export const ListAdaptersResponsePayloadSchema = z.object({
+  llm: z.array(z.string().min(1)),
+  vcs: z.array(z.string().min(1)),
+});
+export const ListAdaptersResponseFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("list-adapters-response"),
+  payload: ListAdaptersResponsePayloadSchema,
+});
+export type ListAdaptersResponseFrame = z.infer<typeof ListAdaptersResponseFrameSchema>;
+```
+
+Both kinds join the `FrameSchema` discriminated union in `envelope.ts`.
+
+##### protocol — extended `error.ts`
+
+```ts
+export const ErrorReasonSchema = z.enum([
+  "schema-violation",
+  "unknown-message",
+  "version-mismatch",
+  "internal",
+  "unknown-quiz-id",
+  // new in ADR-22
+  "unsupported-llm-adapter",
+  "unsupported-vcs-adapter",
+  "bad-credentials",
+  "missing-credentials",
+]);
+```
+
+##### host — `packages/host/src/registry.ts` (new)
+
+```ts
+// Per-adapter credential schemas (host-owned; the host is the only layer that
+// understands the runtime shape).
+const ClaudeCliCredsSchema = z.object({}).strict();          // none required
+const CodexCliCredsSchema  = z.object({}).strict();
+const CopilotCliCredsSchema = z.object({}).strict();
+const ClaudeApiCredsSchema = z.object({ apiKey: z.string().min(1) }).strict();
+const GithubCredsSchema    = z.object({ pat: z.string().min(1) }).strict();
+const AdoCredsSchema       = z.object({ pat: z.string().min(1) }).strict();
+
+export type RegistryError =
+  | { readonly kind: "unsupported-llm-adapter"; readonly id: string }
+  | { readonly kind: "unsupported-vcs-adapter"; readonly id: string }
+  | { readonly kind: "missing-credentials";     readonly adapterId: string }
+  | { readonly kind: "bad-credentials";         readonly adapterId: string; readonly detail: string };
+
+export type LLMAdapterFactory = (
+  creds: CredentialsBag | undefined,
+) => Either<RegistryError, LLMProvider>;
+
+export type VCSAdapterFactory = (
+  creds: CredentialsBag | undefined,
+) => Either<RegistryError, VCSProvider>;
+
+export type AdapterRegistry = {
+  readonly listLlm: () => readonly string[];
+  readonly listVcs: () => readonly string[];
+  readonly buildLlm: (id: string, creds: CredentialsBag | undefined) =>
+    Either<RegistryError, LLMProvider>;
+  readonly buildVcs: (id: string, creds: CredentialsBag | undefined) =>
+    Either<RegistryError, VCSProvider>;
+};
+
+export const createDefaultAdapterRegistry: (deps: {
+  readonly spawnIO: typeof spawnIOFn;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+}) => AdapterRegistry;
+```
+
+Notes on the registry contract:
+
+- **Pure `Either` return**, not `IO`. Adapter construction is synchronous and pure; only the resulting `LLMProvider.generateQuiz` / `VCSProvider.fetchDiff` calls are `IO`-bearing.
+- `buildLlm` / `buildVcs` MUST NOT cache constructed adapters. Each call returns a fresh instance — credentials are per-request.
+- `RegistryError.bad-credentials.detail` is a short message ("missing field `apiKey`", "field `pat` must be non-empty"). It MUST NOT echo any credential bytes; the zod issue list is stringified by field-path only.
+- The factory takes raw `CredentialsBag | undefined`, runs the per-adapter zod schema, and either constructs the adapter or returns a typed `RegistryError`.
+
+##### host — updated `dispatcher.ts` deps
+
+```ts
+export type DispatcherDeps = {
+  readonly write: FrameWriter;
+  readonly store: SessionStore;
+  readonly logger: Logger;
+  readonly registry: AdapterRegistry;          // NEW
+  readonly env?: Readonly<Record<string, string | undefined>>;
+};
+```
+
+The dispatcher passes `frame.payload.llmAdapterId ?? "claude-cli"`, `frame.payload.vcsAdapterId ?? "github"`, and `frame.payload.credentials` to `registry.buildLlm` / `registry.buildVcs`. On `Left<RegistryError>`, it maps to the corresponding wire error.
+
+#### Functions and methods
+
+**`packages/host/src/registry.ts`**:
+
+```ts
+/** Construct the default registry: claude-cli, codex-cli, copilot-cli, claude-api, github, ado. */
+export const createDefaultAdapterRegistry = (deps: {
+  readonly spawnIO: typeof spawnIOFn;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+}): AdapterRegistry => { /* ... */ };
+
+/** Parse a CredentialsBag against a per-adapter zod schema; never echo cred bytes. */
+const validateCreds = <T>(
+  schema: z.ZodType<T>,
+  adapterId: string,
+  bag: CredentialsBag | undefined,
+  required: boolean,
+): Either<RegistryError, T | undefined> => { /* ... */ };
+```
+
+**`packages/host/src/dispatcher.ts`** — new internal helpers:
+
+```ts
+/** Map RegistryError → wire ErrorReason (no credential bytes ever in payload). */
+const buildRegistryErrorFrame = (
+  err: RegistryError,
+  correlationId: string | null,
+): Frame;
+
+/** Handle a `list-adapters-request` frame. */
+const handleListAdaptersRequest = (
+  correlationId: string | null,
+  deps: DispatcherDeps,
+): IO<never, void>;
+```
+
+The existing `handleQuizRequest` signature grows by two parameters:
+
+```ts
+const handleQuizRequest = (
+  pr: PRIdentifier,
+  questionCount: number,
+  llmAdapterId: string,            // NEW (already defaulted by dispatcher)
+  vcsAdapterId: string,            // NEW
+  credentials: CredentialsBag | undefined,  // NEW
+  correlationId: string | null,
+  deps: DispatcherDeps,
+): IO<never, void>;
+```
+
+#### File layout
+
+**New**:
+
+- `packages/protocol/src/messages/credentials.ts` + `.test.ts`
+- `packages/protocol/src/messages/list-adapters-request.ts` + `.test.ts`
+- `packages/protocol/src/messages/list-adapters-response.ts` + `.test.ts`
+- `packages/host/src/registry.ts` + `.test.ts`
+
+**Modified**:
+
+- `packages/protocol/src/messages/quiz-request.ts` — add 3 optional fields; TSDoc reaffirming diff-only invariant unchanged (credentials are NOT diff-derived; they are user-supplied identity for VCS / LLM).
+- `packages/protocol/src/messages/quiz-request.test.ts` — cover new fields (present, absent, malformed).
+- `packages/protocol/src/messages/error.ts` — add 4 enum variants.
+- `packages/protocol/src/messages/error.test.ts` — cover new reasons.
+- `packages/protocol/src/envelope.ts` — add the two new frames to `FrameSchema`.
+- `packages/protocol/src/envelope.test.ts` — extend discriminator coverage.
+- `packages/protocol/src/index.ts` — re-export new schemas and types.
+- `packages/host/src/dispatcher.ts` — accept `registry` dep; thread adapter IDs + creds; handle `list-adapters-request`; map `RegistryError` to wire error frames.
+- `packages/host/src/dispatcher.test.ts` — new cases (see Test strategy).
+- `packages/host/src/cli.ts` — construct the registry once at startup, pass into `createDispatcher`.
+- `packages/host/src/adapter-registry.ts` — **DELETED** (superseded by `registry.ts`).
+- `packages/host/src/adapter-registry.test.ts` — **DELETED**.
+- `packages/host/src/logger.ts` — extend `REDACT_PATHS` with: `payload.credentials`, `credentials`, `*.credentials`, `*.apiKey`, `*.pat`, `*.token`, `request.credentials`, `response.credentials`.
+- `packages/host/src/logger.test.ts` — assert redaction on each new path.
+
+#### Sequence
+
+The flow below is the per-quiz path with the new registry layer.
+
+1. **Extension options page (#50, future)** — user picks LLM + VCS adapter IDs and supplies credentials. Stored in `chrome.storage.local`. (Out of scope for this ADR.)
+2. **CS detects Approve click** — builds `QuizRequestFrame` (ADR-18). The CS reads adapter IDs + credentials from `chrome.storage.local` (or asks the SW to). Wire payload becomes:
+   ```json
+   { "pr": {...}, "questionCount": 3,
+     "llmAdapterId": "claude-api",
+     "vcsAdapterId": "github",
+     "credentials": { "apiKey": "sk-ant-...", "pat": "ghp_..." } }
+   ```
+3. **SW routes frame** (ADR-17 §3) — unchanged; SW handles `Frame` opaquely.
+4. **Host stdio reader** decodes the frame via `parseFrame` (existing). Zod validates `payload.credentials` is `Record<string, string>` if present.
+5. **Dispatcher** picks the adapter IDs (with defaults) and calls:
+   - `registry.buildVcs(vcsAdapterId, creds)` → `Either<RegistryError, VCSProvider>`.
+   - `registry.buildLlm(llmAdapterId, creds)` → `Either<RegistryError, LLMProvider>`.
+   On `Left`: build an `ErrorFrame` with the matching `reason` and return immediately. Diff is NEVER fetched in this branch.
+6. **Adapter pair constructed per-request** — no caching, no global state. The `LLMProvider` and `VCSProvider` references go out of scope at the end of the request.
+7. **Existing quiz pipeline** continues (ADR-16): `fetchDiff` → `generateQuiz` → store answer key → write `quiz-response`.
+8. **Adapter discovery** — separate, simple flow: SW or options page sends `list-adapters-request`; dispatcher calls `registry.listLlm()` / `registry.listVcs()`; writes `list-adapters-response`.
+
+**Diff-flow audit**: credentials are constructed in the registry from the wire bag and passed only to the adapter factories. They never enter prompt construction, error payloads, or log messages.
+
+#### Error cases
+
+| Trigger | Wire frame |
+|---|---|
+| `llmAdapterId` not in registry | `ErrorFrame { reason: "unsupported-llm-adapter", message: "Unknown LLM adapter: <id>", details: { id } }` |
+| `vcsAdapterId` not in registry | `ErrorFrame { reason: "unsupported-vcs-adapter", message: "Unknown VCS adapter: <id>", details: { id } }` |
+| Adapter requires credentials, payload omits `credentials` or required field | `ErrorFrame { reason: "missing-credentials", message: "Adapter <id> requires credentials", details: { adapterId, missing: ["apiKey"] } }` |
+| Credentials present but zod-invalid (wrong type, empty string) | `ErrorFrame { reason: "bad-credentials", message: "Credentials for adapter <id> are invalid", details: { adapterId, fieldPath: "apiKey" } }` |
+| Legacy v1 envelope without new fields | Defaults to `claude-cli` + `github`; quiz proceeds (M2 parity). |
+
+**Binding (reviewer-enforced)**: `ErrorPayload.message` and `ErrorPayload.details` MUST NOT include any bytes of `payload.credentials.*`. The `bad-credentials` payload may include field PATHS (`"apiKey"`, `"pat"`) but NEVER values. Contract test asserts.
+
+Expected failures travel as `Either` / `IO` errors (CLAUDE.md idiom #1/#2). No new `throw` paths.
+
+#### Per-adapter credential contract
+
+| Adapter ID | Required creds | Optional creds | Zod schema (in `registry.ts`) |
+|---|---|---|---|
+| `claude-cli` | none | none | `z.object({}).strict()` |
+| `codex-cli` | none | none | `z.object({}).strict()` |
+| `copilot-cli` | none | none | `z.object({}).strict()` |
+| `claude-api` | `apiKey: string (non-empty)` | none | `z.object({ apiKey: z.string().min(1) }).strict()` |
+| `github` | `pat: string (non-empty)` | none | `z.object({ pat: z.string().min(1) }).strict()` |
+| `ado` | `pat: string (non-empty)` | none | `z.object({ pat: z.string().min(1) }).strict()` |
+
+CLI adapters (`claude-cli`, `codex-cli`, `copilot-cli`) intentionally accept NO credentials at the registry layer in v1 — each CLI manages its own auth (user logs in via `claude auth`, `gh auth`, etc.). If the user supplies a creds bag for these IDs, validation passes (strict-empty allows `undefined`) but extra keys produce `bad-credentials` (`.strict()` rejects unknowns to keep the wire honest).
+
+Future ADRs may add optional creds (e.g., `claude-cli` `binary` path override) — they extend the schema additively.
+
+#### Backwards compatibility — no envelope bump
+
+The protocol envelope `v` literal stays `1`. The three new `quiz-request` fields are `.optional()`; the host applies the documented defaults on absence. Two new frame kinds (`list-adapters-request/response`) join the discriminated union, which is a strictly additive change — older parsers will reject them as `unknown-message`, which is the correct behaviour for a forward-incompatible kind.
+
+This ADR explicitly declines a `v: 2` bump because:
+
+1. The on-the-wire shape change is purely additive.
+2. The extension always supplies the new fields once #50 ships; absence only matters during the rollout window.
+3. Version bumps are coordinated multi-PR work; here the cost outweighs the rigor benefit.
+
+#### Credential storage posture (host-side — hard invariant)
+
+- The host MUST NOT persist credentials. No filesystem write, no in-memory cache across requests, no environment-variable export.
+- Each `quiz-request` carries its own creds bag; the constructed adapter holds it for the lifetime of one `generateQuiz` / `fetchDiff` call.
+- Constructed `LLMProvider` / `VCSProvider` instances are NOT retained between requests — the dispatcher's per-request fiber closes over them and lets GC reclaim them after the response is written.
+- `process.env` is no longer the auth source. `LGTM_BUZZER_GH_TOKEN` and `LGTM_BUZZER_ANTHROPIC_KEY` are **deprecated** and removed from `cli.ts`'s environment-variable docblock. README and `cli.ts` header are updated to point at the options page (#50) as the only supported credential source.
+- For local development without the extension, devs can use the `dev-harness.ts` to inject creds directly into a synthetic `quiz-request` payload. Document this in `packages/host/README.md`.
+
+#### Credential storage posture (extension-side — v1 limitation)
+
+The extension stores PATs / API keys in `chrome.storage.local` as plaintext under Chrome's process-level isolation. This is the same posture as countless other browser extensions (1Password, GitHub Pull Requests for VS Code, etc.) and is acceptable for v1.
+
+**Known v1 limitation, documented in `packages/extension/README.md` and the options page UI**:
+
+- `chrome.storage.local` is readable by any malicious extension granted `"storage"` permission.
+- There is no OS-keychain integration in v1.
+- A future ADR may add (a) a hardware-token unlock flow, (b) integration with the system keychain via the native host, or (c) opt-in encryption with a user passphrase.
+
+This ADR explicitly defers OS-keychain / encrypted-store work to a future issue, but binds the v1 README and options-page copy to call out the storage posture in plain language.
+
+#### Logger redaction (ADR-6 extension)
+
+`packages/host/src/logger.ts` `REDACT_PATHS` adds (binding):
+
+```ts
+const REDACT_PATHS: readonly string[] = [
+  // ... existing ADR-6 + ADR-20 paths ...
+  "credentials",
+  "payload.credentials",
+  "request.credentials",
+  "response.credentials",
+  "*.credentials",
+  "*.apiKey",
+  "*.pat",
+  "*.token",
+  "*.x-api-key",
+];
+```
+
+`logger.test.ts` asserts each path is censored to `"[Redacted]"` on a representative log entry.
+
+#### Test strategy
+
+**`packages/protocol/src/messages/quiz-request.test.ts`** — extend (≥4 new cases):
+1. Payload with all three new fields → parses; types reflect optional fields present.
+2. Payload with only `pr` + `questionCount` → parses (defaults applied at host); fields absent in parsed type.
+3. `credentials` with non-string value → zod rejects.
+4. `llmAdapterId` empty string → zod rejects (`min(1)`).
+
+**`packages/protocol/src/messages/credentials.test.ts`** (new, ≥3):
+1. Empty object parses.
+2. `{ apiKey: "x" }` parses.
+3. `{ apiKey: 123 }` rejects.
+
+**`packages/protocol/src/messages/list-adapters-request.test.ts`** (new, ≥2):
+1. Frame with empty payload parses.
+2. Unknown extra field rejected.
+
+**`packages/protocol/src/messages/list-adapters-response.test.ts`** (new, ≥3):
+1. Frame with both `llm` and `vcs` arrays parses.
+2. Empty arrays parse (degenerate host).
+3. Non-string array element rejects.
+
+**`packages/protocol/src/messages/error.test.ts`** — extend (≥4): each new `ErrorReason` value round-trips.
+
+**`packages/protocol/src/envelope.test.ts`** — extend (≥2): `FrameSchema` accepts the two new kinds.
+
+**`packages/host/src/registry.test.ts`** (new, ≥12):
+1. `listLlm()` returns `["claude-cli", "codex-cli", "copilot-cli", "claude-api"]` (sorted, no duplicates).
+2. `listVcs()` returns `["github", "ado"]`.
+3. `buildLlm("claude-cli", undefined)` → `Right<LLMProvider>` with `id === "claude-cli"`.
+4. `buildLlm("claude-api", { apiKey: "sk-ant-xxx" })` → `Right<LLMProvider>` with `id === "claude-api"`.
+5. `buildLlm("claude-api", undefined)` → `Left<{ kind: "missing-credentials", adapterId: "claude-api" }>`.
+6. `buildLlm("claude-api", { apiKey: "" })` → `Left<{ kind: "bad-credentials", adapterId: "claude-api", detail }>`; `detail` mentions `apiKey` field path only.
+7. `buildLlm("unknown", undefined)` → `Left<{ kind: "unsupported-llm-adapter", id: "unknown" }>`.
+8. `buildLlm("claude-cli", { extra: "x" })` → `Left<{ kind: "bad-credentials" }>` (`.strict()` rejects unknowns).
+9. `buildVcs("github", { pat: "ghp_xxx" })` → `Right<VCSProvider>` with `id === "github"`.
+10. `buildVcs("github", undefined)` → `Left<{ kind: "missing-credentials" }>`.
+11. `buildVcs("ado", { pat: "azp_xxx" })` → `Right<VCSProvider>` (returns adapter; ADR-21 v1 stub error happens later at fetchDiff time).
+12. **Binding canary**: feed a credential string `"SECRET_KEY_CANARY_xxx"` into a failing build; assert the returned `RegistryError.detail` does NOT contain `"SECRET_KEY_CANARY_xxx"`. Reviewer-enforced.
+
+**`packages/host/src/dispatcher.test.ts`** — extend (≥7 new):
+1. `quiz-request` with `llmAdapterId: "unknown"` → writes `ErrorFrame { reason: "unsupported-llm-adapter" }`; no `fetchDiff` call observed on the fake VCS.
+2. `quiz-request` with `vcsAdapterId: "unknown"` → writes `ErrorFrame { reason: "unsupported-vcs-adapter" }`; no `generateQuiz` call observed.
+3. `quiz-request` for `claude-api` without `credentials` → `ErrorFrame { reason: "missing-credentials" }`; no spawn / no HTTP attempted.
+4. `quiz-request` for `claude-api` with `{ apiKey: "" }` → `ErrorFrame { reason: "bad-credentials" }`; **assert response payload does NOT contain `"sk-ant"` substring or the empty-key bytes**.
+5. Legacy envelope (no `llmAdapterId`, no `vcsAdapterId`, no `credentials`) → defaults to `claude-cli` + `github`. Note: in this default branch, `github` adapter now requires creds via the registry, so the legacy path with NO creds will fail with `missing-credentials`. Test must supply `{ pat: "..." }`. Document this M2-incompatibility in the consequences section.
+6. `list-adapters-request` → writes `list-adapters-response` with the full registry.
+7. `quiz-request` with valid `claude-api` + `apiKey` → fake LLM returns Quiz; happy path completes; verify the fake LLM's factory was called exactly once with the apiKey.
+
+**`packages/host/src/logger.test.ts`** — extend (≥6):
+1. Log entry `{ credentials: { apiKey: "x" } }` → `apiKey` censored.
+2. `{ payload: { credentials: {...} } }` → whole field censored.
+3. `{ pat: "..." }` → censored.
+4. `{ token: "..." }` → censored.
+5. `{ x-api-key: "..." }` → censored.
+6. Nested arbitrary `{ foo: { credentials: {...} } }` → `*.credentials` censored.
+
+**Contract tests for adapters**: no change. The existing per-adapter contract tests construct providers directly via their factories; the new registry is the host's wiring layer, not part of the adapter contract.
+
+**End-to-end**: deferred to #51 (Playwright). The options page (#50) and the SW are the e2e surface for this layer; this ADR is host-side only.
+
+Coverage target: ≥90% on `registry.ts` (pure pure-ish factory + zod); ≥85% on the modified dispatcher branches. Existing `adapter-registry.ts` coverage gates removed alongside the file.
+
+### Consequences
+
+- **Stateless host.** The host is now fully stateless w.r.t. user preferences. The options page is the only persistence layer. Future "host config file" requests are denied — they would create a second sync surface.
+- **No envelope version bump.** Protocol stays `v: 1`. Three optional fields + two additive frame kinds. Rollout is unilateral: an updated host accepts both old (defaults) and new payloads.
+- **Per-request adapter construction.** A small cost (factory + zod validation per request, ~µs scale) bought against zero risk of stale-credential leakage between requests. Adapter instances do NOT cross requests.
+- **Defaults preserve M2 surface for CLI users.** `claude-cli` + `github` defaults keep the dev-harness and pre-#50 testing flows working — with one caveat: `github` now requires `pat` via the registry, so the legacy `LGTM_BUZZER_GH_TOKEN` env path is removed. Devs must pass the PAT in the `dev-harness.ts` payload or via the harness's new `--gh-token` flag. Documented in `packages/host/README.md`.
+- **`LGTM_BUZZER_LLM` and `LGTM_BUZZER_GH_TOKEN` env vars are removed.** Devs and CI scripts that relied on them must migrate to the registry/wire-format flow. The deletion is loud (docblock removed, README updated) to avoid silent confusion.
+- **Two new error reasons reach the modal UI.** `unsupported-llm-adapter`, `unsupported-vcs-adapter`, `bad-credentials`, `missing-credentials` join the existing `internal` / `unknown-quiz-id` set. #50 must surface user-friendly copy for each (e.g., "Your API key is invalid — re-check on the options page"). Out of scope here; #50 owns the modal-side copy.
+- **No new runtime deps** anywhere. `zod` (protocol), `monadyssey` (host), and existing adapter deps cover the change.
+- **Credential redaction is structural, not best-effort.** REDACT_PATHS catches the field name on any path (`*.credentials`, `*.apiKey`, `*.pat`); the host code must avoid building log payloads that bury creds inside non-listed wrappers. Reviewer-enforced via the new `logger.test.ts` cases.
+- **Reversibility high.** `registry.ts` is one file behind a typed interface; the dispatcher's only coupling is the `AdapterRegistry` type. A future overhaul (e.g., dynamic plugin loading) replaces `registry.ts` and the dispatcher is unchanged. The wire-format additions are additive — even rolling them back is a strict superset's deletion.
+- **Security posture documented, not magically improved.** v1 stores PATs / API keys in `chrome.storage.local` plaintext. The README explicitly calls this out. A future ADR may add OS-keychain integration via the native host; not in scope here.
+- **Diff-only invariant preserved.** Credentials and adapter IDs are user-supplied identity, not PR-derived. They never reach prompt construction. The reviewer's existing "no non-diff PR text reaches the LLM" gate is untouched.
+- **Binding for reviewer**:
+  - (a) `payload.credentials` MUST NEVER appear in `ErrorPayload.message` or `ErrorPayload.details` — registry-error frames echo field paths only, never values. Canary test in `registry.test.ts` and `dispatcher.test.ts` cover this.
+  - (b) `REDACT_PATHS` MUST include all listed paths; `logger.test.ts` asserts.
+  - (c) Adapter instances MUST NOT persist beyond a single `quiz-request` — no module-level state in `registry.ts`.
+  - (d) `registry.ts` exposes ONLY the `AdapterRegistry` interface and `createDefaultAdapterRegistry`; no per-adapter exports leak (adapters are imported privately).
+  - (e) Default adapter pair (`claude-cli` + `github`) applied at the dispatcher layer, NOT in the wire format — protocol stays version-agnostic.
+  - (f) The new `list-adapters-response` MUST NOT include credential schemas or any indication of adapter capabilities beyond the ID list. UI hints belong to the options page.
+  - (g) No new `throw`s; all expected failures route through `Either<RegistryError, _>` and the dispatcher's existing error-frame plumbing.
+
+---
+
+## ADR-23 (2026-05-22): Extension options page — adapter picker, credential inputs, chrome.storage.local persistence
+**Date**: 2026-05-22
+**Issue**: #50
+**Status**: Accepted
+
+### Context
+
+ADR-22 (#49) just shipped the host-side registry and made `quiz-request` carry `llmAdapterId`, `vcsAdapterId`, and a `credentials` bag. The host is now fully stateless w.r.t. user preferences — the **extension is the source of truth**. With nothing on the extension side to persist or send those fields yet, the M3 adapter matrix is unreachable from a real browser. The user cannot pick `claude-api` over `claude-cli`, cannot supply a GitHub PAT, cannot point at ADO.
+
+Five forces shape this design:
+
+- **Statelessness contract from ADR-22.** Persistence lives in the extension; the host never writes config. Extension code owns the schema for stored preferences.
+- **Diff-only invariant (CLAUDE.md §Key differentiator).** Credentials and adapter IDs are user identity, never PR-derived. The options page must not provide any path by which non-diff PR text reaches the LLM prompt — and indeed it touches no PR text at all, so the invariant is preserved by construction.
+- **Credential blast radius.** PATs / API keys are sensitive. v1 stores them in `chrome.storage.local` plaintext (ADR-22 explicitly accepted this as a v1 limitation). The options page UI must not echo credentials in error messages or logs.
+- **Bundle size discipline.** CLAUDE.md does not mandate "no UI libs," but the options page is ~150 LOC of dropdowns + textboxes. Pulling React/Vue/Svelte for this would bloat the MV3 zip and add a build-tool surface for no gain.
+- **Tight v1 scope.** The "Test connection" feature is genuinely useful — without it the user finds out their PAT is wrong only when they next try to approve a PR. A bare `ping` frame round-trip is the cheapest viable variant; a fuller adapter-probe is deferred.
+
+The PM spec resolves several questions up-front (storage keys, framework, ping-as-probe, deferred e2e). This ADR commits them and adds the missing technical detail: the **storage schema with versioning**, the **DOM structure and visibility model**, the **SW change** (read storage on every quiz-request), and the **first-run UX** (defaults + clear modal copy).
+
+### Decision
+
+A new WXT entrypoint `options/index.html` + `options/main.ts` renders a vanilla-TS form that:
+1. Discovers adapters via `list-adapters-request` to the native host on page load.
+2. Persists `{ schemaVersion, llmAdapterId, vcsAdapterId, credentials }` to `chrome.storage.local` under a single key on Save.
+3. Probes the host with a `ping` frame for "Test connection" — no LLM/VCS adapter is actually exercised in v1 (deferred to a richer probe in a follow-up).
+
+The service worker reads the stored selection on **every** outbound `quiz-request` and inlines `llmAdapterId` / `vcsAdapterId` / `credentials` into `payload`. No caching. On missing/corrupt storage the SW falls back to ADR-22's documented defaults (`claude-cli` + `github`) **without credentials**, letting the host return `missing-credentials`, which the modal surfaces with a "Configure in extension options" link.
+
+#### Affected workspaces
+
+- `packages/extension/` — new `options/` entrypoint, new `src/lib/options/` modules (storage, schema, DOM, probe), updated SW.
+- `packages/protocol/` — no changes. ADR-22 already shipped the wire shape, and `ping` / `pong` already exist (M1).
+- `packages/core/` — no changes. The options page is pure UI + extension storage; no domain logic.
+- `packages/host/`, `packages/adapters/*` — no changes.
+
+**Dependency arrows reaffirmed**:
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+```
+
+The options page imports from `@lgtm-buzzer/protocol` only (`FrameSchema`, `CredentialsBagSchema`, adapter-ID list types). It does **not** import from `@lgtm-buzzer/core` — there is no domain in this story. It does **not** import from `adapters` or `host` (forbidden anyway).
+
+#### Wire-shape choices (binding)
+
+| Choice | Decision |
+|---|---|
+| Framework | Vanilla TS + DOM, no React/Vue/Svelte. ~150 LOC budget. |
+| Page entrypoint | WXT `entrypoints/options/index.html` + `entrypoints/options/main.ts` (auto-wires `manifest.options_ui`). |
+| Storage backend | `chrome.storage.local` (NOT `sync` — credentials in cross-device sync is worse posture). |
+| Storage key | Single key `"lgtm_buzzer.options.v1"` holding a JSON object (one read, one write per save). Versioned key lets future schemas migrate. |
+| Storage schema | Validated with zod on every read; corrupt/missing storage → defaults. |
+| Adapter discovery | `list-adapters-request` to host via the SW (the options page uses the same SW relay as the CS — no direct `connectNative` from the page). |
+| Credential inputs | `<input type="password" autocomplete="off" spellcheck="false">` per required field; only rendered when the adapter requires credentials. |
+| Test connection | v1 sends a `ping` frame with a fresh nonce; success when `pong.payload.nonce` matches. Adapter-specific probe deferred. |
+| SW cache policy | No cache. Storage read on every `quiz-request` outbound. Simple, correct, ~µs cost. |
+| First-run UX | Storage absent → SW sends defaults (`claude-cli` + `github`) with no credentials → host returns `missing-credentials` → modal shows "Configure in extension options" link. |
+| New manifest permission | `"storage"` — required for `chrome.storage.local`. |
+| Options page `<-->` SW protocol | Reuses the existing `CSRequest` `send-frame` envelope (the SW already handles `Frame` opaquely; works from any extension page, not just content scripts). |
+| First-run defaults written? | No. Don't auto-write storage on install. Storage stays empty until the user saves. (Avoids confusing "Save successful but I didn't change anything" UX.) |
+
+#### Per-adapter credential UI (binding)
+
+The host's per-adapter zod schemas from ADR-22 are the contract. The options page mirrors them in a static lookup table (the host does not advertise schemas on the wire — ADR-22 §Consequences binding (f)):
+
+| Adapter ID | Required fields rendered |
+|---|---|
+| `claude-cli` | none — show "no credentials required" note |
+| `codex-cli` | none — show "no credentials required" note |
+| `copilot-cli` | none — show "no credentials required" note |
+| `claude-api` | `apiKey` (password input) |
+| `github` | `pat` (password input) |
+| `ado` | `pat` (password input) |
+
+This static map lives in `packages/extension/src/lib/options/adapter-creds.ts`. When a new adapter lands, the dev updates both the host registry (ADR-22) and this table — a follow-up ADR may collapse them, but for v1 the duplication is explicit and the test suite catches drift.
+
+If the host advertises an adapter ID the options page doesn't know about, the dropdown still shows it (the host is the source of truth on availability); selecting it renders an empty "no credentials required" note and a small warning: "Unknown adapter — credentials may be required by the host." Selecting an unknown adapter is allowed (defensive, not breaking).
+
+#### Types
+
+##### `packages/extension/src/lib/options/schema.ts` (new)
+
+```ts
+import { z } from "zod";
+import { CredentialsBagSchema } from "@lgtm-buzzer/protocol";
+
+/** Versioned storage schema. Increment SCHEMA_VERSION + write a migrator on shape changes. */
+export const STORAGE_KEY = "lgtm_buzzer.options.v1" as const;
+export const SCHEMA_VERSION = 1 as const;
+
+/**
+ * Per-adapter credentials map.
+ *
+ * Keyed by adapter ID so the user does not lose a saved PAT when they
+ * switch from `github` to `ado` and back. Each entry is itself an
+ * opaque `CredentialsBag` (from protocol).
+ */
+export const StoredCredentialsMapSchema = z.record(z.string(), CredentialsBagSchema);
+export type StoredCredentialsMap = z.infer<typeof StoredCredentialsMapSchema>;
+
+export const StoredOptionsSchema = z.object({
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  llmAdapterId: z.string().min(1).optional(),
+  vcsAdapterId: z.string().min(1).optional(),
+  credentials: StoredCredentialsMapSchema.optional(),
+});
+export type StoredOptions = z.infer<typeof StoredOptionsSchema>;
+
+/** Defaults applied when storage is empty or corrupt. */
+export const DEFAULT_OPTIONS: StoredOptions = {
+  schemaVersion: SCHEMA_VERSION,
+  // llmAdapterId / vcsAdapterId / credentials intentionally undefined —
+  // the SW falls back to ADR-22 host defaults when absent.
+};
+```
+
+**Why one nested object under one key?** Single read + single write per save = atomic. The PM spec listed three keys (`llmAdapterId`, `vcsAdapterId`, `credentials`); the ADR consolidates to one root key under a `schemaVersion` envelope. This is a deliberate variance from the spec to (a) make schema evolution cheap and (b) match the standard "one storage key per extension domain" pattern. The PM spec's intent (separable fields, zod-validated) is preserved — they just live inside one envelope.
+
+##### `packages/extension/src/lib/options/storage.ts` (new)
+
+```ts
+export type StorageError =
+  | { readonly kind: "absent" }
+  | { readonly kind: "corrupt"; readonly issues: ReadonlyArray<string> }
+  | { readonly kind: "io"; readonly detail: string };
+
+export type OptionsStore = {
+  /**
+   * Read the stored options. Always resolves; corrupt or absent storage
+   * yields `Left<{ kind }>`. The SW maps `Left` → use defaults.
+   */
+  readonly read: () => Promise<Either<StorageError, StoredOptions>>;
+  /**
+   * Write the stored options atomically. Rejects only on quota / IO.
+   * Resolves with `Right<void>` on success.
+   */
+  readonly write: (options: StoredOptions) => Promise<Either<StorageError, void>>;
+  /** Clear all stored options. Used by tests + a "reset" UI button. */
+  readonly clear: () => Promise<Either<StorageError, void>>;
+};
+
+/**
+ * Minimal `chrome.storage.local`-shaped surface for injection.
+ * Tests pass a fake; production passes `chrome.storage.local` from `wxt/browser`.
+ */
+export type StorageArea = {
+  readonly get: (key: string) => Promise<Record<string, unknown>>;
+  readonly set: (items: Record<string, unknown>) => Promise<void>;
+  readonly remove: (key: string) => Promise<void>;
+};
+
+export const createOptionsStore = (deps: { readonly area: StorageArea }): OptionsStore;
+```
+
+The `Either` type is the project's standard from `monadyssey`. The extension workspace is allowed to reach for monadyssey "when a specific piece of logic genuinely benefits" (CLAUDE.md §Dependency rules). Storage IO is one of those places — three error kinds + sync-vs-async make a `Promise<Either<E, A>>` shape clearer than a thrown error or a discriminated `{ ok, value | error }`. Document the use in `packages/extension/README.md`.
+
+##### `packages/extension/src/lib/options/adapter-creds.ts` (new)
+
+```ts
+/** Static per-adapter credential UI specification (mirrors host registry from ADR-22). */
+export type CredFieldSpec = {
+  readonly key: string;        // The bag key, e.g. "apiKey" / "pat".
+  readonly label: string;      // The UI label.
+  readonly placeholder: string;
+};
+
+export type AdapterCredsSpec = {
+  readonly adapterId: string;
+  readonly category: "llm" | "vcs";
+  readonly fields: ReadonlyArray<CredFieldSpec>;
+  readonly note?: string;      // e.g. "no credentials required"
+};
+
+export const ADAPTER_CREDS_SPECS: ReadonlyArray<AdapterCredsSpec> = [
+  { adapterId: "claude-cli",  category: "llm", fields: [], note: "no credentials required" },
+  { adapterId: "codex-cli",   category: "llm", fields: [], note: "no credentials required" },
+  { adapterId: "copilot-cli", category: "llm", fields: [], note: "no credentials required" },
+  { adapterId: "claude-api",  category: "llm",
+    fields: [{ key: "apiKey", label: "API key", placeholder: "sk-ant-..." }] },
+  { adapterId: "github", category: "vcs",
+    fields: [{ key: "pat", label: "Personal access token", placeholder: "ghp_..." }] },
+  { adapterId: "ado", category: "vcs",
+    fields: [{ key: "pat", label: "Personal access token", placeholder: "azp_..." }] },
+];
+
+export const getCredsSpec = (adapterId: string): AdapterCredsSpec | undefined =>
+  ADAPTER_CREDS_SPECS.find((s) => s.adapterId === adapterId);
+```
+
+##### `packages/extension/src/lib/options/probe.ts` (new)
+
+```ts
+export type ProbeError =
+  | { readonly kind: "host-not-installed" }
+  | { readonly kind: "nonce-mismatch" }
+  | { readonly kind: "internal";    readonly message: string }
+  | { readonly kind: "host-error";  readonly reason: string; readonly message: string };
+
+export type Probe = (input: {
+  readonly llmAdapterId: string;
+  readonly vcsAdapterId: string;
+  readonly credentials: CredentialsBag;
+}) => Promise<Either<ProbeError, "ok">>;
+
+export const createProbe = (deps: {
+  readonly sendFrame: (frame: Frame) => Promise<Frame>;
+  readonly newCorrelationId: () => string;
+  readonly newNonce: () => string;
+}): Probe;
+```
+
+**v1 binding**: the probe sends a `ping` frame with a fresh nonce and asserts a `pong` reply with the matching nonce. The `llmAdapterId` / `vcsAdapterId` / `credentials` are accepted in the input only for forward compatibility — a follow-up issue (deferred, not blocking M3) will swap `ping` for a real adapter-probe frame that the host runs through the registry. The probe input is wired today so the UI does not change when that swap happens.
+
+##### `packages/extension/src/lib/options/dom.ts` (new)
+
+```ts
+export type OptionsDOMDeps = {
+  readonly doc: Document;
+  readonly root: HTMLElement;
+  readonly store: OptionsStore;
+  readonly listAdapters: () => Promise<Either<ListAdaptersError, AdapterCatalog>>;
+  readonly probe: Probe;
+  readonly logger?: { readonly warn: (msg: string, ctx?: Record<string, unknown>) => void };
+};
+
+export type AdapterCatalog = { readonly llm: readonly string[]; readonly vcs: readonly string[] };
+
+export type ListAdaptersError =
+  | { readonly kind: "host-not-installed" }
+  | { readonly kind: "host-error"; readonly reason: string; readonly message: string }
+  | { readonly kind: "internal";   readonly message: string };
+
+export type OptionsView = {
+  readonly mount: () => Promise<void>;
+  readonly unmount: () => void;
+};
+
+export const createOptionsView = (deps: OptionsDOMDeps): OptionsView;
+```
+
+The DOM module renders into a caller-supplied `root` element (the entrypoint's `<main>`), so the unit tests can mount it inside a jsdom `Document` without touching `document.body`.
+
+##### `packages/extension/src/lib/options/sw-bridge.ts` (new)
+
+```ts
+/**
+ * Sends a Frame to the SW from the options page via `chrome.runtime.sendMessage`.
+ * Identical contract to the CS-side `sendFrame` in `entrypoints/content.ts` —
+ * extracted here so the options page does not duplicate the wrapper.
+ *
+ * The CS-side wrapper stays in `entrypoints/content.ts` for now; a follow-up
+ * may unify them into a single `packages/extension/src/lib/sw-bridge.ts`.
+ */
+export const createSWBridge = (deps: {
+  readonly sendMessage: (msg: unknown) => Promise<unknown>;
+}): { readonly sendFrame: (frame: Frame) => Promise<Frame> };
+
+/** Wraps `sendFrame` into a `list-adapters-request` round-trip with typed errors. */
+export const createListAdapters = (deps: {
+  readonly sendFrame: (frame: Frame) => Promise<Frame>;
+  readonly newCorrelationId: () => string;
+}): () => Promise<Either<ListAdaptersError, AdapterCatalog>>;
+```
+
+##### `packages/extension/src/lib/options/storage-reader.ts` (new) — used by the SW
+
+```ts
+/**
+ * Read stored options from chrome.storage.local. Used by the SW on every
+ * outbound `quiz-request` to inline `llmAdapterId` / `vcsAdapterId` / `credentials`.
+ *
+ * Returns the *projection* needed by the SW — not the full `StoredOptions` — so
+ * the SW does not have to know about `schemaVersion` etc.
+ */
+export type SwOptionsProjection = {
+  readonly llmAdapterId: string | undefined;
+  readonly vcsAdapterId: string | undefined;
+  readonly credentials: CredentialsBag | undefined;
+};
+
+export const readSwOptions = (deps: {
+  readonly store: OptionsStore;
+}): () => Promise<SwOptionsProjection>;
+```
+
+On `Left` (`absent`, `corrupt`, `io`), the projection returns `{ llmAdapterId: undefined, vcsAdapterId: undefined, credentials: undefined }`. The host then applies its ADR-22 defaults; if those defaults need credentials and none are present, the host returns `missing-credentials` and the modal's existing error-result rendering path fires.
+
+##### SW change — `entrypoints/background.ts` + `packages/extension/src/lib/router.ts`
+
+The SW must inject the storage projection into outbound `quiz-request` frames **only**. Other frames (`ping`, `quiz-submit`, `list-adapters-request`) pass through untouched (`quiz-submit` already carries a `quizId` keying the host-side session — re-injecting creds there would be a credential re-leak surface for no value).
+
+The cleanest place to splice this in is the **router** (`createCSMessageHandler`): before calling `portClient.sendFrame`, if `request.frame.kind === "quiz-request"`, read storage and replace `frame.payload` with the merged object. A new dep on `createCSMessageHandler` carries the storage reader:
+
+```ts
+export type RouterDeps = {
+  readonly portClient: PortClient;
+  readonly readSwOptions: () => Promise<SwOptionsProjection>;   // NEW
+  readonly logger?: RouterLogger;
+};
+```
+
+The merge rule:
+
+```ts
+const merged: QuizRequestPayload = {
+  ...request.frame.payload,
+  // Storage-supplied values OVERRIDE any payload the CS already set.
+  // (The CS does not currently set these — but if a future content script
+  // wanted to, the options page must remain authoritative.)
+  llmAdapterId: projection.llmAdapterId ?? request.frame.payload.llmAdapterId,
+  vcsAdapterId: projection.vcsAdapterId ?? request.frame.payload.vcsAdapterId,
+  credentials:  projection.credentials  ?? request.frame.payload.credentials,
+};
+```
+
+If `projection.credentials` and `request.frame.payload.credentials` both exist, the projection wins. (Per-adapter credentials live under their adapter ID in `StoredCredentialsMap`; the SW projects only the entry for the chosen `llmAdapterId` + `vcsAdapterId`, merged into a single bag.) The projection helper handles the merge:
+
+```ts
+// inside readSwOptions
+const llmCreds = options.credentials?.[options.llmAdapterId ?? ""] ?? {};
+const vcsCreds = options.credentials?.[options.vcsAdapterId ?? ""] ?? {};
+const credentials = { ...llmCreds, ...vcsCreds };
+return {
+  llmAdapterId: options.llmAdapterId,
+  vcsAdapterId: options.vcsAdapterId,
+  credentials: Object.keys(credentials).length > 0 ? credentials : undefined,
+};
+```
+
+**Conflict policy**: if the LLM creds and VCS creds both define the same key (e.g., both define `pat`), the VCS creds win because they are merged last. This is fine for v1 — the only overlapping field in the registry is `pat`, and only VCS adapters define it. If LLM and VCS adapters ever conflict on a key, ADR-22's per-adapter zod still validates each adapter's slice; the host slices the wire bag back per-adapter at construction time, so the field overlap is benign on the wire (the host does not get to see "this `pat` came from the github adapter"). To avoid relying on this fragility past v1, a follow-up issue may shift the wire format to a nested `credentials: { llm: ..., vcs: ... }` shape — out of scope here.
+
+#### Functions and methods
+
+`packages/extension/src/lib/options/storage.ts`:
+
+```ts
+export const createOptionsStore = (deps: { readonly area: StorageArea }): OptionsStore;
+```
+
+`packages/extension/src/lib/options/storage-reader.ts`:
+
+```ts
+export const readSwOptions = (deps: { readonly store: OptionsStore }): () => Promise<SwOptionsProjection>;
+```
+
+`packages/extension/src/lib/options/sw-bridge.ts`:
+
+```ts
+export const createSWBridge = (deps: {
+  readonly sendMessage: (msg: unknown) => Promise<unknown>;
+}): { readonly sendFrame: (frame: Frame) => Promise<Frame> };
+
+export const createListAdapters = (deps: {
+  readonly sendFrame: (frame: Frame) => Promise<Frame>;
+  readonly newCorrelationId: () => string;
+}): () => Promise<Either<ListAdaptersError, AdapterCatalog>>;
+```
+
+`packages/extension/src/lib/options/probe.ts`:
+
+```ts
+export const createProbe = (deps: {
+  readonly sendFrame: (frame: Frame) => Promise<Frame>;
+  readonly newCorrelationId: () => string;
+  readonly newNonce: () => string;
+}): Probe;
+```
+
+`packages/extension/src/lib/options/dom.ts`:
+
+```ts
+export const createOptionsView = (deps: OptionsDOMDeps): OptionsView;
+```
+
+`packages/extension/src/lib/options/adapter-creds.ts`:
+
+```ts
+export const getCredsSpec = (adapterId: string): AdapterCredsSpec | undefined;
+```
+
+`packages/extension/src/lib/router.ts` — modified `createCSMessageHandler` signature:
+
+```ts
+export type RouterDeps = {
+  readonly portClient: PortClient;
+  readonly readSwOptions: () => Promise<SwOptionsProjection>;   // NEW
+  readonly logger?: RouterLogger;
+};
+```
+
+#### File layout
+
+**New (extension)**:
+
+- `packages/extension/entrypoints/options/index.html`
+- `packages/extension/entrypoints/options/main.ts`
+- `packages/extension/src/lib/options/schema.ts` + `.test.ts`
+- `packages/extension/src/lib/options/storage.ts` + `.test.ts`
+- `packages/extension/src/lib/options/storage-reader.ts` + `.test.ts`
+- `packages/extension/src/lib/options/sw-bridge.ts` + `.test.ts`
+- `packages/extension/src/lib/options/probe.ts` + `.test.ts`
+- `packages/extension/src/lib/options/adapter-creds.ts` + `.test.ts`
+- `packages/extension/src/lib/options/dom.ts` + `.test.ts`
+- `packages/extension/src/lib/options/index.ts` — barrel for the entrypoint.
+
+**Modified (extension)**:
+
+- `packages/extension/wxt.config.ts` — add `"storage"` to `manifest.permissions`. (Do **not** add `options_ui`/`options_page` manually — WXT auto-detects the `entrypoints/options/` folder and synthesizes `options_page: "options.html"`. Verify by inspecting `.output/<browser>-mv3/manifest.json` after `wxt build`.)
+- `packages/extension/src/lib/router.ts` — add `readSwOptions` dep; inject projection into `quiz-request` payload.
+- `packages/extension/src/lib/router.test.ts` — new cases (see Test strategy).
+- `packages/extension/entrypoints/background.ts` — construct `OptionsStore` + `readSwOptions` and pass into `createCSMessageHandler`.
+- `packages/extension/package.json` — add `monadyssey` (pinned exact version, same as adapters use) per CLAUDE.md §Dependency rules — `Either` for the options storage layer.
+- `packages/extension/README.md` — new section "Options page" with: storage posture (plaintext, not encrypted), where the file lives, link to ADR-22 + ADR-23, planned future ADR for OS-keychain.
+
+**Modified (modal — minor copy)**:
+
+- `packages/extension/src/lib/dom/modal.ts` — when `error` outcome carries `reason: "missing-credentials"` or `reason: "bad-credentials"`, render a copy line: "Configure credentials in the LGTM-Buzzer options page" with an `<a href="#" data-action="open-options">` that, on click, dispatches a `DOMEvent` that the CS forwards to the SW which opens the options page via `chrome.runtime.openOptionsPage()`. **Scope guard**: only the copy + click-through wiring is in this ADR; if the wiring grows beyond ~30 LOC, defer it to a separate issue. The "open options" action requires no new permissions.
+- `packages/extension/src/lib/dom/modal.test.ts` — assert the copy renders on the two error reasons.
+
+**Unchanged**:
+
+- `packages/protocol/**` — no changes.
+- `packages/core/**` — no changes.
+- `packages/host/**` — no changes.
+- `packages/adapters/**` — no changes.
+
+#### Sequence
+
+##### A. Options page first load
+
+1. User opens `chrome-extension://<id>/options.html` (via the toolbar icon's "Options" link or the modal's "Configure credentials" link).
+2. `main.ts` constructs:
+   - `area = browser.storage.local` (wrapped to the `StorageArea` shape).
+   - `store = createOptionsStore({ area })`.
+   - `sendMessage = browser.runtime.sendMessage`.
+   - `bridge = createSWBridge({ sendMessage })`.
+   - `listAdapters = createListAdapters({ sendFrame: bridge.sendFrame, newCorrelationId: crypto.randomUUID })`.
+   - `probe = createProbe({ sendFrame: bridge.sendFrame, newCorrelationId: crypto.randomUUID, newNonce: crypto.randomUUID })`.
+   - `view = createOptionsView({ doc: document, root: document.querySelector("main")!, store, listAdapters, probe })`.
+3. `view.mount()`:
+   - Calls `store.read()` to hydrate the form. On `Left<absent>`, fall back to defaults (no prior selection).
+   - Calls `listAdapters()` to populate the two `<select>` elements.
+     - On `Left<host-not-installed>`: render an instructive banner ("Native host not installed. Run `node packages/host/dist/install-manifest.js` and reload.").
+     - On `Left<host-error>`: render a banner with the host's `reason` + `message`.
+     - On `Right`: populate the dropdowns; pre-select the stored values if present.
+   - Renders the credential inputs corresponding to the currently selected adapter pair (per `getCredsSpec`).
+4. Dropdown change handlers re-render only the credential inputs (no full re-mount).
+5. Save handler validates form input via `StoredOptionsSchema.safeParse(...)`, calls `store.write(options)`, renders a dismissable green check "Save successful".
+6. Test connection handler reads the form's current state (NOT storage — the user may not have saved yet), calls `probe({ llmAdapterId, vcsAdapterId, credentials })`. Renders success / error banner. The banner copy NEVER includes credential bytes; on `Left<host-error>` show `reason` + `message` from the host's error frame; the host already redacts credentials per ADR-22 §Binding (a).
+
+##### B. SW reads storage on every quiz-request
+
+1. CS detects Approve click → builds a `quiz-request` `Frame` with `payload: { pr, questionCount }` (no adapter fields, no creds — the CS knows nothing about user prefs).
+2. CS calls `browser.runtime.sendMessage({ kind: "send-frame", frame })`.
+3. SW's `createCSMessageHandler` validates the message, then:
+   - If `frame.kind === "quiz-request"`: `const projection = await readSwOptions()`. Merge `projection` into `frame.payload`. Call `portClient.sendFrame(mergedFrame, tabId)`.
+   - Else (other kinds): pass through unchanged.
+4. Host receives the merged `quiz-request`, applies ADR-22 defaults if any field still absent, constructs adapter pair per-request, runs the quiz pipeline.
+5. SW relays the reply back to the CS unchanged.
+
+##### C. Modal "Configure in options" link
+
+1. Modal receives a `quiz-result` DOM event with `outcome.kind === "error"`, `outcome.reason === "missing-credentials"`.
+2. Modal renders the existing error panel + an additional "Configure credentials in the LGTM-Buzzer options page" link.
+3. User clicks → emit a `DOM_EVENTS.openOptions` event with no payload.
+4. CS catches the event → `browser.runtime.sendMessage({ kind: "open-options" })`.
+5. SW handles `open-options` → calls `browser.runtime.openOptionsPage()`.
+
+(`DOM_EVENTS.openOptions` is a new event name; the CS-side wiring stays under the ~30-LOC scope guard. If it grows, file a follow-up.)
+
+##### Diff-flow audit (required by CLAUDE.md §Key differentiator)
+
+The options page sees no PR data. `payload.credentials` is the only non-`pr` field on `quiz-request`; the SW only adds adapter selection + credentials; the host already enforces that `credentials` never reaches prompt construction (ADR-22). No path in this ADR touches PR text. **Diff-only invariant preserved.**
+
+#### Error cases
+
+| Trigger | UX |
+|---|---|
+| `list-adapters` fails with `host-not-installed` (port connect threw / no manifest) | Banner: "Native host not installed. Run the installer and reload." Dropdowns disabled. Save disabled. |
+| `list-adapters` returns `host-error` (any other) | Banner: "Failed to load adapters: \<message>". Retry button. |
+| `store.read()` returns `Left<corrupt>` | Toast: "Stored options were corrupt and have been reset." Defaults loaded. (The reviewer asserts that "corrupt" is not silently swallowed.) |
+| `store.write()` returns `Left<io>` (quota / disabled) | Banner: "Failed to save options: \<message>". |
+| `probe` returns `Left<host-not-installed>` | Banner: "Test connection failed: native host not installed." |
+| `probe` returns `Left<nonce-mismatch>` | Banner: "Test connection failed: host returned an unexpected response." |
+| `probe` returns `Left<host-error>` with `reason: "bad-credentials"` | Banner: "Credentials rejected by the adapter. Re-enter and try again." (NEVER echo the credential.) |
+| `probe` returns `Left<host-error>` with any other `reason` | Banner: "Test connection failed: \<message>". |
+| Empty required field on Save | Inline error next to the field; Save blocked. |
+| User selects an adapter the host did not advertise (e.g., dev typed it into storage manually) | Warning banner: "Unknown adapter — credentials may be required by the host." |
+| Modal sees `reason: "missing-credentials"` on a quiz request | Render the existing error UI + "Configure in options" link. |
+
+All expected failures travel as `Promise<Either<E, A>>` (CLAUDE.md idiom #1). No `throw` in the options page modules except for invariant violations (e.g., missing `<main>` root in the HTML, which is a programmer error).
+
+#### Security guardrails (binding)
+
+- Credential inputs use `type="password" autocomplete="off" spellcheck="false"`. Browser autofill stays under user control.
+- `chrome.storage.local` is plaintext; the options-page README + an on-page footnote both state this (v1 limitation). No promises of encryption that we do not deliver.
+- The options page **must not** `console.log` any credential or any object that may transitively contain credentials. Reviewer-enforced: greppable rule "no `console.log` of any object derived from form state or `store.read()`." The page may log adapter IDs and high-level events.
+- Probe error banners surface only `reason` + `message` from the host's error frame. The host (ADR-22) already redacts credential bytes from those fields; no further filtering is needed on the extension side, but the reviewer should assert that no credential bytes appear in the rendered DOM (a canary unit test on the DOM module with a known-bad creds value asserts the rendered HTML does not contain the bytes).
+- The `"storage"` permission grants access to all of the extension's `chrome.storage.local`. No other code in this extension reads from any other key; the SW reads only `STORAGE_KEY`. Reviewer-enforced via a grep test that `chrome.storage.local.get` is called only with `STORAGE_KEY`.
+
+#### Test strategy
+
+All tests use Vitest + jsdom (Vitest workspace already configured). No new tooling.
+
+**`schema.test.ts`** (new, ≥5):
+1. Empty storage → `read()` returns `Left<absent>`.
+2. Valid stored options round-trip through `StoredOptionsSchema`.
+3. Wrong `schemaVersion` → `Left<corrupt>`.
+4. Non-string value inside `credentials` → `Left<corrupt>`.
+5. `llmAdapterId: ""` (empty) → `Left<corrupt>`.
+
+**`storage.test.ts`** (new, ≥6):
+1. `read` of empty storage → `Left<absent>`.
+2. `read` of valid stored options → `Right<StoredOptions>`.
+3. `read` of corrupt JSON → `Left<corrupt>` with non-empty `issues`.
+4. `write` of valid options → underlying `area.set` called with `{ [STORAGE_KEY]: <serialised> }`.
+5. `write` failure (fake `set` throws) → `Left<io>`.
+6. `clear` removes the key (`area.remove` called with `STORAGE_KEY`).
+
+**`storage-reader.test.ts`** (new, ≥5):
+1. Empty storage → projection is `{ llmAdapterId: undefined, vcsAdapterId: undefined, credentials: undefined }`.
+2. Stored `{ llmAdapterId: "claude-api", credentials: { "claude-api": { apiKey: "x" } } }` → projection `{ llmAdapterId: "claude-api", vcsAdapterId: undefined, credentials: { apiKey: "x" } }`.
+3. Stored LLM + VCS both with creds → projection merges both bags.
+4. Stored `llmAdapterId` set but no `credentials` entry → `credentials: undefined` (do not emit empty `{}`).
+5. Corrupt storage → projection is all-`undefined` (no `throw`).
+
+**`sw-bridge.test.ts`** (new, ≥4):
+1. `sendFrame` validates the SW reply against `CSResponseSchema`; well-formed `{ kind: "frame", frame }` → resolves with the frame.
+2. SW reply `{ kind: "sw-error" }` → resolves with a synthetic `ErrorFrame` (matches the CS-side wrapper's contract).
+3. `sendMessage` throws → resolves with a synthetic `ErrorFrame` (no rejection).
+4. `createListAdapters` round-trips a `list-adapters-request` → `list-adapters-response`; returns `Right<{ llm, vcs }>`. Host-not-installed (sendFrame returns `ErrorFrame { reason: "internal", message: ... }` with the specific connect-failed signature) → `Left<host-not-installed>`.
+
+**`probe.test.ts`** (new, ≥4):
+1. Round-trips `ping` with nonce `"abc"` → host replies `pong` with `nonce: "abc"` → `Right<"ok">`.
+2. Host replies `pong` with a different nonce → `Left<nonce-mismatch>`.
+3. Host replies `ErrorFrame { reason: "bad-credentials", ... }` → `Left<host-error>` with the reason propagated. (v1 cannot actually trigger this with `ping`, but the mapping is wired now for the future swap.)
+4. Connect failed → `Left<host-not-installed>`.
+
+**`adapter-creds.test.ts`** (new, ≥3):
+1. `getCredsSpec("claude-cli")` → fields empty, note "no credentials required".
+2. `getCredsSpec("claude-api")` → fields contain exactly one entry `{ key: "apiKey" }`.
+3. `getCredsSpec("unknown")` → `undefined`.
+
+**`dom.test.ts`** (new, ≥10) — jsdom-driven:
+1. Mount with empty storage + a fake `listAdapters` returning `{ llm: ["claude-cli", "claude-api"], vcs: ["github", "ado"] }` → both dropdowns populated, no pre-selection.
+2. Selecting `claude-api` → credential input with placeholder `sk-ant-...` appears.
+3. Selecting `claude-cli` → no input rendered, note "no credentials required" visible.
+4. Filling in the form + clicking Save → `store.write` called with the expected `StoredOptions`.
+5. Save → success banner rendered; dismiss button hides it.
+6. Test-connection success → green banner.
+7. Test-connection `bad-credentials` → red banner with the documented copy "Credentials rejected by the adapter."
+8. List-adapters `host-not-installed` → instructive banner; dropdowns + save + test buttons disabled.
+9. **Security canary**: form populated with credential `"SECRET_CANARY_xxx"`; probe rejected with `host-error { reason: "bad-credentials" }`; assert `document.body.innerHTML` does NOT contain `"SECRET_CANARY_xxx"`.
+10. Selecting an unknown-to-the-spec adapter ID → warning banner; save still enabled.
+
+**`router.test.ts`** — extend (≥3):
+1. `quiz-request` with empty storage → SW forwards a `quiz-request` to the port client with `llmAdapterId/vcsAdapterId/credentials` all `undefined`.
+2. `quiz-request` with stored `{ llmAdapterId: "claude-api", credentials: { "claude-api": { apiKey: "k" } } }` → SW forwards with `payload.llmAdapterId === "claude-api"` and `payload.credentials.apiKey === "k"`.
+3. `ping` frame from a CS → SW passes it through unchanged (no storage read; no credential leakage to a `ping`).
+
+**`modal.test.ts`** — extend (≥2):
+1. `quiz-result` outcome `error { reason: "missing-credentials" }` → modal renders "Configure credentials in the LGTM-Buzzer options page" link.
+2. Clicking the link emits the `openOptions` DOM event.
+
+**Coverage**: ≥85% on every new file. The options page modules are mostly straight-line code; the targets are achievable without contrived branches.
+
+**End-to-end**: deferred to #51. This PR ships no Playwright coverage for the options page. The dom.test.ts security canary plus the modal copy test are the v1 acceptance line for credential safety.
+
+### Consequences
+
+- **The user can now choose their adapter pair and supply credentials.** The host became wire-driven in ADR-22; this ADR makes the wire fields user-controllable in a real browser, closing the M3 prerequisite loop for #59 v2 (claude-api) and #48 (ADO).
+- **No new runtime deps to `core` or `protocol`.** The extension adopts `monadyssey` (already an allowed dep per CLAUDE.md), pinned to the same exact version as the adapters use. This is the first place outside `adapters/host` where `monadyssey` ships in the extension.
+- **`"storage"` permission added to the manifest.** Single new permission, fully documented. Listed in the Chrome Web Store description.
+- **`chrome.storage.local` is plaintext.** Documented in the options page footnote + the extension README. A future ADR explores OS-keychain integration; explicitly out of scope.
+- **SW reads storage on every quiz-request.** Simplicity wins over caching. The cost is one `chrome.storage.local.get` per Approve click; that is microseconds and runs in parallel with the rest of the request assembly. If profiling shows this dominates, ADR-N+1 adds a TTL cache.
+- **One stored key, versioned envelope.** `lgtm_buzzer.options.v1`. Schema bumps replace the key suffix and write a migrator. (v1 → v2 migration is out of scope; the contract just says the SW always reads the current-version key.)
+- **Modal grows a "Configure in options" link.** Small change; copy-tested via jsdom. The "open options page" plumbing through CS → SW → `chrome.runtime.openOptionsPage()` adds three small wires; if any of them grow, defer to a follow-up.
+- **`monadyssey-fetch` is NOT added to the extension.** The probe goes through the existing native-messaging pipeline, not HTTP. Future probe flavours (HTTP from the options page) would need a separate ADR — the current dependency rules don't expect raw `fetch` in the extension.
+- **First-run UX is "missing-credentials" guided.** No auto-write of defaults to storage on install. The user opening the modal triggers `missing-credentials` → modal copy points them to options. This is intentional friction; "you must configure credentials" is the only correct posture for a tool that holds PATs.
+- **Reversibility high.** The options page lives behind one entrypoint folder. Removing the feature (rolling back to env-driven host config) is one folder delete + one router-dep removal + manifest permission drop. Storage cleanup is `chrome.storage.local.clear()` once.
+- **Diff-only invariant preserved.** No path from this ADR introduces non-diff PR text to the prompt. Credentials and adapter IDs are user identity, not PR content. Verified by code-path audit in §Sequence-D.
+
+**Binding for the reviewer**:
+- (a) The options page MUST NOT log or render credential bytes. Canary test asserts (dom.test.ts §9).
+- (b) The SW MUST inject the storage projection ONLY into `quiz-request` frames. Other frame kinds pass through. Router test §3 asserts.
+- (c) The SW MUST NOT cache the storage read. Each quiz-request causes a fresh `chrome.storage.local.get`. (Future cache requires a new ADR.)
+- (d) `chrome.storage.local.get` MUST be called only with `STORAGE_KEY` from this ADR. Greppable rule.
+- (e) No new permission beyond `"storage"`. The "open options page" wire uses the existing `chrome.runtime.openOptionsPage()` API which needs no permission.
+- (f) Storage corruption MUST surface to the UI (toast or banner) — never silently overwritten with defaults without telling the user.
+- (g) No new `throw` outside invariant violations; all expected failures route through `Promise<Either<E, A>>`.
+
+---

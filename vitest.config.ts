@@ -54,16 +54,22 @@ export default defineConfig({
             ...sharedExclude,
             // DOM tests handled by the jsdom project below.
             "packages/extension/src/lib/dom/**",
+            // Options dom test uses DOM APIs — handled by the jsdom project.
+            "packages/extension/src/lib/options/dom.test.ts",
           ],
           passWithNoTests: true,
         },
       })),
-      // extension/src/lib/dom/** tests run in jsdom (ADR-18).
+      // extension DOM tests run in jsdom (ADR-18, extended by ADR-23).
       mergeConfig(sharedBase, defineProject({
         test: {
           name: "jsdom",
           environment: "jsdom",
-          include: ["packages/extension/src/lib/dom/**/*.test.ts"],
+          include: [
+            "packages/extension/src/lib/dom/**/*.test.ts",
+            // Options dom module uses DOM APIs (ADR-23).
+            "packages/extension/src/lib/options/dom.test.ts",
+          ],
           exclude: sharedExclude,
           passWithNoTests: true,
         },
