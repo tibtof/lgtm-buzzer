@@ -8,8 +8,8 @@ import {
   addDOMEventListener,
 } from "./dom-events.js";
 import { detectPRPage } from "./page-detection.js";
-import { setupApproveInterceptor } from "./approve-intercept.js";
-import type { ApproveBlockedEvent } from "./approve-intercept.js";
+import type { InterceptedApproveEvent } from "./approve-intercept.js";
+import type { NavigationWatcher } from "./navigation.js";
 import { CSResponseSchema } from "../cs-protocol.js";
 
 /**
@@ -30,6 +30,20 @@ export type QuizFlowLogger = {
   readonly warn: (msg: string, ctx?: Record<string, unknown>) => void;
 };
 
+/**
+ * Factory function that wires a platform-specific approve interceptor.
+ *
+ * Receives the platform-agnostic deps surface and returns a dispose function.
+ * The GitHub factory wraps `setupApproveInterceptor`; the ADO factory wraps
+ * `setupAdoVoteInterceptor`. New platforms follow the same pattern.
+ */
+export type InterceptorFactory = (deps: {
+  readonly doc: Document;
+  readonly getCurrentPR: () => PRIdentifier | null;
+  readonly shouldBypass: () => boolean;
+  readonly onBlocked: (e: InterceptedApproveEvent) => void;
+}) => () => void;
+
 /** Dependencies injected into `createQuizFlowController`. */
 export type QuizFlowDeps = {
   /** The document used for event dispatch and listener attachment. */
@@ -43,6 +57,16 @@ export type QuizFlowDeps = {
   readonly newCorrelationId: () => string;
   /** Returns a new, unique request id for each Approve-click intercept. */
   readonly newRequestId: () => string;
+  /**
+   * Platform-specific interceptor factory. Called once during `start()`.
+   * GitHub: wraps `setupApproveInterceptor`. ADO: wraps `setupAdoVoteInterceptor`.
+   */
+  readonly setupInterceptor: InterceptorFactory;
+  /**
+   * Platform-specific SPA navigation watcher. Called once during `start()`.
+   * GitHub: uses Turbo events. ADO: uses popstate + MutationObserver URL poll.
+   */
+  readonly navigationWatcher: NavigationWatcher;
   /** Optional structured logger for unexpected-state warnings. */
   readonly logger?: QuizFlowLogger;
 };
@@ -60,11 +84,10 @@ export type QuizFlowController = {
   readonly stop: () => void;
 };
 
-/** Represents a pending Approve submit waiting for a quiz result. */
+/** Represents a pending Approve action waiting for a quiz result. */
 type PendingApprove = {
   readonly requestId: string;
-  readonly form: HTMLFormElement;
-  readonly submitter: HTMLElement | null;
+  readonly blocked: InterceptedApproveEvent;
   readonly pr: PRIdentifier;
 };
 
@@ -84,34 +107,44 @@ const makeSyntheticErrorFrame = (
 
 /**
  * Creates the quiz flow controller that orchestrates the full Approve →
- * quiz → result → re-submit flow.
+ * quiz → result → re-submit/re-click flow.
  *
- * Lifecycle (per ADR-18 §Sequence):
- * 1. `start()` detects PR, attaches capture-phase submit listener, Turbo
- *    event listeners, MutationObserver fallback, and quiz-event listeners.
+ * Lifecycle (per ADR-18 + ADR-21):
+ * 1. `start()` detects PR, wires the injected `setupInterceptor` and
+ *    `navigationWatcher`, attaches MutationObserver fallback (GitHub only via
+ *    Turbo; ADO via navigation watcher), and quiz-event listeners.
  * 2. User clicks Approve → interceptor fires → quiz request frame sent.
  * 3. SW replies with `QuizResponseFrame` → `quiz-result { quiz-ready }` event.
  * 4. User submits answers → `quiz-submit` event → `QuizSubmitFrame` sent.
  * 5. SW replies with `QuizResultFrame` → on pass: bypass flag set,
- *    `requestSubmit` called; on fail: `quiz-failed` event.
- * 6. `turbo:before-visit` clears pending + bypass.
+ *    replay action (GitHub: `requestSubmit`; ADO: `element.click()`);
+ *    on fail: `quiz-failed` event.
+ * 6. Navigation `onWillNavigate` clears pending + bypass.
  * 7. `quiz-cancel` drops pending; SW times out naturally.
  *
  * Module-scoped `approveBypass` flag (ADR-18 §Decision 4): never on `window`.
  */
 export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController => {
-  const { doc, sendFrame, newCorrelationId, newRequestId, logger } = deps;
+  const {
+    doc,
+    sendFrame,
+    newCorrelationId,
+    newRequestId,
+    setupInterceptor,
+    navigationWatcher,
+    logger,
+  } = deps;
 
   // ---------------------------------------------------------------------------
   // Module-scoped bypass flag (NOT on window — CS isolated world).
-  // Reset on turbo:before-visit to guard against stuck state.
+  // Reset on navigation to guard against stuck state.
   // ---------------------------------------------------------------------------
   let approveBypass = false;
 
   // Current PR identifier derived from `window.location.href`.
   let currentPR: PRIdentifier | null = null;
 
-  // Pending Approve submits, keyed by requestId.
+  // Pending Approve actions, keyed by requestId.
   const pending = new Map<string, PendingApprove>();
 
   // Dispose functions for all attached listeners.
@@ -168,6 +201,33 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   };
 
   /**
+   * Replays the intercepted approve action after a quiz pass.
+   *
+   * - GitHub: `form.requestSubmit(submitter)` — preserves the original submit.
+   * - ADO: `element.click()` — triggers ADO's own click handler after the bypass
+   *   flag lets the re-click pass the capture-phase listener.
+   */
+  const replayApprove = (requestId: string, p: PendingApprove): void => {
+    approveBypass = true;
+    try {
+      if (p.blocked.kind === "github") {
+        p.blocked.form.requestSubmit(p.blocked.submitter ?? undefined);
+      } else {
+        // ADO path: synchronous click; capture listener sees bypass, resets
+        // flag, returns without preventDefault.
+        p.blocked.element.click();
+      }
+    } catch (err) {
+      approveBypass = false;
+      emitResult(requestId, {
+        kind: "error",
+        reason: "internal",
+        message: `replay failed: ${String(err)}`,
+      });
+    }
+  };
+
+  /**
    * Handles the SW response to a `quiz-submit` frame.
    */
   const handleQuizSubmitReply = (requestId: string, reply: Frame): void => {
@@ -177,16 +237,8 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
       const result = reply.payload;
       if (result.passed) {
         emitResult(requestId, { kind: "quiz-passed", result });
-        approveBypass = true;
-        try {
-          p?.form.requestSubmit(p.submitter ?? undefined);
-        } catch (err) {
-          approveBypass = false;
-          emitResult(requestId, {
-            kind: "error",
-            reason: "internal",
-            message: `requestSubmit failed: ${String(err)}`,
-          });
+        if (p !== undefined) {
+          replayApprove(requestId, p);
         }
       } else {
         emitResult(requestId, { kind: "quiz-failed", result });
@@ -266,14 +318,13 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   // Approve intercept → onBlocked
   // ---------------------------------------------------------------------------
 
-  const onBlocked = (blocked: ApproveBlockedEvent): void => {
+  const onBlocked = (blocked: InterceptedApproveEvent): void => {
     const requestId = newRequestId();
     const correlationId = newCorrelationId();
 
     const p: PendingApprove = {
       requestId,
-      form: blocked.form,
-      submitter: blocked.submitter,
+      blocked,
       pr: blocked.pr,
     };
     pending.set(requestId, p);
@@ -336,33 +387,17 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   };
 
   // ---------------------------------------------------------------------------
-  // Turbo navigation handlers
+  // Navigation handlers (platform-agnostic via NavigationWatcher)
   // ---------------------------------------------------------------------------
 
-  const onTurboBeforeVisit = (): void => {
+  const onWillNavigate = (): void => {
     approveBypass = false;
     dropAll();
   };
 
-  const onTurboRender = (): void => {
+  const onDidNavigate = (): void => {
     const result = detectPRPage(doc.defaultView?.location.href ?? "");
     currentPR = result.ok ? result.pr : null;
-  };
-
-  // ---------------------------------------------------------------------------
-  // MutationObserver fallback (GitHub deployments without Turbo events)
-  // ---------------------------------------------------------------------------
-
-  let observer: MutationObserver | null = null;
-
-  const setupObserver = (): void => {
-    if (typeof MutationObserver === "undefined") return;
-    observer = new MutationObserver(() => {
-      // On body child-list change, re-evaluate the URL in case of SPA nav.
-      const result = detectPRPage(doc.defaultView?.location.href ?? "");
-      currentPR = result.ok ? result.pr : null;
-    });
-    observer.observe(doc.body, { childList: true, subtree: false });
   };
 
   // ---------------------------------------------------------------------------
@@ -375,8 +410,8 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
       const initialResult = detectPRPage(doc.defaultView?.location.href ?? "");
       currentPR = initialResult.ok ? initialResult.pr : null;
 
-      // Capture-phase Approve interceptor.
-      const disposeInterceptor = setupApproveInterceptor({
+      // Capture-phase platform Approve interceptor (injected strategy).
+      const disposeInterceptor = setupInterceptor({
         doc,
         getCurrentPR: () => currentPR,
         shouldBypass: () => {
@@ -391,19 +426,9 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
       });
       disposers.push(disposeInterceptor);
 
-      // Turbo navigation events.
-      const turboBeforeVisitHandler = (): void => { onTurboBeforeVisit(); };
-      const turboRenderHandler = (): void => { onTurboRender(); };
-      doc.addEventListener("turbo:before-visit", turboBeforeVisitHandler);
-      doc.addEventListener("turbo:render", turboRenderHandler);
-      disposers.push(() => {
-        doc.removeEventListener("turbo:before-visit", turboBeforeVisitHandler);
-        doc.removeEventListener("turbo:render", turboRenderHandler);
-      });
-
-      // MutationObserver fallback.
-      setupObserver();
-      disposers.push(() => { observer?.disconnect(); observer = null; });
+      // Platform-specific SPA navigation watcher (injected strategy).
+      const disposeNavigation = navigationWatcher.start({ onWillNavigate, onDidNavigate });
+      disposers.push(disposeNavigation);
 
       // Modal → CS event listeners.
       const disposeSubmit = addDOMEventListener(

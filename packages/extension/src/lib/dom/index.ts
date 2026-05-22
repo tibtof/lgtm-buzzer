@@ -25,7 +25,24 @@ export {
   setupApproveInterceptor,
   type ApproveBlockedEvent,
   type ApproveInterceptorDeps,
+  type InterceptedApproveEvent,
 } from "./approve-intercept.js";
+
+export {
+  setupAdoVoteInterceptor,
+  recognizeAdoVoteClick,
+  KNOWN_ADO_VOTE_TESTIDS,
+  type AdoVoteVariant,
+  type AdoVoteSelectorOverrides,
+  type AdoInterceptedApproveEvent,
+  type AdoVoteInterceptorDeps,
+} from "./ado-vote-intercept.js";
+
+export {
+  createGitHubNavigationWatcher,
+  createAdoNavigationWatcher,
+  type NavigationWatcher,
+} from "./navigation.js";
 
 export {
   createQuizFlowController,
@@ -33,6 +50,7 @@ export {
   type QuizFlowDeps,
   type QuizFlowLogger,
   type SendFrameFn,
+  type InterceptorFactory,
 } from "./quiz-flow.js";
 
 export {

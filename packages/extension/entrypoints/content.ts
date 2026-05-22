@@ -1,11 +1,26 @@
 import { defineContentScript } from "wxt/utils/define-content-script";
 import { browser } from "wxt/browser";
-import { createQuizFlowController, createQuizModal } from "../src/lib/dom/index.js";
+import {
+  createQuizFlowController,
+  createQuizModal,
+  setupApproveInterceptor,
+  setupAdoVoteInterceptor,
+  createGitHubNavigationWatcher,
+  createAdoNavigationWatcher,
+  detectPRPage,
+} from "../src/lib/dom/index.js";
+import type {
+  InterceptorFactory,
+} from "../src/lib/dom/index.js";
 import type { Frame } from "@lgtm-buzzer/protocol";
 import { CSResponseSchema } from "../src/lib/cs-protocol.js";
 
 export default defineContentScript({
-  matches: ["*://github.com/*", "*://dev.azure.com/*"],
+  matches: [
+    "*://github.com/*",
+    "*://dev.azure.com/*",
+    "*://*.visualstudio.com/*",
+  ],
   runAt: "document_idle",
 
   main() {
@@ -46,16 +61,45 @@ export default defineContentScript({
       return response.frame;
     };
 
+    const logger = {
+      warn: (msg: string, ctx?: Record<string, unknown>): void => {
+        console.warn(`[lgtm-buzzer:cs] ${msg}`, ctx ?? {});
+      },
+    };
+
+    // -------------------------------------------------------------------------
+    // Platform selection — computed once at main() time (per ADR-21 §Types).
+    //
+    // Each page load is a fresh document; cross-host SPA navigation does not
+    // exist, so a static-at-load choice is correct. The CS idles on non-PR
+    // URLs within the matched hosts — `detectPRPage` is the gate.
+    // -------------------------------------------------------------------------
+    const initialPR = detectPRPage(window.location.href);
+    const platform: "github" | "ado" =
+      initialPR.ok && initialPR.pr.kind === "ado" ? "ado" : "github";
+
+    const setupInterceptor: InterceptorFactory =
+      platform === "ado"
+        ? (interceptorDeps) =>
+            setupAdoVoteInterceptor({
+              ...interceptorDeps,
+              logger,
+            })
+        : (interceptorDeps) => setupApproveInterceptor(interceptorDeps);
+
+    const navigationWatcher =
+      platform === "ado"
+        ? createAdoNavigationWatcher(document)
+        : createGitHubNavigationWatcher(document);
+
     const controller = createQuizFlowController({
       doc: document,
       sendFrame,
       newCorrelationId: () => crypto.randomUUID(),
       newRequestId: () => crypto.randomUUID(),
-      logger: {
-        warn: (msg, ctx) => {
-          console.warn(`[lgtm-buzzer:cs] ${msg}`, ctx ?? {});
-        },
-      },
+      setupInterceptor,
+      navigationWatcher,
+      logger,
     });
 
     controller.start();
