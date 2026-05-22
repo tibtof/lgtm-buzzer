@@ -1,5 +1,42 @@
 import tseslint from "typescript-eslint";
 
+/**
+ * Human-readable message shown by ESLint when a forbidden FP library import is detected.
+ * Points contributors directly at the CLAUDE.md section that explains the rationale.
+ */
+const FORBIDDEN_FP_LIBS_MESSAGE =
+  'This library is forbidden across the monorepo. See CLAUDE.md "Forbidden libraries" section. Use monadyssey instead.';
+
+/**
+ * Exact package names for every FP library that must not be imported anywhere in the monorepo.
+ * A future ADR that adds another forbidden library edits only this array.
+ */
+const FORBIDDEN_FP_LIB_NAMES = [
+  "neverthrow",
+  "fp-ts",
+  "io-ts",
+  "effect",
+  "purify-ts",
+  "true-myth",
+];
+
+/**
+ * ESLint `no-restricted-imports` paths + patterns for forbidden FP libraries.
+ * Spread this constant into every scoped block that has a `no-restricted-imports` rule.
+ */
+const FORBIDDEN_FP_LIBS = {
+  paths: FORBIDDEN_FP_LIB_NAMES.map((name) => ({
+    name,
+    message: FORBIDDEN_FP_LIBS_MESSAGE,
+  })),
+  patterns: [
+    {
+      group: FORBIDDEN_FP_LIB_NAMES.map((name) => `${name}/*`),
+      message: FORBIDDEN_FP_LIBS_MESSAGE,
+    },
+  ],
+};
+
 export default tseslint.config(
   {
     ignores: [
@@ -31,14 +68,16 @@ export default tseslint.config(
       ],
     },
   },
-  // Core and protocol may not depend on Node APIs or outer-layer packages.
+  // Core and protocol may not depend on Node APIs, outer-layer packages, or forbidden FP libraries.
   {
     files: ["packages/protocol/**/*.ts", "packages/core/**/*.ts"],
     rules: {
       "no-restricted-imports": [
         "error",
         {
+          paths: [...FORBIDDEN_FP_LIBS.paths],
           patterns: [
+            ...FORBIDDEN_FP_LIBS.patterns,
             {
               group: [
                 "node:*",
@@ -75,14 +114,16 @@ export default tseslint.config(
       "no-restricted-syntax": "off",
     },
   },
-  // Extension may not depend on host or adapters directly.
+  // Extension may not depend on host or adapters directly, or on forbidden FP libraries.
   {
     files: ["packages/extension/**/*.ts"],
     rules: {
       "no-restricted-imports": [
         "error",
         {
+          paths: [...FORBIDDEN_FP_LIBS.paths],
           patterns: [
+            ...FORBIDDEN_FP_LIBS.patterns,
             {
               group: ["@lgtm-buzzer/adapter-*", "@lgtm-buzzer/host"],
               message:
@@ -93,6 +134,19 @@ export default tseslint.config(
               message: "Extension runs in the browser — no Node APIs.",
             },
           ],
+        },
+      ],
+    },
+  },
+  // Adapters and host may not import forbidden FP libraries.
+  {
+    files: ["packages/adapters/**/*.ts", "packages/host/**/*.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [...FORBIDDEN_FP_LIBS.paths],
+          patterns: [...FORBIDDEN_FP_LIBS.patterns],
         },
       ],
     },
