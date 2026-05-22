@@ -942,3 +942,204 @@ architect rather than merging — it indicates a config mistake
   constraint (quiz prompts take only the diff) is not in scope of
   any change here.
 
+
+---
+
+## ADR-3: Block forbidden FP libraries via a monorepo-wide ESLint `no-restricted-imports` rule
+**Date**: 2026-05-22
+**Issue**: #2
+**Status**: Accepted
+
+### Context
+
+CLAUDE.md's **Forbidden libraries** section locks `monadyssey` (+ `monadyssey-fetch`) as the single FP foundation across the monorepo and lists the libraries that must never be imported:
+
+- `neverthrow`
+- `fp-ts`
+- `io-ts`
+- `effect`
+- `purify-ts`
+- `true-myth`
+
+Today nothing enforces this. A contributor (or an agent) could install `neverthrow` in an adapter and the reviewer would catch it only by manual inspection. The "single FP foundation" rule must fail closed in the lint pipeline so it cannot be regressed silently.
+
+The existing `eslint.config.js` already has two scoped `no-restricted-imports` blocks: one for `core`/`protocol` (forbidding `node:*` and outer-layer packages) and one for `extension` (forbidding adapters/host and Node APIs). The new rule is **monorepo-wide** — every workspace, every `.ts` file — and therefore must not collide with the scoped blocks. In ESLint's flat config, when two config objects both apply to the same file and both set `no-restricted-imports`, the **later** object wins (full replacement of the rule's options, not a merge of `paths`/`patterns` arrays). The placement strategy below sidesteps this by giving the monorepo-wide rule its own block whose `files` glob targets only the union of files the scoped blocks do *not* cover, and by **duplicating** the forbidden-library entries into the existing scoped blocks so every file is covered exactly once.
+
+Spec ambiguity in the issue ("a new top-level override [...] or extend the existing base rules block") resolved here: extending the base-rules block is **not** viable because the base block has no `files` field (it applies to everything that isn't ignored), and the two scoped blocks would then *replace* its `no-restricted-imports` for files in `core`/`protocol`/`extension`. The only safe placement is one of:
+
+- **(a)** A new top-level block that lists *all* the forbidden-FP entries and **adds** the existing scoped restrictions into the same block's `paths`/`patterns` arrays (merging by hand).
+- **(b)** Duplicate the forbidden-FP `paths` + `patterns` into each existing scoped block, and add one new block for the workspaces not covered by either scoped block (`adapters`, `host`, and anything else under `packages/`).
+
+**Decision: (b).** Reasons:
+
+1. The scoped blocks already encode workspace-specific intent (Node forbidden in core/protocol/extension; adapters/host forbidden from extension). Folding everything into a single block forces the architect to re-derive that intent every time a forbidden entry is added.
+2. The forbidden-FP entries are an orthogonal axis (FP foundation) from the scoped entries (architecture boundaries). Keeping them as a reusable constant inside `eslint.config.js` and spreading the constant into each block lets a future ADR (e.g., adding another forbidden library) edit one array literal instead of three.
+3. The diff is minimal: one new module-level `const FORBIDDEN_FP_LIBS = [...]` plus three small spread sites.
+
+The rule shape is `no-restricted-imports` with **both** `paths` (exact specifiers) and `patterns` (sub-path globs). Exact `paths` catches `import x from "neverthrow"`; `patterns` like `"fp-ts/*"` catches `import x from "fp-ts/lib/Either"`. Both are required to meet acceptance criterion 2.
+
+### Decision
+
+Introduce a module-level constant `FORBIDDEN_FP_LIBS` inside `eslint.config.js` containing the `paths` and `patterns` entries for every library in CLAUDE.md's "Forbidden libraries" section, with a single shared `message` naming the rule and pointing at CLAUDE.md. Spread this constant into the existing `core`/`protocol` block's `no-restricted-imports` options and the existing `extension` block's `no-restricted-imports` options. Add **one** new top-level flat-config block at the end of the array that applies to `packages/**/*.ts` and the union of `files` patterns the two scoped blocks *don't* already cover (in practice: `packages/adapters/**/*.ts` and `packages/host/**/*.ts`), wiring the same `FORBIDDEN_FP_LIBS` entries through `no-restricted-imports`.
+
+The block placement order in `eslint.config.js` (top to bottom) becomes:
+
+1. `ignores` block (unchanged).
+2. `...tseslint.configs.recommended` (unchanged).
+3. Base rules block — `no-restricted-syntax` and TS rules (unchanged).
+4. `core`/`protocol` block — `no-restricted-imports` now includes Node bans, outer-layer bans, **and** the spread `FORBIDDEN_FP_LIBS` entries.
+5. WXT entrypoints override (unchanged).
+6. `extension` block — `no-restricted-imports` now includes adapter/host bans, Node bans, **and** the spread `FORBIDDEN_FP_LIBS` entries.
+7. **New** monorepo-FP block — applies to `["packages/adapters/**/*.ts", "packages/host/**/*.ts"]`; only rule is `no-restricted-imports` with `FORBIDDEN_FP_LIBS`.
+
+Because each file matches at most one of blocks (4), (6), and (7), there is no `no-restricted-imports` collision — every file gets exactly one `no-restricted-imports` rule application, and that application carries the forbidden-FP entries. The base block (3) deliberately does **not** set `no-restricted-imports`, so it cannot be silently overridden.
+
+#### Affected workspaces
+
+Tooling-only ADR. No source code changes; no package dependencies added or removed.
+
+#### Types
+
+N/A — tooling-only ADR.
+
+#### Functions and methods
+
+N/A — tooling-only ADR. The only new identifier is the module-level constant `FORBIDDEN_FP_LIBS` inside `eslint.config.js`.
+
+#### File layout
+
+Modified files: `eslint.config.js` only.
+
+#### Sequence
+
+1. Add `FORBIDDEN_FP_LIBS_MESSAGE`, `FORBIDDEN_FP_LIB_NAMES`, and `FORBIDDEN_FP_LIBS` constants above the `export default`.
+2. Spread into the `core`/`protocol` block's `no-restricted-imports.paths` and `patterns`.
+3. Spread into the `extension` block's `no-restricted-imports.paths` and `patterns`.
+4. Append the new monorepo-FP block (for `packages/adapters/**/*.ts` and `packages/host/**/*.ts`).
+5. `npm run lint` clean.
+6. Run regression recipe (see Test strategy). Paste both runs into PR description.
+7. Commit, push, open PR.
+
+#### Error cases
+
+- **Forbidden import in a source file.** ESLint emits a `no-restricted-imports` error naming the specifier and the configured message.
+- **Sub-path forbidden import.** `import { Either } from "fp-ts/lib/Either"` triggers the `patterns` matcher.
+- **Two `no-restricted-imports` blocks accidentally apply to the same file.** Prevented by design — blocks have disjoint `files` globs.
+- **Forbidden library is in `package.json` but not imported.** Not caught (ESLint doesn't see package.json). Future ADR could add a depcheck-style guard.
+
+#### Test strategy
+
+Regression recipe (run verbatim, capture all outputs into PR `## Verification` section):
+
+1. `npm run lint` — expect exit 0 baseline.
+2. Create `packages/core/src/_forbidden.regression.test.ts` with `import { ok } from "neverthrow";` (use `@ts-expect-error` since neverthrow isn't installed).
+3. `npm run lint` — expect exit ≠ 0, error names `neverthrow`, message includes `CLAUDE.md "Forbidden libraries"`.
+4. Replace import with `import { right } from "fp-ts/lib/Either";` — confirm sub-path matcher fires too.
+5. `rm packages/core/src/_forbidden.regression.test.ts`.
+6. `npm run lint` — expect exit 0.
+
+### Consequences
+
+- Single-FP-foundation rule is now mechanically enforced.
+- Issue #6 (`npm run check`) inherits this rule automatically.
+- Future ADRs that add a new forbidden library edit one array literal (`FORBIDDEN_FP_LIB_NAMES`).
+- Composition with ADR-4 (no IO/Schedule in core): both rules use `no-restricted-imports`; ADR-3 places its entries inside scoped blocks (core/protocol, extension) and a new adapters/host block. ADR-4 splits the core/protocol block into protocol-only + core-only. Whichever dev lands second merges by: (a) preserving the protocol/core split from ADR-4, (b) ensuring the spread `FORBIDDEN_FP_LIBS` lives in both halves (and in extension, and in adapters/host).
+- No security implications.
+
+---
+
+## ADR-4: Forbid the monadyssey IO/Schedule surface inside `core` via ESLint `no-restricted-imports`
+**Date**: 2026-05-22
+**Issue**: #3
+**Status**: Accepted
+
+### Context
+
+CLAUDE.md's per-package dependency policy says `core` may use **only the IO-free surface** of `monadyssey` (`Either`, `Option`, `Eval`, `Ref`, `NonEmptyList`); `IO` and `Schedule` are forbidden in `core` and the policy explicitly nominates ESLint `no-restricted-imports` as the enforcement mechanism. ADR-1 installed `monadyssey@2.0.1` in `core` (and the adapters and host). Nothing in the lint config currently prevents a `core` file from importing `IO`, `Schedule`, or the surrounding retry/cancellation error classes.
+
+The shape of `monadyssey`'s top-level `export` surface was confirmed against `node_modules/monadyssey/dist/monadyssey.d.ts` (v2.0.1), so the `importNames` list below matches reality. CLAUDE.md mentions `Ref` in the IO-free family; that identifier is **not** exported by `monadyssey@2.0.1`. The blocklist therefore enumerates only what currently exists.
+
+Two implementation shapes were evaluated:
+
+- **(a)** Extend the existing block by splitting it into protocol-only and core-only blocks. Each carries its own `no-restricted-imports`; core adds a `paths` entry on `monadyssey`.
+- **(b)** Add a third override block scoped to core only, containing only the `paths` rule.
+
+**Decision: (a).** ESLint flat-config rule-replacement semantics: within a single rule (`no-restricted-imports` here), later blocks completely **replace** earlier configurations for the same rule on overlapping `files`. Approach (b) would silently disable the existing Node-API ban on `core` the moment a core-specific block re-declared `no-restricted-imports` without re-stating those patterns. Approach (a) keeps each file-scope's rule self-contained.
+
+### Decision
+
+Replace the single `["packages/protocol/**/*.ts", "packages/core/**/*.ts"]` override block in `eslint.config.js` with **two** override blocks:
+
+1. A `["packages/protocol/**/*.ts"]` block carrying the existing shared `patterns` (Node-API ban + outer-layer-package ban).
+2. A `["packages/core/**/*.ts"]` block carrying the **same** shared `patterns` **plus** a new `paths` entry on `"monadyssey"` with an `importNames` blocklist enumerating the IO/Schedule surface.
+
+The rule applies to **all** `.ts` files under `packages/core/`, including `*.test.ts`. Tests in `core` are part of the pure domain layer; if a test genuinely needs `IO`/`Schedule`, that signals the code under test should be a port plus an adapter, with the test in the adapter workspace.
+
+#### Affected workspaces
+
+- `packages/protocol` — none (block reshaped but rule body identical).
+- `packages/core` — new: import of any listed monadyssey IO/Schedule symbol now errors.
+- `packages/adapters/*`, `packages/host`, `packages/extension` — none (rule scoped out).
+- Root `eslint.config.js` — modified.
+
+#### Types / Functions and methods
+
+N/A. Tooling-only ADR.
+
+#### File layout
+
+Modified files: `eslint.config.js` only.
+
+##### Blocklist (`importNames`)
+
+Verified against `node_modules/monadyssey/dist/monadyssey.d.ts` (v2.0.1):
+
+```
+IO, Schedule, Policy, RepeatError, RetryError,
+PolicyValidationError, TimeoutError, CancellationError,
+ConditionalRetryError, Fiber, Cancelled, EvaluationError, Reader
+```
+
+`Reader` is included as a defensive measure; if a future feature has a concrete use case for `Reader` in `core`, a follow-up ADR removes it.
+
+##### Allowed (by omission)
+
+`Either`, `Left`, `Right`, `Option`, `Some`, `None`, `Eval`, `NonEmptyList`, `Nel`, `Ok`, `Err`, `Ordering`, `EQ`, `GT`, `LT`, `identity`, `TODO`, `NotImplementedYetError`. Future IO-free additions are allowed by default.
+
+#### Sequence
+
+1. Locate the existing override block whose `files` array is `["packages/protocol/**/*.ts", "packages/core/**/*.ts"]`.
+2. Replace it with **two** blocks: protocol-only (same patterns), core-only (same patterns + new `paths` entry on `monadyssey` with the blocklist above).
+3. If ADR-3 has landed first, merge: keep the protocol/core split; ensure `FORBIDDEN_FP_LIBS` is spread into both halves (protocol-only block's `paths`/`patterns`, core-only block's `paths`/`patterns`).
+4. `npm run lint` clean.
+5. Run regression recipe (see Test strategy). Paste all runs into PR `## Verification` section.
+6. Commit, push, open PR.
+
+#### Error cases
+
+- **Expected diagnostic** when a `core` file imports a blocked symbol — names the file, the symbol (`IO`), the rule, and the configured message.
+- **Default/namespace imports** are not caught by `importNames`. Mitigation: `monadyssey` does not expose a default export (verified). Namespace imports remain a theoretical hole; reviewer agent catches them; future tightening if exploited.
+- **Renamed imports** (`import { IO as X }`) — still caught (ESLint matches exported name, not local alias).
+- **Re-export from a barrel** in core would itself fail the rule at the barrel.
+- **Both ADRs land conflict** — see Consequences for merge recipe.
+
+#### Test strategy
+
+Regression recipe:
+
+1. `npm run lint` — expect exit 0 baseline.
+2. Create `packages/core/src/_io_forbidden.regression.test.ts` importing `IO` from `monadyssey`.
+3. `npm run lint` — expect exit ≠ 0; diagnostic names `IO`; message from this ADR.
+4. Replace import with `import { Right } from "monadyssey";` — confirm lint is clean (positive allowlist test).
+5. `rm packages/core/src/_io_forbidden.regression.test.ts`.
+6. `npm run lint` — expect exit 0.
+7. **Scope isolation**: temporarily add `import { IO } from "monadyssey"` to `packages/host/src/monadyssey.smoke.test.ts`, run `npm run lint`, expect exit 0 (rule scoped to core only). Revert.
+
+### Consequences
+
+- `core` is now mechanically pure with respect to monadyssey surface.
+- **Composition with ADR-3.** ADR-3's forbidden-FP entries are scoped per workspace (spread into core/protocol, extension, and a new adapters/host block). ADR-4's split-core-out-of-protocol modification needs the spread `FORBIDDEN_FP_LIBS` preserved in BOTH halves of the split. Whichever dev lands second runs both regression recipes to confirm.
+- Tests in `core` obey the rule too — by design.
+- `Reader` is on the blocklist defensively; cheap to revert.
+- Namespace-import hole acknowledged; reviewer agent is the second line of defense.
+- No new runtime deps. No security implications. Fully reversible.
