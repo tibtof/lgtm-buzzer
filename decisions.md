@@ -4441,3 +4441,243 @@ M2 ("First vertical slice — Chrome + claude-cli + GitHub") complete. All 14 is
 - The modal data-testid contract from ADR-19 §7 is binding for any future modal redesign.
 
 Onward to M3.
+
+---
+
+## ADR-20: Second `LLMProvider` — `claude-api` adapter calling Anthropic Messages API via `monadyssey-fetch` with prompt caching
+**Date**: 2026-05-22
+**Issue**: #59
+**Status**: Accepted
+
+### Context
+
+Users with Anthropic API key but no `claude` CLI cannot use LGTM-Buzzer. CLI users miss prompt caching's cost reduction on quiz regeneration. M3 adds an HTTP-based LLMProvider.
+
+### Decision
+
+#### 1. monadyssey-fetch HttpClient (NOT @anthropic-ai/sdk)
+
+Per CLAUDE.md idiom #5. SDK rejected: would bring transitive deps, second retry mechanism fighting Schedule (idiom #3), Promise→IO shim at every call site.
+
+#### 2. Endpoint and request shape
+
+```
+POST https://api.anthropic.com/v1/messages
+Headers: x-api-key, anthropic-version: 2023-06-01, anthropic-beta: prompt-caching-2024-07-31
+Body: {
+  model, max_tokens: 4096,
+  system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+  messages: [{ role: "user", content: [{ type: "text", text: USER_MESSAGE_WITH_DIFF, cache_control: { type: "ephemeral" } }] }]
+}
+```
+
+Two ephemeral cache blocks (system + diff). Regeneration on same PR within ~5min is mostly cache hits. **Diff-only invariant**: body constructed ONLY from SYSTEM_PROMPT, questionCount, diff, model. Canary test asserts.
+
+#### 3. Re-use SYSTEM_PROMPT via _shared extraction
+
+Extract SYSTEM_PROMPT + `buildUserMessage` from `claude-cli/prompt.ts` to `_shared/prompt.ts`; re-export from claude-cli for backwards compat. Single source of truth; eval suite (#52) calibrated against one constant. `buildPrompt` (CLI stdin composer) stays in claude-cli.
+
+`buildMessagesPayload(diff, questionCount, model, maxTokens)` — exactly 4 parameters; adding a 5th PR-derived parameter requires ADR amendment.
+
+#### 4. Response parsing — extract to _shared/quiz-from-text.ts
+
+```ts
+export const AnthropicMessageEnvelopeSchema = z.object({
+  type: z.literal("message"),
+  role: z.literal("assistant"),
+  content: z.array(z.union([
+    z.object({ type: z.literal("text"), text: z.string().min(1) }),
+    z.object({ type: z.string() }).passthrough(),  // tolerant of future block types
+  ])).min(1),
+  stop_reason: z.enum(["end_turn", "max_tokens", "stop_sequence", "tool_use"]).nullable().optional(),
+});
+```
+
+Pipeline:
+1. Validate envelope. Fail → `malformed-response`.
+2. Find first text block. None → `malformed-response`.
+3. Strip markdown fences.
+4. `JSON.parse` → `LlmQuizSchema` (from _shared).
+5. Cross-check `correctChoiceIndex < choices.length`.
+6. Empty questions → `malformed-response`.
+7. Map to Quiz via injected IdGenerator.
+
+Extract steps 3-7 to `_shared/quiz-from-text.ts` as `parseQuizFromText(text, ids)`. Both claude-cli and claude-api call it.
+
+#### 5. API key — factory dep at construction
+
+```ts
+export type ClaudeApiConfig = {
+  readonly apiKey: string;
+  readonly model?: AnthropicModel;       // default "claude-sonnet-4-7"
+  readonly baseUrl?: string;              // default "https://api.anthropic.com"
+  readonly timeoutMs?: number;            // default 60_000
+  readonly maxTokens?: number;            // default 4096
+  readonly retry?: { recurs; factor; delay };  // default { 3, 2, 500 }
+};
+```
+
+- Adapter does NOT read env vars or filesystem.
+- v1 host wiring uses env var `LGTM_BUZZER_ANTHROPIC_KEY`.
+- v2 (post-#49/#50): extension options page sends config-set wire message.
+- API key sent ONLY as `x-api-key` header.
+- **NEVER** in `detail`, `raw`, log bindings, or wire messages back to extension.
+- Extend ADR-6 redaction list with `x-api-key`, `anthropic-api-key`.
+
+#### 6. Model selection — closed union
+
+```ts
+export type AnthropicModel =
+  | "claude-sonnet-4-7"
+  | "claude-opus-4-7"
+  | "claude-haiku-4-5";
+```
+
+Closed (not free string) to prevent typos. Default `claude-sonnet-4-7`.
+
+#### 7. Retry policy — Schedule.retryIf
+
+```ts
+const isRetryable = (err: LLMProviderError): boolean =>
+  err.kind === "transport" &&
+  (err.status === undefined || err.status === 429 || err.status === 529);
+
+const policy = new Schedule({
+  recurs: config.retry?.recurs ?? 3,
+  factor: config.retry?.factor ?? 2,
+  delay:  config.retry?.delay  ?? 500,
+});
+const retried = policy.retryIf(httpCallIO, isRetryable, liftToProviderError);
+```
+
+Retry: 429, 529, network (status 0). NOT: 400, 401, 403, 404, 5xx ≠ 529, malformed-response, timeout. AbortSignal propagates → Cancelled runtime outcome.
+
+#### 8. Per-request timeout via HttpClient
+
+`HttpClient` constructor's `timeout` field set to `config.timeoutMs`. Exhausted timeout surfaces as `HttpError status: 0` with rawMessage matching `/timeout|aborted/i`; mapped to `LLMProviderError.timeout { afterMs: timeoutMs }`. Best-effort introspection documented as limitation.
+
+#### 9. Error mapping
+
+| Source | LLMProviderError | Retryable? |
+|---|---|---|
+| HttpError.status 0, rawMessage non-timeout | `transport { detail }` | yes |
+| HttpError.status 0, rawMessage timeout-like | `timeout { afterMs }` | no |
+| 400/401/403/404 | `transport { status, detail }` | no |
+| 429 | `transport { status: 429, detail }` | **yes** |
+| 5xx ≠ 529 | `transport { status, detail }` | no |
+| 529 | `transport { status: 529, detail }` | **yes** |
+| Envelope fail | `malformed-response { detail, raw }` | no |
+| LlmQuizSchema fail | `malformed-response` | no |
+| OOB correctChoiceIndex | `malformed-response { detail: "correctChoiceIndex out of range" }` | no |
+| Empty questions | `malformed-response { detail: "empty-quiz" }` | no |
+| Caller cancels | `Cancelled` runtime (NEVER `Err`) | n/a |
+
+`raw` clipped 8 KiB. Reviewer-enforced: API key NEVER in `detail` or `raw`.
+
+### Affected workspaces
+
+- `packages/adapters/claude-api/` — new (all files + fixtures).
+- `packages/adapters/_shared/` — extract `SYSTEM_PROMPT`, `LlmQuizSchema`, `parseQuizFromText`, `IdGenerator`, `clipRaw` to new files.
+- `packages/adapters/claude-cli/` — modified: re-import/re-export from `_shared` (public API unchanged).
+
+NO changes to core, protocol, extension, host (host wiring is separate).
+
+### Types
+
+```ts
+export type AnthropicModel = "claude-sonnet-4-7" | "claude-opus-4-7" | "claude-haiku-4-5";
+
+export type ClaudeApiConfig = {
+  readonly apiKey: string;
+  readonly model?: AnthropicModel;
+  readonly baseUrl?: string;
+  readonly timeoutMs?: number;
+  readonly maxTokens?: number;
+  readonly retry?: { readonly recurs: number; readonly factor: number; readonly delay: number };
+};
+
+export type ClaudeApiDeps = {
+  readonly config: ClaudeApiConfig;
+  readonly httpClient?: HttpClient;
+  readonly ids?: IdGenerator;
+};
+
+export declare const createClaudeApiProvider: (deps: ClaudeApiDeps) => LLMProvider;
+```
+
+### File layout
+
+**New in claude-api/** (12):
+- `src/provider.ts` + `.test.ts`
+- `src/http.ts` + `.test.ts`
+- `src/prompt.ts` + `.test.ts` — `buildMessagesPayload`, `AnthropicModel`.
+- `src/response.ts` + `.test.ts` — `AnthropicMessageEnvelopeSchema`, `parseAnthropicResponse`.
+- `src/errors.ts` + `.test.ts` — `mapHttpError`.
+- `src/index.ts` — barrel.
+- `src/contract.test.ts` — httptape-backed.
+- `package.json`, `tsconfig.json`, `vitest.config.ts`, `vitest.globalSetup.ts`, `httptape.sanitize.json`, `fixtures/`, `README.md`.
+
+**Refactored in _shared/**:
+- `src/prompt.ts` (new) — `SYSTEM_PROMPT`, `buildUserMessage`.
+- `src/quiz-from-text.ts` (new) — `LlmQuizSchema`, `parseQuizFromText`, `CODE_FENCE_RE`, `MAX_RAW_BYTES`, `clipRaw`.
+- `src/ids.ts` (new) — `IdGenerator`, `defaultIdGenerator`.
+- `src/index.ts` — barrel additions.
+- `package.json` — adds `zod`.
+
+**Modified in claude-cli/**:
+- `src/prompt.ts`, `response.ts`, `ids.ts` — re-import from `_shared`; re-export for backwards compat; public API unchanged.
+
+### Sequence
+
+1. `buildMessagesPayload(diff, questionCount, model, maxTokens)` → MessagesRequestBody (pure).
+2. `client.post("/v1/messages", body, { observe: "response", responseType: "json" })` → `IO<HttpError, Response>`.
+3. Wrap in `Schedule.retryIf(io, isRetryable, liftE)` for 429/529/status-0.
+4. Success: `response.json()` → `parseAnthropicResponse(json, ids)` → `Either<LLMProviderError, Quiz>`.
+5. HttpError: `mapHttpError(err)` → `LLMProviderError`.
+6. Cancel: AbortSignal aborts in-flight fetch + retry delay → `Cancelled` runtime.
+
+**Diff-flow audit**: diff appears only in step 1's body construction + step 2's JSON-serialized HTTPS body. Never in argv (no subprocess), errors, logs, retry decisions.
+**API-key-flow audit**: key read once at step 2 (header). Never in returns, errors, logs, or any other path.
+
+### Test strategy
+
+**`prompt.test.ts`** (≥10): happy; 4-param signature; model/maxTokens fields; cache_control on system; cache_control on diff block; diff only in `<DIFF>…</DIFF>` (canary `PR_DESCRIPTION_LEAK` doesn't leak); count interpolation; SYSTEM_PROMPT identity; each AnthropicModel value round-trips.
+
+**`response.test.ts`** (≥10): happy; markdown fences; envelope fail; no text block; invalid JSON; LlmQuizSchema fail; OOB index; empty questions; raw clipped; explanation optional; tolerant of unknown block types.
+
+**`errors.test.ts`** (≥10): each row in §9; reviewer-binding API key never in detail.
+
+**`http.test.ts`** (≥6): HttpClient defaults; x-api-key header; anthropic-version + beta headers; custom baseUrl; timeoutMs respected.
+
+**`provider.test.ts`** with fake HttpClient (≥12):
+1. Happy: 1 POST to /v1/messages, body shape correct, cache markers present.
+2. **Diff-only binding**: canary markers only in `<DIFF>…</DIFF>`.
+3. **API key not in errors**: 401 sim → detail does NOT contain key string.
+4. Retry on 429: 2 calls, succeed.
+5. Retry on 529: same.
+6. Retry on status 0 (network): same.
+7. No retry on 401/400: 1 call, error.
+8. Retry budget exhausted: 4 calls.
+9. Cancellation: fake Cancelled → adapter propagates Cancelled (NOT Err).
+10. Custom model respected.
+11. Default model `claude-sonnet-4-7`.
+12. `provider.id === "claude-api"`.
+
+**`contract.test.ts`** with httptape (≥7): same scenarios via real HttpClient against fixtures. Skip warn if httptape unavailable.
+
+Coverage: 80% adapter, ≥95% pure helpers.
+
+### Consequences
+
+- Second LLMProvider, first HTTP-based. Template for future API adapters (OpenAI, Gemini).
+- `_shared` extraction consolidates SYSTEM_PROMPT, LlmQuizSchema, parseQuizFromText, IdGenerator. Eval suite (#52) calibrated against one prompt constant.
+- Prompt caching ON by default. Material cost reduction on regeneration. User-visible carrot.
+- No new runtime deps (zod, monadyssey, monadyssey-fetch already in workspace).
+- API key transport host-config-only. v1 env var; v2 (post #49/#50) wire message.
+- Retry policy bounded ~247.5s max wall-clock.
+- Per-request timeout introspection best-effort (monadyssey-fetch limitation documented).
+- `Cancelled` semantics preserved (ADR-10).
+- Closed model union requires ADR amendment for new Anthropic models.
+- ADR-6 redaction list extended (`x-api-key`, `anthropic-api-key`).
+- Reversibility high: 6 small files in claude-api, 3 small in _shared. SDK switch is one file's swap.
+- Binding for reviewer: (a) 4-param `buildMessagesPayload` + canary; (b) API key never in errors/logs; (c) Cancelled never manufactured; (d) retry only 429/529/status-0; (e) cache_control markers on both blocks; (f) `provider.id === "claude-api"`.
