@@ -1,0 +1,80 @@
+name: Evals (non-gating)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Which suite to run"
+        required: true
+        default: "quick"
+        type: choice
+        options:
+          - quick
+          - full
+          - empty-quiz-control
+  schedule:
+    # Mondays 09:00 UTC — weekly drift signal.
+    - cron: "0 9 * * 1"
+  pull_request:
+    types: [labeled, synchronize]
+    branches: [main]
+
+# Do NOT cancel in-progress evals — a mid-run cancellation leaks credits
+# without producing a usable result.
+concurrency:
+  group: evals-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  evals:
+    name: promptfoo evals (claude-api only in CI)
+    # Run on workflow_dispatch / schedule unconditionally; on pull_request
+    # only when the PR carries the `run-evals` label.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'run-evals'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build workspace libs (evals depend on built adapter outputs)
+        run: npm run build:libs
+
+      - name: Run evals
+        # On workflow_dispatch use the chosen suite input; on schedule/pull_request
+        # default to quick. CLI providers (claude-cli, codex-cli, copilot-cli) SKIP
+        # automatically — no binary install attempted (ADR-26 §5 graceful-skip).
+        env:
+          SUITE: ${{ github.event_name == 'workflow_dispatch' && inputs.suite || 'quick' }}
+        run: |
+          case "$SUITE" in
+            full)                npm run evals ;;
+            empty-quiz-control)  npm --workspace=@lgtm-buzzer/evals run evals:empty-quiz-control ;;
+            *)                   npm run evals:quick ;;
+          esac
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evals-results-${{ github.run_id }}
+          path: packages/evals/results/
+          if-no-files-found: ignore
+          retention-days: 30

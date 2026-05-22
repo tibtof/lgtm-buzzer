@@ -501,3 +501,27 @@ type errors in tests slip through the gate.
 `npm run check` runs the full CI gate locally — required to pass before
 merging any PR. It chains `build`, `test`, `lint`, and `typecheck:tests`
 with `&&` so the first failing stage halts the run immediately.
+
+---
+
+## CI (GitHub Actions)
+
+Workflows live in `.github/workflows/`. See `.github/workflows/README.md`
+for the full trigger table, artifact locations, and instructions for manual
+evals dispatch.
+
+| Workflow | File | Triggers | Gating |
+|---|---|---|---|
+| CI | `ci.yml` | `push`/`pull_request` on `main` | Required (after branch-protection setup) |
+| Evals | `evals.yml` | `workflow_dispatch`, Mon 09:00 UTC schedule, `run-evals` label | Non-gating |
+
+Node version is anchored in `.nvmrc` (`22` / Node 22 LTS). Both workflows
+read it via `node-version-file: .nvmrc` — bumping the version is a single
+`.nvmrc` edit. Dev contributors with `nvm` get the correct version
+automatically via `nvm use`.
+
+**Branch-protection follow-up (manual, post-first-green-run):** After the
+CI workflow runs green at least once on `main`, a repo admin must mark
+`unit-and-build` and `e2e` as required checks in Repo Settings → Branches.
+`evals` must remain un-required. Full instructions in
+`.github/workflows/README.md`.

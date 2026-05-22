@@ -6,7 +6,7 @@
   "description": "Browser extension that quizzes you on the diff before letting you approve a PR.",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "workspaces": [
     "packages/protocol",
