@@ -8,9 +8,10 @@
  * referenced in PLAN.md / CLAUDE.md is real.
  */
 import { HOST_ID } from "./index.js";
+import { createPinoLogger } from "./logger.js";
 
 const main = (): void => {
-  process.stderr.write(`${HOST_ID} dev-harness: placeholder — wire stdio framing in the host ADR.\n`);
+  const logger = createPinoLogger({ bindings: { component: "dev-harness" } });
+  logger.info(`${HOST_ID} dev-harness: placeholder — wire stdio framing in the host ADR.`);
 };
-
 main();
