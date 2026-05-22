@@ -1,7 +1,7 @@
 {
   "name": "lgtm-buzzer",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "description": "Browser extension that quizzes you on the diff before letting you approve a PR.",
   "license": "MIT",
@@ -30,10 +30,15 @@
     "check": "npm run build && npm run test && npm run lint && npm run typecheck:tests",
     "clean": "tsc -b --clean",
     "evals": "npm run evals --workspace=@lgtm-buzzer/evals --if-present",
-    "evals:quick": "npm run evals:quick --workspace=@lgtm-buzzer/evals --if-present"
+    "evals:quick": "npm run evals:quick --workspace=@lgtm-buzzer/evals --if-present",
+    "release": "node scripts/release.mjs",
+    "release:build": "node scripts/release.mjs",
+    "release:check": "node scripts/release.mjs --skip-check --no-checksums --output-dir tmp/release-test --force",
+    "release:clean": "node -e \"const fs=require('fs');['dist'].forEach(d=>{try{fs.rmSync(d,{recursive:true})}catch{}});\""
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
+    "esbuild": "^0.25.0",
     "eslint": "^10.4.0",
     "prettier": "^3.8.3",
     "typescript": "^6.0.3",
