@@ -1,13 +1,31 @@
-/**
- * `@lgtm-buzzer/protocol` — shared wire-format and domain DTO surface.
- *
- * This package will host zod schemas for native-messaging frames and
- * domain DTOs (issue #5 and the M1 wire-format issues #7/#8). For now
- * the file is intentionally empty: the placeholder Result type was
- * removed in ADR-5 in favour of the FP foundation's Either (from
- * `monadyssey`) used directly by `core` and the adapters.
- *
- * `protocol` must remain reusable from any FP stack and therefore
- * does not import `monadyssey` (per CLAUDE.md per-package policy).
- */
-export {};
+export {
+  PROTOCOL_VERSION,
+  FrameSchema,
+  type Frame,
+  type FrameKind,
+} from "./envelope.js";
+
+export {
+  PingPayloadSchema,
+  PingFrameSchema,
+  type PingPayload,
+  type PingFrame,
+} from "./messages/ping.js";
+
+export {
+  PongPayloadSchema,
+  PongFrameSchema,
+  type PongPayload,
+  type PongFrame,
+} from "./messages/pong.js";
+
+export {
+  ErrorReasonSchema,
+  ErrorPayloadSchema,
+  ErrorFrameSchema,
+  type ErrorReason,
+  type ErrorPayload,
+  type ErrorFrame,
+} from "./messages/error.js";
+
+export { parseFrame } from "./parse.js";
