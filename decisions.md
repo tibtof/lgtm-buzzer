@@ -1317,3 +1317,289 @@ The dev pastes both the grep-gate output and the four gate command outputs into 
 - **Follow-up nit flagged for the orchestrator**: CLAUDE.md idiom #1 reads `Right.of(input)`; should be `Right.pure(value)` to match v2.0.1.
 - Security posture unchanged.
 - Reversibility: bounded blast radius — 7 source + 6 test files, 2-3 line edits each.
+
+---
+
+## ADR-6: Structured logging in `host` via a `Logger` port in `core` + pino adapter, hard-wired to stderr
+**Date**: 2026-05-22
+**Issue**: #9
+**Status**: Accepted
+
+### Context
+
+`packages/host/src/cli.ts` and `packages/host/src/dev-harness.ts` currently emit free-form text via `process.stderr.write(...)`. The M1 wire-format work will introduce length-prefixed JSON framing on stdout to the browser extension — any byte mistakenly written to stdout becomes a malformed frame and breaks the protocol.
+
+Two hard invariants make ad-hoc logging unsafe past this issue:
+
+1. **stdout is the native-messaging protocol channel.** Logger output must never reach stdout.
+2. **Diff content must never appear in logs.** Per CLAUDE.md §Key differentiator, even a stderr crash dump must not include the diff.
+
+CLAUDE.md §Dependency rules already allows `pino` in the `host` package and forbids it elsewhere. Pino is NOT on the forbidden-FP-libraries list (ADR-3) and is not part of the `monadyssey` IO/Schedule surface restricted in `core` (ADR-4) — no ESLint rule changes needed.
+
+PM's open question (`info` vs `debug` default): resolved as `info` in §Decision.
+
+### Decision
+
+Introduce a `Logger` port in `core` and a pino adapter in `host`. The host wires pino at startup with stderr as the only destination, level driven by `LGTM_BUZZER_LOG_LEVEL` (default `info`), and a redaction list baked into the adapter. Rewrite the two existing `process.stderr.write(...)` callsites in `cli.ts` and `dev-harness.ts` to go through the logger.
+
+#### Constraint 1 — stdout is sacred
+
+The pino adapter passes `destination: 2` (file descriptor 2 = stderr) to pino's constructor. A contract test asserts this. No `console.log` permitted in `host` source. Verification recipe (see §Test strategy) demonstrates channel separation.
+
+#### Constraint 2 — Logger port in `core`, pino in `host`
+
+`packages/core/src/ports/logger.ts` is the project's **first port file** and sets the convention for future ports (`LLMProvider`, `VCSProvider`, `QuizPolicy`):
+- One port per file under `packages/core/src/ports/`.
+- Port is a `type` alias (not `interface`) per CLAUDE.md §Code style.
+- Port has zero imports from `monadyssey` unless the surface genuinely needs `Either` or `IO`. `Logger` does NOT.
+
+`core` MUST NOT import `pino`. `host` provides `createPinoLogger` returning a `Logger`.
+
+#### Constraint 3 — No `IO<E, A>` in the Logger surface
+
+Documented carve-out from CLAUDE.md Functional idiom #2:
+- Log emission is fire-and-forget — caller has no useful recovery for a log failure.
+- Pino swallows write errors by default; host subscribes to the `'error'` event once at construction.
+- Threading `IO<never, void>` through every callsite would force `.run()` for a non-domain effect.
+- Logger methods return `void`, not `IO<never, void>`. Idiom #2 reaffirmed for all other side effects.
+
+#### Constraint 4 — Redaction (binding list)
+
+Pino's `redact` config uses these paths, all replaced with `[Redacted]`:
+
+```ts
+const REDACT_PATHS: readonly string[] = [
+  "diff",
+  "body",
+  "prompt",
+  "pr.body",
+  "pr.title",
+  "pr.description",
+  "pr.commits",
+  "request.diff",
+  "request.body",
+  "request.prompt",
+  "quiz",
+  "quiz.questions",
+  "response.diff",
+  "response.body",
+  "*.diff",
+  "*.body",
+  "*.prompt",
+];
+```
+
+Notes:
+- `*.diff` / `*.body` / `*.prompt` catch nested re-bindings.
+- `quiz` is redacted as a whole in addition to `quiz.questions`.
+- `pr.title` is redacted (tight default; no PR-derived text in telemetry).
+- `remove: false` keeps the key, replaces the value — easier to grep for the censor token.
+
+#### Default log level: `info`
+
+PM's open question resolved. The host is long-running attached to a Chrome MV3 session; `debug` would produce per-frame chatter. Real diagnostic sessions opt in via `LGTM_BUZZER_LOG_LEVEL=debug`.
+
+Env-var parsing:
+- Accept exactly: `trace | debug | info | warn | error | fatal | silent`.
+- On unrecognised value: fall back to `info`, log a single `warn` line at startup naming the bad value. Do NOT throw.
+- Trim and lowercase before comparison.
+
+The **port** exposes only 4 methods (`debug|info|warn|error`) — `trace` is "debug with more noise" (config-controlled), `fatal` implies process-exit which Chrome owns, not us.
+
+#### Affected workspaces
+
+| Workspace             | Adds                                         | Imports |
+|-----------------------|----------------------------------------------|---------|
+| `packages/core`       | `Logger` port, `LogBindings`, `LogLevel`     | no new imports |
+| `packages/host`       | `createPinoLogger`; rewrites cli/dev-harness | `pino` (new), `@lgtm-buzzer/core` (existing) |
+
+#### Types
+
+##### In `packages/core/src/ports/logger.ts`
+
+```ts
+/**
+ * Structured logging port.
+ *
+ * The first port file in `core`. Logger methods return `void` — they
+ * are fire-and-forget side effects. This is the only documented
+ * carve-out from CLAUDE.md Functional idiom #2 (see ADR-6 §Constraint 3).
+ */
+export type LogLevel =
+  | "trace" | "debug" | "info" | "warn" | "error" | "fatal" | "silent";
+
+export type LogBindings = Readonly<Record<string, unknown>>;
+
+export type Logger = {
+  readonly debug: (msg: string, bindings?: LogBindings) => void;
+  readonly info: (msg: string, bindings?: LogBindings) => void;
+  readonly warn: (msg: string, bindings?: LogBindings) => void;
+  readonly error: (msg: string, bindings?: LogBindings) => void;
+  readonly child: (bindings: LogBindings) => Logger;
+};
+```
+
+`LogBindings` is `Record<string, unknown>` rather than a strict recursive type — pino does the serialisation, and redaction (not type-narrowing) is the right tool for "don't log the diff."
+
+##### Re-exports in `packages/core/src/index.ts`
+
+```ts
+export type { LogBindings, LogLevel, Logger } from "./ports/logger.js";
+```
+
+#### Functions and methods
+
+##### `createPinoLogger` (in `packages/host/src/logger.ts`)
+
+```ts
+import type { LogBindings, Logger } from "@lgtm-buzzer/core";
+import pino, { type Logger as PinoLogger } from "pino";
+
+const LEVEL_ENV_VAR = "LGTM_BUZZER_LOG_LEVEL" as const;
+const VALID_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal", "silent"] as const;
+const REDACT_PATHS: readonly string[] = [/* see Constraint 4 */];
+
+export type PinoLoggerOptions = {
+  readonly level?: string;
+  readonly bindings?: LogBindings;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly destination?: pino.DestinationStream | number;
+};
+
+export const createPinoLogger = (opts?: PinoLoggerOptions): Logger => {
+  // resolve level; construct pino with redact + destination; wrap; return.
+};
+```
+
+Internally:
+- Resolves the level from `opts.level ?? env.LGTM_BUZZER_LOG_LEVEL ?? "info"`.
+- Constructs pino with `redact: { paths: REDACT_PATHS, censor: "[Redacted]", remove: false }`.
+- Wires destination to `opts.destination ?? pino.destination(2)`.
+- Attaches a one-time `'error'` listener that does a single `process.stderr.write(...)` and nothing else (no JSON, no retry).
+- Returns an object satisfying `Logger`, with `child(bindings)` wrapping `pinoInstance.child(bindings)` recursively.
+
+##### Wrapping pino as `Logger`
+
+```ts
+const wrap = (p: PinoLogger): Logger => ({
+  debug: (msg, bindings) => { p.debug(bindings ?? {}, msg); },
+  info:  (msg, bindings) => { p.info(bindings  ?? {}, msg); },
+  warn:  (msg, bindings) => { p.warn(bindings  ?? {}, msg); },
+  error: (msg, bindings) => { p.error(bindings ?? {}, msg); },
+  child: (bindings)      => wrap(p.child(bindings)),
+});
+```
+
+#### File layout
+
+New files (4):
+- `packages/core/src/ports/logger.ts`
+- `packages/core/src/ports/logger.test.ts`
+- `packages/host/src/logger.ts`
+- `packages/host/src/logger.test.ts`
+
+Modified files (4):
+- `packages/core/src/index.ts` — add the re-export.
+- `packages/host/src/cli.ts` — replace `process.stderr.write` with logger.
+- `packages/host/src/dev-harness.ts` — same.
+- `packages/host/package.json` — add `pino` dependency.
+
+Note: existing `packages/core/tsconfig.json` globs `src/**/*` — no tsconfig change needed for the `ports/` subdir.
+
+#### Sequence
+
+1. Write `packages/core/src/ports/logger.ts` from §Types verbatim.
+2. Add the re-export to `packages/core/src/index.ts`.
+3. Write `packages/core/src/ports/logger.test.ts` (type-only smoke; see §Test strategy).
+4. Add `"pino": "^X.Y.Z"` (latest stable, caret range) to `packages/host/package.json` `dependencies`. Run `npm install` from repo root.
+5. Implement `packages/host/src/logger.ts` per §Functions.
+6. Rewrite `packages/host/src/cli.ts`:
+   ```ts
+   #!/usr/bin/env node
+   import { HOST_ID } from "./index.js";
+   import { createPinoLogger } from "./logger.js";
+   const main = (): void => {
+     const logger = createPinoLogger({ bindings: { component: "cli" } });
+     logger.info(`${HOST_ID}: placeholder entry. Native messaging wiring lands with the first host ADR.`);
+   };
+   main();
+   ```
+7. Rewrite `packages/host/src/dev-harness.ts` similarly (`component: "dev-harness"`, existing message text).
+8. Write `packages/host/src/logger.test.ts` — 4 it() blocks per §Test strategy.
+9. Run the standard gate: `npm run check` (or build + test + lint + typecheck:tests). Must be green.
+10. Run the channel-separation demo (§Verification recipe). Remove the temp `console.log` before commit.
+11. Commit `chore(host): structured logger to stderr only (#9)` on branch `feat/9-host-structured-logger`.
+
+#### Error cases
+
+- **Garbage env var value** — fall back to `info` + a `warn` line. Host MUST start.
+- **`silent` level** — pino accepts; emissions produce zero bytes. Contract test asserts.
+- **Pino constructor throws at init** — invariant violation; let it throw (CLAUDE.md §Error model reserves `throw` for programmer errors).
+- **stderr closed (EPIPE on fd=2)** — the one-time `'error'` listener writes a single line via `process.stderr.write` (no-ops on closed fd); subsequent log calls become silent. Host MUST NOT crash.
+- **Unserialisable value in bindings** — pino stringifies. Acceptable.
+- **Redaction path missed in future code** — future issues that add prompt-adjacent fields MUST extend `REDACT_PATHS` + add a parallel contract-test assertion. Architect + reviewer agents enforce on PR review.
+
+#### Test strategy
+
+##### `packages/core/src/ports/logger.test.ts` — type-only smoke
+
+Port interfaces have no runtime behavior. File exists to pull the port into the test compile graph. Shape:
+
+```ts
+import { describe, expect, it } from "vitest";
+import type { LogBindings, LogLevel, Logger } from "./logger.js";
+
+describe("Logger port", () => {
+  it("is a type-only surface (no runtime export)", () => {
+    const noop: Logger = {
+      debug: () => {}, info: () => {}, warn: () => {}, error: () => {},
+      child: () => noop,
+    };
+    const bindings: LogBindings = { traceId: "abc" };
+    const level: LogLevel = "info";
+    noop.info("hello", bindings);
+    expect(level).toBe("info");
+  });
+});
+```
+
+No behavioral assertions allowed here. If `core` grows logger logic later (e.g., a `noopLogger` factory), tests live in their own file.
+
+##### `packages/host/src/logger.test.ts` — contract test (4 cases, binding)
+
+1. **Channel separation.** Spy on `process.stdout.write`; construct logger with no destination override; emit `info("hello")`. Assert `stdout.write` NOT called. Use a `Writable` capture stream as `destination` to verify the message arrives.
+2. **Redaction.** Emit with `{ diff: "FAKE DIFF BYTES", body: "FAKE BODY", pr: { title: "secret", body: "secret-body" } }`. Assert output contains `[Redacted]` ≥3× and does NOT contain the secret values.
+3. **Wildcard redaction.** Emit with `{ payload: { diff: "NESTED DIFF" } }`. Assert `[Redacted]` present, `NESTED DIFF` absent.
+4. **Level resolution from env.** Three sub-asserts: `LGTM_BUZZER_LOG_LEVEL=debug` enables debug; empty env defaults to info (debug filtered); `LGTM_BUZZER_LOG_LEVEL=nonsense` produces a warn naming the bad value, no throw.
+
+Pattern: use `node:stream`'s `Writable` for capture; pass via the `destination` option.
+
+##### Existing smoke tests
+
+`packages/host/src/index.test.ts` and `monadyssey.smoke.test.ts` MUST still pass.
+
+##### Verification recipe (manual, one-time)
+
+```bash
+npm run check
+# Add temporary console.log("LEAK"); to cli.ts. Then:
+node packages/host/dist/cli.js >/tmp/stdout.txt 2>/tmp/stderr.txt
+grep "LEAK" /tmp/stdout.txt           # MUST match
+grep "LEAK" /tmp/stderr.txt           # MUST NOT match
+grep "placeholder entry" /tmp/stderr.txt   # MUST match
+# Remove the console.log. Re-run `npm run check`.
+```
+
+The dev pastes the four grep results into the PR body under `## Verification`.
+
+### Consequences
+
+- **First port file** in `packages/core/src/ports/`. Sets the convention: one port per file, `type` alias, no monadyssey unless the surface genuinely needs `Either`/`IO`.
+- **First documented carve-out from idiom #2** (`Logger` returns `void` not `IO<never, void>`). Logger-specific. All other side effects still return `IO<E, A>`.
+- **Pino bundle weight negligible** in `host` (Node-side binary). Extension never imports pino (dependency-direction rule prevents it).
+- **Redaction list is a living artifact.** Future issues that add prompt-adjacent fields MUST extend `REDACT_PATHS` + add a parallel contract-test assertion.
+- **No ESLint rule changes.** Pino isn't on any forbidden list.
+- **Security posture improved.** Stdout-safety and redaction now contract-tested.
+- **Reversibility.** ~150 LoC across 4 new + 4 modified files. Replacing pino later is a single-adapter swap behind the port.
+- **No license burden.** Pino is MIT.
+- **PM's open question resolved.** Default level `info`; env-var override `LGTM_BUZZER_LOG_LEVEL`.
