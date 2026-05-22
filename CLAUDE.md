@@ -34,6 +34,7 @@ License: MIT
 | LLM providers (v1) | Claude Code, Codex, `gh copilot` | All three are CLI-first and locally invoked |
 | Quiz input | The actual diff, never the PR description/title | Prevents "LGTM-by-marketing" — see Key differentiator |
 | Distribution | Browser stores + the native host as a separate installable | Stores can't ship native binaries |
+| Repository structure | Single monorepo through v1.0 | Wire-format schemas in `protocol` bind extension + host in lockstep; cross-cutting changes are one PR, not coordinated multi-repo bumps. Reassess only if release cadences genuinely diverge post-v1.0 |
 
 ---
 
