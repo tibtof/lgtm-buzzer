@@ -175,9 +175,9 @@ import { Either, Left, Right } from "monadyssey";
 type ParseError = "empty" | "too-long";
 
 export const parseName = (input: string): Either<ParseError, string> => {
-  if (input.length === 0) return Left.of("empty");
-  if (input.length > 50)  return Left.of("too-long");
-  return Right.of(input);
+  if (input.length === 0) return Left.pure("empty");
+  if (input.length > 50)  return Left.pure("too-long");
+  return Right.pure(input);
 };
 ```
 
@@ -273,8 +273,8 @@ export type QuizRequest = z.infer<typeof QuizRequestSchema>;
 export const parseQuizRequest = (raw: unknown): Either<ParseError, QuizRequest> => {
   const result = QuizRequestSchema.safeParse(raw);
   return result.success
-    ? Right.of(result.data)
-    : Left.of({ kind: "schema", issues: result.error.issues });
+    ? Right.pure(result.data)
+    : Left.pure({ kind: "schema", issues: result.error.issues });
 };
 ```
 
