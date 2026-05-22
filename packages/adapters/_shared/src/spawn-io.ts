@@ -63,6 +63,22 @@ const clampGrace = (ms: number | undefined): number => {
 };
 
 // ---------------------------------------------------------------------------
+// Test hooks (internal — do NOT use outside tests)
+// ---------------------------------------------------------------------------
+
+/**
+ * @internal
+ * Test-only hook. Subscribe to PID notifications from `spawnIO`. The callback
+ * is invoked synchronously after `spawn()` returns, before any I/O begins.
+ * Reset to a no-op after each test to avoid state leakage.
+ *
+ * DO NOT USE OUTSIDE TESTS.
+ */
+export const __spawnIO_testHooks: { onSpawn: (pid: number) => void } = {
+  onSpawn: () => {},
+};
+
+// ---------------------------------------------------------------------------
 // Core subprocess runner
 // ---------------------------------------------------------------------------
 
@@ -83,6 +99,9 @@ const runChildProcess = (
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // Notify test hooks synchronously so tests can capture the PID before
+    // any cancellation is issued. No-op in production (hook defaults to () => {}).
+    __spawnIO_testHooks.onSpawn(child.pid!);
 
     let stdoutChunks = "";
     let stderrChunks = "";

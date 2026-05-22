@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { spawnIO } from "./spawn-io.js";
+import { __spawnIO_testHooks, spawnIO } from "./spawn-io.js";
 
 // We use process.execPath (the current node binary) for all test cases to
 // ensure portability across environments.
@@ -97,72 +97,118 @@ describe("spawnIO", () => {
     async () => {
       // NOTE: fiber.join() returns { type: "Cancelled" } per monadyssey@2.0.1
       // semantics (see module-level deviation comment). The subprocess IS killed
-      // via SIGTERM. We verify liveness via process.kill(pid, 0).
-      const io = spawnIO(NODE, ["-e", "setInterval(()=>{},1e9)"]);
-      const fiberResult = await io.fork().unsafeRun();
-      expect(fiberResult.type).toBe("Ok");
-      if (fiberResult.type !== "Ok") return;
+      // via SIGTERM. We verify liveness via process.kill(pid, 0) → ESRCH.
+      let capturedPid: number | undefined;
+      __spawnIO_testHooks.onSpawn = (pid) => {
+        capturedPid = pid;
+      };
 
-      const fiber = fiberResult.value;
-      // Capture PID before cancel. Access internal signal to find the child.
-      // We verify the child is dead by catching ESRCH after cancel.
-      let pidGone = false;
-
-      await fiber.cancel();
-      const joined = await fiber.join();
-
-      // monadyssey@2.0.1 returns Cancelled (not Err) from the fiber's perspective.
-      expect(joined.type).toBe("Cancelled");
-
-      // The child process must have been killed. We verify indirectly: after
-      // cancel, any child spawned by this IO must be dead. We spawn a tiny probe
-      // to confirm the event loop is still alive (guards against false positives).
       try {
-        // If the original child is still running, it would hold resources.
-        // The strongest available signal: no SIGTERM-cooperative child should
-        // survive past cancel() resolution (grace = 5000ms default, we
-        // cancelled cooperatively).
-        pidGone = true; // cancel() resolved without timeout → child is gone
-      } catch {
-        pidGone = false;
+        const io = spawnIO(NODE, ["-e", "setInterval(()=>{},1e9)"]);
+        const fiberResult = await io.fork().unsafeRun();
+        expect(fiberResult.type).toBe("Ok");
+        if (fiberResult.type !== "Ok") return;
+
+        const fiber = fiberResult.value;
+
+        // Give the child a moment to fully start before cancelling.
+        await new Promise((r) => setTimeout(r, 50));
+
+        expect(capturedPid).toBeDefined();
+        const pid = capturedPid!;
+
+        await fiber.cancel();
+        const joined = await fiber.join();
+
+        // monadyssey@2.0.1 returns Cancelled (not Err) from the fiber's perspective.
+        expect(joined.type).toBe("Cancelled");
+
+        // Allow the OS a moment to fully reap the child process.
+        await new Promise((r) => setTimeout(r, 50));
+
+        // The child must be dead. process.kill(pid, 0) throws ESRCH when the
+        // process no longer exists — this is the safety property from CLAUDE.md:
+        // "a forgotten child process holding an LLM connection is the worst-case bug".
+        let pidGone = false;
+        try {
+          process.kill(pid, 0);
+        } catch (e: unknown) {
+          if (typeof e === "object" && e !== null && (e as NodeJS.ErrnoException).code === "ESRCH") {
+            pidGone = true;
+          }
+        }
+        expect(pidGone).toBe(true);
+      } finally {
+        __spawnIO_testHooks.onSpawn = () => {};
       }
-      expect(pidGone).toBe(true);
     },
-    1000,
+    2000,
   );
 
   it(
-    "6. cancellation stubborn: fiber.join() is Cancelled; SIGKILL fires within graceMs",
+    "6. cancellation stubborn: fiber.join() is Cancelled; SIGKILL fires within graceMs; PID no longer alive",
     async () => {
       // NOTE: same deviation as test 5. The child ignores SIGTERM; monadyssey
       // interpreter returns Cancelled regardless of the liftSpawnError result.
       // graceMs: 100 means SIGKILL fires 100ms after SIGTERM. We verify
-      // cancel() resolves within ~500ms (well within 1000ms budget).
-      const io = spawnIO(
-        NODE,
-        ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1e9)"],
-        undefined,
-        { graceMs: 100 },
-      );
-      const fiberResult = await io.fork().unsafeRun();
-      expect(fiberResult.type).toBe("Ok");
-      if (fiberResult.type !== "Ok") return;
+      // cancel() resolves within ~500ms (well within 1000ms budget) AND that
+      // the child PID is dead after cancellation (ESRCH check).
+      let capturedPid: number | undefined;
+      __spawnIO_testHooks.onSpawn = (pid) => {
+        capturedPid = pid;
+      };
 
-      const fiber = fiberResult.value;
-      const start = Date.now();
+      try {
+        const io = spawnIO(
+          NODE,
+          ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1e9)"],
+          undefined,
+          { graceMs: 100 },
+        );
+        const fiberResult = await io.fork().unsafeRun();
+        expect(fiberResult.type).toBe("Ok");
+        if (fiberResult.type !== "Ok") return;
 
-      await fiber.cancel();
-      const joined = await fiber.join();
-      const elapsed = Date.now() - start;
+        const fiber = fiberResult.value;
 
-      // monadyssey@2.0.1 returns Cancelled from the fiber's perspective.
-      expect(joined.type).toBe("Cancelled");
+        // Give the child a moment to fully start before cancelling.
+        await new Promise((r) => setTimeout(r, 50));
 
-      // SIGKILL must have fired within graceMs + some buffer; total cancel
-      // duration should be well under 500ms (graceMs=100 + process overhead).
-      expect(elapsed).toBeLessThan(500);
+        expect(capturedPid).toBeDefined();
+        const pid = capturedPid!;
+
+        const start = Date.now();
+        await fiber.cancel();
+        const joined = await fiber.join();
+        const elapsed = Date.now() - start;
+
+        // monadyssey@2.0.1 returns Cancelled from the fiber's perspective.
+        expect(joined.type).toBe("Cancelled");
+
+        // SIGKILL must have fired within graceMs (100ms) + process overhead.
+        // We check a lower bound (>=80ms, proving graceMs elapsed) and an upper
+        // bound (<1000ms for CI noise tolerance).
+        expect(elapsed).toBeGreaterThanOrEqual(80);
+        expect(elapsed).toBeLessThan(1000);
+
+        // Allow the OS a moment to fully reap the child process.
+        await new Promise((r) => setTimeout(r, 50));
+
+        // The child must be dead — same ESRCH safety check as test 5.
+        let pidGone = false;
+        try {
+          process.kill(pid, 0);
+        } catch (e: unknown) {
+          if (typeof e === "object" && e !== null && (e as NodeJS.ErrnoException).code === "ESRCH") {
+            pidGone = true;
+          }
+        }
+        expect(pidGone).toBe(true);
+      } finally {
+        __spawnIO_testHooks.onSpawn = () => {};
+      }
     },
-    1000,
+    2000,
   );
 
   it(
