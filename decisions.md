@@ -3946,3 +3946,275 @@ Coverage: pure helpers ~95%; port + router ~85%; entrypoint via Playwright.
 - Reversibility high. Swap to persisted correlation / eager connect / thinner CS↔SW protocol is an isolated change.
 - Binding for #43 (modal): modal speaks Frame to SW via `chrome.runtime.sendMessage`. No new layer.
 - Security: SW never logs frame payloads. Only `{ correlationId, kind }` reaches the dev console.
+
+---
+
+## ADR-18: Content script intercepts the GitHub PR Approve button via form-submit capture and a DOM-event bus to the modal
+**Date**: 2026-05-22
+**Issue**: #42
+**Status**: Accepted
+
+### Context
+
+CS on `github.com/*/pull/*` stops Approve form submission, runs quiz round-trip through SW (ADR-17) and host, releases the original submit only on pass.
+
+Three forces:
+1. GitHub DOM unstable — class names churn. The wire-stable contract is the form's `name="pull_request_review[event]"` input with `value="approve"` (server-side parameter; cannot change without breaking GH's API).
+2. GitHub Turbo/PJAX — navigation without reload; form lazy-mounts.
+3. #42 ships before #43 modal — interceptor must work without modal code.
+
+Plain TS + zod per per-package policy. No monadyssey.
+
+### Decision
+
+#### 1. Form-submit interception in capture phase
+
+`document.addEventListener("submit", handler, { capture: true })`. Handler:
+1. `event.target` is `HTMLFormElement`? Else return.
+2. `new FormData(form, event.submitter)` — preserves submitter's `formaction`/`name=value` for replay.
+3. `formData.get("pull_request_review[event]") !== "approve"` → return.
+4. Module-scoped `approveBypass === true` → consume, return without preventDefault.
+5. Else: `preventDefault()` + `stopPropagation()`, store `{ form, submitter }`, dispatch `lgtm-buzzer:quiz-request`.
+
+Capture (not bubble) — GitHub installs bubble-phase handlers; we get first refusal.
+
+`requestSubmit(submitter)` for replay, NOT `form.submit()` (which skips validation + listeners).
+
+#### 2. Turbo navigation handling
+
+Submit listener on `document` survives navigation. Two SPA events:
+- `turbo:render` — clears stale pending; recomputes `detectPRPage(window.location.href)`.
+- `turbo:before-visit` — drops in-flight pending; SW correlation map times out naturally.
+
+Fallback: `MutationObserver` on `document.body` (`childList: true, subtree: false`) for GitHub deployments without Turbo events.
+
+#### 3. CS emits CustomEvents — modal subscribes (decoupling #42 from #43)
+
+Four namespaced events with zod-validated `detail`:
+
+- `lgtm-buzzer:quiz-request` (CS→modal): `{ correlationId, pr, requestId }`.
+- `lgtm-buzzer:quiz-result` (CS→modal): `{ requestId, outcome: discriminated union of "quiz-ready" | "quiz-passed" | "quiz-failed" | "error" }`.
+- `lgtm-buzzer:quiz-submit` (modal→CS): `{ requestId, quizId, answers }`.
+- `lgtm-buzzer:quiz-cancel` (modal→CS): `{ requestId }`.
+
+`requestId` = controller per-Approve-click id (distinct from wire `correlationId`); modal needs stable id to bridge both frame pairs.
+
+Pub/sub means #42 and #43 build independently and Playwright can assert via `fireEvent` / `waitFor`.
+
+#### 4. Module-scoped bypass flag, NOT `window`
+
+`let approveBypass = false;` at module scope in `quiz-flow.ts`. On `passed: true`:
+1. Emit `quiz-result` with `outcome.kind = "quiz-passed"`.
+2. `approveBypass = true`.
+3. `pending.form.requestSubmit(pending.submitter ?? undefined)`.
+4. Capture-phase listener fires synchronously, sees bypass, resets to `false`, returns without preventDefault.
+5. GH's own handlers run; POST happens.
+
+Module scope (not `window`) because:
+- `window` properties visible to page JS — security hole.
+- Module-scope = isolated-world CS isolation = page JS can't see it.
+- Lifetime per page-load = exactly what we need.
+
+Reset on `turbo:before-visit` defensively.
+
+#### 5. Cancellation = drop state (v1)
+
+`lgtm-buzzer:quiz-cancel` from modal → drop pending; no wire frame sent. SW's 60s timeout (ADR-17) cleans the host side. Acceptable for v1: host is local, no network cost, keeps CS protocol minimal. Future: `quiz-cancel` wire frame is an ADR-13 amendment if user feedback shows it matters.
+
+#### 6. ADO defer
+
+`detectPRPage` discriminates GitHub vs ADO. For #42, controller only activates GitHub-specific interceptor when `pr.kind === "github"`. ADO interceptor is a sibling file in a future issue (#48-area).
+
+#### 7. Diff-only invariant — type-level + reviewer-enforced
+
+CS reads ZERO PR text from DOM. Only:
+- `window.location.href` (parsed by `parsePRIdentifier`).
+- `form.elements` / `new FormData(form, submitter)` / `event.target` / `event.submitter` (form structure only — not PR content).
+
+Reviewer grep gate: any addition under `lib/dom/**` that touches `.markdown-body`, `.commit-message`, `.timeline-comment`, `.js-issue-title`, or any PR-content selector fails review.
+
+### Affected workspaces
+
+`packages/extension` only.
+
+### Types
+
+```ts
+// page-detection.ts
+export const detectPRPage = (url: string): Either<UnsupportedURL, PRIdentifier>;
+```
+
+```ts
+// dom-events.ts
+export const QuizRequestEventDetailSchema = z.object({
+  requestId: z.string().min(1),
+  correlationId: z.string().min(1),
+  pr: PRIdentifierSchema,
+});
+
+export const QuizResultEventDetailSchema = z.object({
+  requestId: z.string().min(1),
+  outcome: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("quiz-ready"), quiz: QuizDTOSchema }),
+    z.object({ kind: z.literal("quiz-passed"), result: QuizResultPayloadSchema }),
+    z.object({ kind: z.literal("quiz-failed"), result: QuizResultPayloadSchema }),
+    z.object({ kind: z.literal("error"), reason: ErrorReasonSchema, message: z.string().min(1) }),
+  ]),
+});
+
+export const QuizSubmitEventDetailSchema = z.object({
+  requestId: z.string().min(1),
+  quizId: z.string().min(1),
+  answers: z.array(SubmittedAnswerSchema).min(1),
+});
+
+export const QuizCancelEventDetailSchema = z.object({
+  requestId: z.string().min(1),
+});
+
+export const DOM_EVENTS = {
+  quizRequest: "lgtm-buzzer:quiz-request",
+  quizResult: "lgtm-buzzer:quiz-result",
+  quizSubmit: "lgtm-buzzer:quiz-submit",
+  quizCancel: "lgtm-buzzer:quiz-cancel",
+} as const;
+```
+
+```ts
+// approve-intercept.ts
+export type ApproveBlockedEvent = {
+  readonly form: HTMLFormElement;
+  readonly submitter: HTMLElement | null;
+  readonly pr: PRIdentifier;
+};
+
+export type ApproveInterceptorDeps = {
+  readonly doc: Document;
+  readonly getCurrentPR: () => PRIdentifier | null;
+  readonly shouldBypass: () => boolean;
+  readonly onBlocked: (e: ApproveBlockedEvent) => void;
+};
+
+export const setupApproveInterceptor = (deps: ApproveInterceptorDeps): (() => void);
+```
+
+```ts
+// quiz-flow.ts
+export type SendFrameFn = (frame: Frame) => Promise<Frame>;
+
+export type QuizFlowDeps = {
+  readonly doc: Document;
+  readonly sendFrame: SendFrameFn;
+  readonly newCorrelationId: () => string;
+  readonly newRequestId: () => string;
+  readonly logger?: { readonly warn: (msg: string, ctx?: Record<string, unknown>) => void };
+};
+
+export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController;
+```
+
+### File layout
+
+**New (10)**:
+- `src/lib/dom/page-detection.ts` + `.test.ts`
+- `src/lib/dom/approve-intercept.ts` + `.test.ts`
+- `src/lib/dom/dom-events.ts` + `.test.ts`
+- `src/lib/dom/quiz-flow.ts` + `.test.ts`
+- `src/lib/dom/index.ts` (barrel)
+- `vitest.config.ts` — split env: node default, jsdom for `src/lib/dom/**`.
+
+**Modified (2)**:
+- `entrypoints/content.ts` — wire `createQuizFlowController`.
+- `package.json` — add `jsdom` to devDependencies (MIT).
+
+### Sequence
+
+1. wxt loads CS on `*://github.com/*` and `*://dev.azure.com/*`. `runAt: "document_idle"`.
+2. `main()` constructs controller, `start()`:
+   - `detectPRPage(window.location.href)`. Left → idle but listeners stay.
+   - Capture-phase submit listener on `document`.
+   - `turbo:before-visit`, `turbo:render` listeners.
+   - `MutationObserver` on `document.body` (Turbo fallback).
+   - `lgtm-buzzer:quiz-submit` and `:quiz-cancel` listeners.
+3. User clicks Approve → submit fires → handler: preventDefault, stopPropagation, store pending, dispatch `quiz-request`.
+4. In parallel, `sendFrame(QuizRequestFrame)` awaits.
+5. SW routes to host (ADR-17), returns reply.
+6. Reply branches:
+   - `QuizResponseFrame` → store `quizId`; dispatch `quiz-result { outcome: "quiz-ready" }`.
+   - `ErrorFrame` → dispatch `quiz-result { outcome: "error" }`; drop pending.
+7. User answers. Modal dispatches `lgtm-buzzer:quiz-submit`.
+8. Controller listens → find pending by requestId, `sendFrame(QuizSubmitFrame)`.
+9. Reply branches:
+   - `passed: true`: dispatch `quiz-passed` event, set bypass, `requestSubmit(submitter)`, drop pending.
+   - `passed: false`: dispatch `quiz-failed`, drop pending.
+   - `ErrorFrame`: dispatch `error`, drop pending.
+10. Modal close → `quiz-cancel` → drop pending. SW times out naturally.
+11. `turbo:before-visit` → drop all pending; reset bypass.
+12. `turbo:render` → recompute PR; if not a PR URL, controller idles.
+
+**Diff-flow audit**: only PR-derived data on the wire is `PRIdentifier` (coordinates only). No DOM scraping of PR description/title/commits/comments.
+
+### Error cases
+
+| Failure | Surfaced |
+|---|---|
+| URL parse fails | Controller idles; no UI |
+| Non-Approve review action | Handler returns; normal submit |
+| `sendFrame` throws (context invalidated) | Synthetic `ErrorFrame { reason: "internal" }`; modal shows error |
+| SW `sw-error` reply | Wrapped as synthetic ErrorFrame |
+| Reply wrong kind | Logged; `error` outcome dispatched; pending dropped |
+| `quiz-submit` for unknown requestId | Logged + dropped (modal is gone) |
+| Malformed event detail | Logged; `error` if recoverable, else dropped |
+| `requestSubmit` throws | Caught; `error` outcome |
+| Bypass flag stuck | Defensive reset on `turbo:before-visit` |
+
+No throws on expected paths. Only `throw` is invariant assertion for missing `crypto.randomUUID` (impossible in MV3).
+
+### Test strategy
+
+All `src/lib/dom/**` tests under jsdom env.
+
+**`page-detection.test.ts`** (4 cases): GitHub URL; ADO URL; GitHub issues; non-https.
+
+**`dom-events.test.ts`** (6 cases): emit dispatches; listener fires + dispose; malformed detail rejected; requestId round-trips; multiple listeners; event name constants.
+
+**`approve-intercept.test.ts`** (10 cases, jsdom):
+- Approve-form submit → onBlocked + preventDefault.
+- Non-Approve review action → no onBlocked.
+- Non-review form → ignored.
+- `getCurrentPR()` null → early-return.
+- `shouldBypass()` true → early-return without preventDefault.
+- Capture phase: bubble-phase listener sees `defaultPrevented === true`.
+- `event.submitter` passed through.
+- `dispose()` removes listener.
+- Form mounted AFTER setup → still intercepted (document-level listener).
+- Nested form → no double-fire.
+
+**`quiz-flow.test.ts`** (12 cases, jsdom, fake sendFrame):
+- Happy path GitHub: Approve → request → ready → submit → passed → requestSubmit called.
+- Failed quiz: form NOT re-submitted; bypass stays false.
+- ErrorFrame on QuizRequest: error event; pending dropped.
+- ErrorFrame on QuizSubmit: error event; form NOT submitted.
+- `sw-error` from SW: wrapped as ErrorFrame; error event.
+- `sendFrame` rejection: error event with `reason: "internal"`.
+- `quiz-cancel` mid-flight: pending dropped; late reply logged + ignored.
+- `turbo:before-visit`: clears bypass + pending.
+- `turbo:render` to non-PR: controller idles.
+- Two concurrent Approve clicks (defensive): two distinct requestIds; one's pass doesn't replay other's form.
+- `crypto.randomUUID` via injected deps (tests use counter).
+- **Diff-only invariant**: `quiz-request.detail.pr` carries only coordinate fields.
+
+NOT unit-tested (deferred to Playwright #51): real `chrome.runtime.sendMessage`; real `turbo:render`; real `requestSubmit` POST; SW restart; visual modal verification.
+
+Coverage: ~90% on `src/lib/dom/**`.
+
+### Consequences
+
+- Selector resilience: form-submit on `pull_request_review[event]` is the most stable contract GitHub offers (server-side API parameter).
+- Decoupled modal: #43 ships independently; integration via event protocol.
+- No global `window` state. Bypass flag in CS isolated world.
+- No new runtime deps. `jsdom` is dev-only (MIT). `crypto.randomUUID` in MV3.
+- ADO deferred: detectPRPage already discriminates; future ADO interceptor is a sibling file.
+- Cancellation best-effort: v1 lets host quiz generation continue after modal close (SW timeout cleans up).
+- Diff-only invariant type-enforced. Reviewer grep gate on PR-content selectors codifies this.
+- Reversibility high. All five concerns in separate files. Swapping intercept strategy is one file's change.
