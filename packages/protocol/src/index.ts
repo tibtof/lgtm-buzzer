@@ -38,6 +38,11 @@ export {
 } from "./messages/pr-identifier.js";
 
 export {
+  CredentialsBagSchema,
+  type CredentialsBag,
+} from "./messages/credentials.js";
+
+export {
   QuizRequestPayloadSchema,
   QuizRequestFrameSchema,
   type QuizRequestPayload,
@@ -74,5 +79,19 @@ export {
   type QuizResultPayload,
   type QuizResultFrame,
 } from "./messages/quiz-result.js";
+
+export {
+  ListAdaptersRequestPayloadSchema,
+  ListAdaptersRequestFrameSchema,
+  type ListAdaptersRequestPayload,
+  type ListAdaptersRequestFrame,
+} from "./messages/list-adapters-request.js";
+
+export {
+  ListAdaptersResponsePayloadSchema,
+  ListAdaptersResponseFrameSchema,
+  type ListAdaptersResponsePayload,
+  type ListAdaptersResponseFrame,
+} from "./messages/list-adapters-response.js";
 
 export { parseFrame } from "./parse.js";

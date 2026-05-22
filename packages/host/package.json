@@ -26,6 +26,7 @@
   },
   "dependencies": {
     "@lgtm-buzzer/adapter-ado": "*",
+    "@lgtm-buzzer/adapter-claude-api": "*",
     "@lgtm-buzzer/adapter-claude-cli": "*",
     "@lgtm-buzzer/adapter-codex-cli": "*",
     "@lgtm-buzzer/adapter-copilot-cli": "*",

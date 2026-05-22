@@ -4,8 +4,15 @@ import pino, { type Logger as PinoLogger } from "pino";
 const LEVEL_ENV_VAR = "LGTM_BUZZER_LOG_LEVEL" as const;
 const VALID_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal", "silent"] as const;
 
-/** @internal Redact paths that may carry diff or prompt content — see ADR-6 §Constraint 4. */
+/**
+ * @internal Redact paths that may carry diff, prompt, or credential content.
+ *
+ * ADR-6 §Constraint 4: existing diff/prompt redactions.
+ * ADR-22 §Logger redaction: credential paths added — `credentials`, `apiKey`,
+ * `pat`, `token`, `x-api-key` on any nesting level.
+ */
 const REDACT_PATHS: readonly string[] = [
+  // ADR-6: diff and prompt paths
   "diff",
   "body",
   "prompt",
@@ -23,6 +30,21 @@ const REDACT_PATHS: readonly string[] = [
   "*.diff",
   "*.body",
   "*.prompt",
+  // ADR-22: credential paths — catch at top level and any nesting depth.
+  // Top-level names must be listed explicitly; *.field only covers nested.
+  "credentials",
+  "apiKey",
+  "pat",
+  "token",
+  "x-api-key",
+  "payload.credentials",
+  "request.credentials",
+  "response.credentials",
+  "*.credentials",
+  "*.apiKey",
+  "*.pat",
+  "*.token",
+  "*.x-api-key",
 ];
 
 /** Options accepted by {@link createPinoLogger}. */

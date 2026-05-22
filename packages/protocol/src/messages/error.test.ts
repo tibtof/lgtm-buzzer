@@ -14,6 +14,11 @@ describe("ErrorFrameSchema", () => {
     "version-mismatch",
     "internal",
     "unknown-quiz-id",
+    // ADR-22: adapter registry errors
+    "unsupported-llm-adapter",
+    "unsupported-vcs-adapter",
+    "bad-credentials",
+    "missing-credentials",
   ] as const;
 
   for (const reason of reasons) {

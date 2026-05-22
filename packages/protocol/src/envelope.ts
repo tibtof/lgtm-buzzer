@@ -6,6 +6,8 @@ import { QuizRequestFrameSchema } from "./messages/quiz-request.js";
 import { QuizResponseFrameSchema } from "./messages/quiz-response.js";
 import { QuizSubmitFrameSchema } from "./messages/quiz-submit.js";
 import { QuizResultFrameSchema } from "./messages/quiz-result.js";
+import { ListAdaptersRequestFrameSchema } from "./messages/list-adapters-request.js";
+import { ListAdaptersResponseFrameSchema } from "./messages/list-adapters-response.js";
 
 export { PROTOCOL_VERSION, EnvelopeBase } from "./base.js";
 
@@ -18,6 +20,8 @@ export const FrameSchema = z.discriminatedUnion("kind", [
   QuizResponseFrameSchema,
   QuizSubmitFrameSchema,
   QuizResultFrameSchema,
+  ListAdaptersRequestFrameSchema,
+  ListAdaptersResponseFrameSchema,
 ]);
 
 /** A well-formed native-messaging frame after parsing. */
