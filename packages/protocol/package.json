@@ -13,9 +13,14 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
   }
 }
