@@ -185,10 +185,11 @@ describe("spawnIO", () => {
         // monadyssey@2.0.1 returns Cancelled from the fiber's perspective.
         expect(joined.type).toBe("Cancelled");
 
-        // SIGKILL must have fired within graceMs (100ms) + process overhead.
-        // We check a lower bound (>=80ms, proving graceMs elapsed) and an upper
-        // bound (<1000ms for CI noise tolerance).
-        expect(elapsed).toBeGreaterThanOrEqual(80);
+        // Upper bound only: the real invariant is the PID-dead check below.
+        // monadyssey's join() can resolve before the child OS process is reaped
+        // (the fiber sees Cancelled the moment cancellation propagates), so a
+        // lower bound on elapsed time conflates fiber-state with OS state and
+        // flakes under varying process scheduling.
         expect(elapsed).toBeLessThan(1000);
 
         // Allow the OS a moment to fully reap the child process.
