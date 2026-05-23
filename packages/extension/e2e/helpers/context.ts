@@ -110,11 +110,16 @@ export const launchExtensionContext = async (deps: {
     ],
   });
 
-  // Wait for the extension service worker to register. The window is generous
-  // because under xvfb on CI, MV3 SW registration can be 5-15s on cold start
-  // (vs sub-second on dev macOS). 30s leaves headroom for the polling loop
-  // below without bumping into Playwright's per-test timeout.
-  const sw = await context.waitForEvent("serviceworker", { timeout: 30_000 });
+  // Get the extension service worker, handling the race where the SW may have
+  // ALREADY registered before launchPersistentContext returned (#106). Playwright's
+  // `waitForEvent("serviceworker")` only catches NEW events; if chromium boots
+  // fast enough on Linux+xvfb the SW is already there and the event never fires.
+  // macOS happens to have timing that lets the listener attach first. Check the
+  // existing list and only wait if empty.
+  const existingSws = context.serviceWorkers();
+  const sw =
+    existingSws[0] ??
+    (await context.waitForEvent("serviceworker", { timeout: 30_000 }));
 
   // Inject the stub into the SW context. connectNative is called lazily
   // (first message from CS), so the stub is always installed in time.

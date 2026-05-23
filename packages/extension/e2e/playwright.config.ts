@@ -26,7 +26,7 @@ export default defineConfig({
   // in 3-5s but CI has been observed at 30s+ for the SW event alone (#106).
   timeout: 60_000,
   workers: 1,
-  retries: process.env.CI ? 1 : 0,
+  retries: 0,
   reporter: [["list"], ["html", { open: "never" }]],
 
   use: {
