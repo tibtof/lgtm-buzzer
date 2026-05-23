@@ -114,7 +114,7 @@ for (const c of ERROR_CASES) {
 
       // 2. Wait for error state (generating → error after stub returns error frame).
       // Use waitForSelector with the same shadow-piercing pattern as the original
-      // quiz-happy-path.spec.ts (ADR-19) which uses "css=host >> css=inner".
+      // happy-path.spec.ts which uses "css=host >> css=inner" shadow-piercing.
       await page.waitForSelector(
         "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=.error-title",
         { timeout: 15_000 },

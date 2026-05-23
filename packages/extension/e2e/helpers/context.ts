@@ -28,6 +28,17 @@ const EXTENSION_DIR = path.resolve(__dirname, "../../.output/chrome-mv3");
 const E2E_DIR = path.resolve(__dirname, "..");
 
 /**
+ * Pipes Playwright's internal logs (including chromium stderr in browser mode)
+ * to stdout when `LGTM_E2E_DEBUG=1`. Used by #106 CI investigations.
+ */
+const chromiumLogger = {
+  isEnabled: (name: string) => name.startsWith("browser") || name.startsWith("api"),
+  log: (name: string, severity: string, message: string) => {
+    process.stdout.write(`[pw:${name}:${severity}] ${message}\n`);
+  },
+};
+
+/**
  * The return type of `launchExtensionContext`.
  *
  * `extensionId` is parsed from `sw.url()` which is
@@ -81,19 +92,33 @@ export const launchExtensionContext = async (deps: {
 
   // headless: false is required — MV3 extension SWs are not visible to CDP
   // in headless mode. CI equivalent: xvfb-run + headless: false (#54).
-  // See spec-level comment 1 in quiz-happy-path.spec.ts (ADR-19).
+  const debugChromium = process.env["LGTM_E2E_DEBUG"] === "1";
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: false,
+    // Surface chromium stderr in CI when LGTM_E2E_DEBUG=1; off locally to keep
+    // dev runs quiet. CI's e2e job sets this so #106 investigations see logs.
+    ...(debugChromium ? { logger: chromiumLogger } : {}),
     args: [
       `--load-extension=${EXTENSION_DIR}`,
       `--disable-extensions-except=${EXTENSION_DIR}`,
       "--no-sandbox",
       "--disable-gpu",
+      // Linux/CI hardening (#106):
+      "--disable-dev-shm-usage", // /dev/shm is 64 MiB in GH Actions; chromium crashes on MV3 boot.
+      "--disable-setuid-sandbox", // belt-and-suspenders with --no-sandbox on locked-down runners.
     ],
   });
 
-  // Wait for the extension service worker to register.
-  const sw = await context.waitForEvent("serviceworker");
+  // Get the extension service worker, handling the race where the SW may have
+  // ALREADY registered before launchPersistentContext returned (#106). Playwright's
+  // `waitForEvent("serviceworker")` only catches NEW events; if chromium boots
+  // fast enough on Linux+xvfb the SW is already there and the event never fires.
+  // macOS happens to have timing that lets the listener attach first. Check the
+  // existing list and only wait if empty.
+  const existingSws = context.serviceWorkers();
+  const sw =
+    existingSws[0] ??
+    (await context.waitForEvent("serviceworker", { timeout: 30_000 }));
 
   // Inject the stub into the SW context. connectNative is called lazily
   // (first message from CS), so the stub is always installed in time.

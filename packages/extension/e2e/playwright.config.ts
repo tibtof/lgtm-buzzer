@@ -21,7 +21,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export default defineConfig({
   testDir: path.resolve(__dirname),
   testMatch: "**/*.spec.ts",
-  timeout: 30_000,
+  // 60s per-test budget covers: chromium cold start under xvfb on CI (5-15s),
+  // SW registration polling, plus the actual test work. Local macOS finishes
+  // in 3-5s but CI has been observed at 30s+ for the SW event alone (#106).
+  timeout: 60_000,
   workers: 1,
   retries: 0,
   reporter: [["list"], ["html", { open: "never" }]],
