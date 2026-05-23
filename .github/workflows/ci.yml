@@ -75,8 +75,10 @@ jobs:
         # --with-deps installs xvfb + libs even on cache hit (cheap apt step).
         run: npx playwright install --with-deps chromium
 
-      - name: Build extension
-        run: npm run build:extension
+      - name: Build libraries and extension
+        # build:libs (tsc -b) must run before build:extension so wxt/Rolldown
+        # can resolve workspace package dist/ outputs.
+        run: npm run build
 
       - name: Run e2e under xvfb
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' npm --workspace=@lgtm-buzzer/extension run test:e2e
