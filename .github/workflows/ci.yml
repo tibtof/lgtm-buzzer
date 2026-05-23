@@ -86,6 +86,9 @@ jobs:
         run: npm run build
 
       - name: Run e2e under xvfb
+        env:
+          # Surface chromium logs in CI for #106 investigation; remove once stable.
+          LGTM_E2E_DEBUG: "1"
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' npm --workspace=@lgtm-buzzer/extension run test:e2e
 
       - name: Upload Playwright report on failure

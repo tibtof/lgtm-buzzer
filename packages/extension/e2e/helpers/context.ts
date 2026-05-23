@@ -28,6 +28,17 @@ const EXTENSION_DIR = path.resolve(__dirname, "../../.output/chrome-mv3");
 const E2E_DIR = path.resolve(__dirname, "..");
 
 /**
+ * Pipes Playwright's internal logs (including chromium stderr in browser mode)
+ * to stdout when `LGTM_E2E_DEBUG=1`. Used by #106 CI investigations.
+ */
+const chromiumLogger = {
+  isEnabled: (name: string) => name.startsWith("browser") || name.startsWith("api"),
+  log: (name: string, severity: string, message: string) => {
+    process.stdout.write(`[pw:${name}:${severity}] ${message}\n`);
+  },
+};
+
+/**
  * The return type of `launchExtensionContext`.
  *
  * `extensionId` is parsed from `sw.url()` which is
@@ -82,18 +93,28 @@ export const launchExtensionContext = async (deps: {
   // headless: false is required — MV3 extension SWs are not visible to CDP
   // in headless mode. CI equivalent: xvfb-run + headless: false (#54).
   // See spec-level comment 1 in quiz-happy-path.spec.ts (ADR-19).
+  const debugChromium = process.env["LGTM_E2E_DEBUG"] === "1";
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: false,
+    // Surface chromium stderr in CI when LGTM_E2E_DEBUG=1; off locally to keep
+    // dev runs quiet. CI's e2e job sets this so #106 investigations see logs.
+    ...(debugChromium ? { logger: chromiumLogger } : {}),
     args: [
       `--load-extension=${EXTENSION_DIR}`,
       `--disable-extensions-except=${EXTENSION_DIR}`,
       "--no-sandbox",
       "--disable-gpu",
+      // Linux/CI hardening (#106):
+      "--disable-dev-shm-usage", // /dev/shm is 64 MiB in GH Actions; chromium crashes on MV3 boot.
+      "--disable-setuid-sandbox", // belt-and-suspenders with --no-sandbox on locked-down runners.
     ],
   });
 
-  // Wait for the extension service worker to register.
-  const sw = await context.waitForEvent("serviceworker");
+  // Wait for the extension service worker to register. The window is generous
+  // because under xvfb on CI, MV3 SW registration can be 5-15s on cold start
+  // (vs sub-second on dev macOS). 30s leaves headroom for the polling loop
+  // below without bumping into Playwright's per-test timeout.
+  const sw = await context.waitForEvent("serviceworker", { timeout: 30_000 });
 
   // Inject the stub into the SW context. connectNative is called lazily
   // (first message from CS), so the stub is always installed in time.
