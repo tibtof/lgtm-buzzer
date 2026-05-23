@@ -7404,3 +7404,2070 @@ This ADR documents the CI requirements; the wiring is #54's responsibility.
 
 ---
 
+
+## ADR-26 (2026-05-23): Promptfoo evals workspace — fixture set, assertions, custom providers, non-gating policy
+**Date**: 2026-05-23
+**Issue**: #52
+**Status**: Accepted
+
+### Context
+
+M3 ships four `LLMProvider` adapters (`claude-cli` per ADR-14,
+`claude-api` per ADR-20, `codex-cli`, `copilot-cli`). Each consumes the
+same `SYSTEM_PROMPT` (locked in `_shared/prompt.ts`) and produces a
+`Quiz` parsed by the same `parseQuizFromText` pipeline
+(`_shared/quiz-from-text.ts`, ADR-20 §4). The adapters are exercised by
+unit + contract tests, but the *quality* of the quizzes they generate
+has never been measured. Prompt regressions today land on vibes; we
+have no signal for:
+
+- whether questions reference real symbols from the diff;
+- whether questions are answerable without reading the diff (the
+  failure mode the project's `key differentiator` is built to prevent);
+- whether distractors are plausible vs trivially wrong;
+- whether the prompt holds up across languages (TS, Go, Python, Rust,
+  SQL) and diff shapes (refactor, bug-fix, dep bump, test-only, docs);
+- whether stability across runs is good enough to detect regressions
+  via small fixture deltas.
+
+CLAUDE.md §Testing has reserved `packages/evals/` for `promptfoo` since
+the scaffold ADRs. Issue #52 finalises its v1 shape. promptfoo
+(https://promptfoo.dev, MIT licence, dev-only) supports JS/TS custom
+providers (`file://path/to/provider.js`, `callApi(prompt, ctx, opts) ->
+{ output, ... }`), structured per-test assertions (`is-json`,
+`contains-any`, `javascript`, `llm-rubric`, `latency`, `cost`), and
+results emitted as JSON / HTML reports that can be committed as a
+baseline.
+
+This is not application code. The constitution's hard rules
+(hexagonal layering, IO-only side effects, monadyssey-everywhere) bind
+shipped runtime; an evals workspace that runs offline against fixture
+diffs is a developer tool. We document below the narrow set of
+constitution constraints that *do* apply (diff-only invariant, no real
+PR data, license allowlist).
+
+### Decision
+
+#### 1 — Workspace placement and scope
+
+A new workspace `packages/evals/` (name `@lgtm-buzzer/evals`,
+`"private": true`) is added as a sibling to `protocol`, `core`,
+`adapters/*`, `host`, `extension`. It is **not** a TypeScript project
+reference (no entry in `tsconfig.json`'s `references`, no entry in
+`scripts/build-libs.mjs`), and it is **not** part of
+`scripts/typecheck-tests.mjs` — its purpose is to run promptfoo, not
+to ship code that's imported by other packages.
+
+The root `package.json` `workspaces` array gains
+`"packages/evals"` so `npm install` hoists its deps.
+
+Dependency direction (ADR-1 §Dependency-direction rule) is preserved:
+`evals` depends on `adapters/*` and `@lgtm-buzzer/core` (for the
+`Quiz`/`LLMProviderError` *type* surface used by custom providers). No
+package depends on `evals`. The dependency arrow points strictly
+inward.
+
+#### 2 — What we measure (v1 scope)
+
+Four properties, one promptfoo `assert` per row. All assertions run
+per-test (per-diff × per-adapter). Latency and (claude-api only) cost
+are advisory in v1 — collected and surfaced in the report, not
+threshold-gated as a hard failure:
+
+| Property | promptfoo assertion | Pass criterion |
+|---|---|---|
+| Schema conformance | `is-json` + custom `javascript` assert calling `LlmQuizSchema.safeParse` from `@lgtm-buzzer/adapter-shared` | `safeParse.success === true` AND `correctChoiceIndex` in bounds for every question |
+| Symbol grounding | `contains-any` over `vars.expectedSymbols` (ground-truth tokens authored in the fixture) | At least one `expectedSymbols` entry appears verbatim in the concatenated `prompt` + `choices` text |
+| LLM-rubric relevance / difficulty / discrimination | `llm-rubric` with `provider: anthropic:claude-sonnet-4-7` (uses `ANTHROPIC_API_KEY`) and a rubric prompt that scores 1–5 on each of three axes | Average score ≥ 3.5; per-axis minimum ≥ 2 |
+| Latency (advisory) | `latency` | ≤ 90_000 ms for CLI adapters, ≤ 20_000 ms for `claude-api` |
+
+`cost` is **not** added as a hard assert in v1 — promptfoo's `cost`
+assertion only fires for providers that report `tokenUsage` and we
+don't wire that through from the host-style adapters. The report
+table still shows wall-clock latency per cell.
+
+The locked `SYSTEM_PROMPT` instructs the model to produce *exactly N*
+questions, but historically the LLM under-delivers in ~10 % of runs
+on small diffs. We do **not** add a hard `questions.length === N`
+assertion in v1: the LLM-rubric already penalises low coverage, and a
+hard count gate would mask drift behind a flaky red. Q&A count is
+collected as a numeric column in the report instead.
+
+The "answerable without the diff" anti-property is verified offline
+once, at fixture-creation time, by the human author of each fixture
+(documented in the fixture's `expectedSymbols` rationale). We do
+**not** automate a "filenames-only baseline" run in v1 because the
+SYSTEM_PROMPT receives no filenames-only context shape and re-prompting
+the model with a stripped diff would calibrate against a non-production
+prompt. Adding that gate properly requires a separate prompt template
+and is out of scope.
+
+#### 3 — Fixture set (10 diffs, language × shape matrix)
+
+Fixtures live in `packages/evals/fixtures/`, one folder per fixture
+with:
+
+```
+fixtures/<slug>/
+  diff.patch              # unified diff, ≤ 16 KiB
+  ground-truth.json       # { expectedSymbols: string[], notes: string }
+  README.md               # one-paragraph human authoring rationale
+```
+
+The 10 fixtures (each ≤ 16 KiB; total fixture corpus ≤ 160 KiB):
+
+| Slug | Language | Diff shape | Why it's in the set |
+|---|---|---|---|
+| `ts-add-validator` | TypeScript | new pure function + tests | baseline; happy path |
+| `ts-rename-symbol` | TypeScript | rename across 4 files | detects "did the LLM track the rename" |
+| `go-fix-nil-deref` | Go | one-line bug fix + new test | minimal-diff edge-case probe |
+| `python-add-route` | Python | new Flask route + handler | non-TS coverage; framework-flavoured |
+| `rust-borrow-fix` | Rust | adjust lifetime annotation | language with sharp edges; tests detail capture |
+| `sql-migration` | SQL | up + down migration | non-program-flow diff |
+| `dep-bump-only` | n/a | `package.json` + lockfile bump | edge case — almost no semantic content |
+| `refactor-extract-helper` | TypeScript | move a function across files, no behaviour change | "no behaviour" trap for shallow LLMs |
+| `test-only-change` | TypeScript | tests added, source untouched | tests the LLM doesn't hallucinate source changes |
+| `docs-readme-update` | Markdown | README rewording | should yield `{ questions: [] }` → adapter surfaces `malformed-response { detail: "empty-quiz" }`; eval expects this and treats it as the **negative-control** assertion |
+
+The `dep-bump-only`, `test-only-change`, and `docs-readme-update`
+fixtures intentionally stress the "should the LLM generate at all?"
+boundary. For the docs-only fixture, the eval flips polarity: instead
+of asserting schema-valid quiz output, it asserts the adapter returns
+`malformed-response { detail: "empty-quiz" }`. This is the only
+negative-control test in v1 and lives in a separate
+`empty-quiz-control.eval.yaml` to keep the main config's assertion
+shape uniform.
+
+**Fixture provenance**: all fixtures are hand-authored against
+synthetic codepaths (`packages/evals/fixtures/<slug>/diff.patch` is a
+unified diff written from scratch, not extracted from
+`lgtm-buzzer`'s own git history). Reasons:
+1. Real PRs from this repo would leak the project's own concerns
+   into the eval rubric (the LLM-as-judge has seen this codebase).
+2. The PM spec's `area:security-sensitive` line is unambiguous: no
+   real-world PR data, period. Synthetic diffs are the only safe
+   source.
+
+#### 4 — Custom provider strategy (direct TS API, not host)
+
+promptfoo invokes one custom provider per adapter. Each provider is a
+~40-line TS module under `packages/evals/src/providers/<adapter>.ts`
+exposing:
+
+```ts
+// packages/evals/src/providers/types.ts
+export type EvalProviderOptions = {
+  readonly id: () => string;
+  readonly callApi: (
+    prompt: string,
+    context: { vars: Record<string, unknown> },
+  ) => Promise<EvalProviderResult>;
+};
+
+export type EvalProviderResult = {
+  readonly output: string;          // JSON-stringified Quiz, or "" if Err
+  readonly error?: string;          // populated when LLMProviderError
+  readonly metadata: {
+    readonly adapter: string;       // ADAPTER_ID
+    readonly latencyMs: number;
+    readonly errKind?: string;      // LLMProviderError.kind on failure
+  };
+  readonly cached: false;           // always false; we never cache LLM output
+};
+```
+
+Inside the provider's `callApi`:
+
+1. Resolve the diff from `context.vars.diff` (string injected by the
+   promptfoo testCase).
+2. Construct the adapter factory directly from its TS export
+   (`createClaudeCliProvider`, `createClaudeApiProvider`,
+   `createCodexCliProvider`, `createCopilotCliProvider`). The factory
+   receives a deps object the eval owns: `spawnIO` (for CLI
+   adapters, imported from `@lgtm-buzzer/adapter-shared`), a default
+   `ids`, and config (`model`, `timeoutMs`, `apiKey` for the API
+   variant).
+3. Call `provider.generateQuiz({ diff, questionCount: 3 })` →
+   `IO<LLMProviderError, Quiz>`.
+4. Run the IO with `io.unsafeRun()` (the same pattern the host
+   dispatcher uses, see `packages/host/src/dispatcher.ts` L322).
+5. `.fold(onErr, onQuiz)` into `EvalProviderResult`. Errors are
+   surfaced into `output`/`error` so promptfoo's `javascript` assert
+   can inspect them.
+
+**Why direct TS API, not the native-messaging host:**
+
+- The host is a stdio framing + dispatcher layer (ADR-7, ADR-8,
+  ADR-17, ADR-22) whose purpose is browser↔native plumbing. Wiring
+  promptfoo through it would test the framing layer, not the LLM
+  output.
+- The adapter factories are pure DI factories (per ADR-11 §6 and
+  every adapter ADR since). Their public surface is *designed* to be
+  reusable from Node — that is what `packages/host/src/registry.ts`
+  already does.
+- Bypassing the host eliminates a class of flakes (port handshake,
+  frame size limits, JSON encoding round-trip) that would otherwise
+  pollute the quality signal we care about.
+
+**Diff-flow audit (KEY DIFFERENTIATOR)**: the only PR-derived input
+passed to each provider's `generateQuiz` call is `input.diff`. The
+provider modules MUST NOT pass `expectedSymbols`, fixture metadata,
+or any other field through to the LLM. The reviewer enforces this
+with a single grep: `grep -n "context.vars" packages/evals/src/providers/`
+in each provider may appear only on the line that reads
+`context.vars.diff`. Fixture metadata (`expectedSymbols`) is consumed
+by promptfoo's assertion runner, **not** the provider.
+
+#### 5 — Graceful degradation on missing binaries / keys
+
+CLI adapters require the underlying binary to be installed; the API
+adapter requires `ANTHROPIC_API_KEY`. We do **not** want a missing
+local tool to red the whole evals run.
+
+Each provider performs a precheck at `callApi` time:
+
+- CLI providers shell out `<binary> --version` via `spawnIO` with a
+  3s timeout. `spawn-failed` → return `{ output: "", error:
+  "skipped: binary not on PATH", metadata: { adapter, latencyMs: 0,
+  errKind: "skipped" } }`. promptfoo's `javascript` assert checks
+  `metadata.errKind !== "skipped"` to know whether to score; when
+  skipped, the cell is reported as `SKIP` (not pass, not fail).
+- `claude-api` provider checks `process.env.ANTHROPIC_API_KEY`; if
+  missing, same skip shape.
+
+The README documents that a clean local run requires all four tools.
+CI invokes `evals` in a matrix where each adapter is allowed to skip
+independently, so a contributor without `gh copilot` installed still
+gets useful signal from the other three.
+
+#### 6 — promptfoo configuration
+
+Single config file: `packages/evals/promptfoo.config.yaml`. Shape:
+
+```yaml
+description: LGTM-Buzzer quiz-quality evals (v1, ADR-26)
+prompts:
+  - id: passthrough
+    raw: "{{diff}}"     # diff is forwarded verbatim; SYSTEM_PROMPT lives in the adapter
+providers:
+  - id: claude-cli
+    config:
+      apiBaseUrl: file://./src/providers/claude-cli.js
+  - id: claude-api
+    config:
+      apiBaseUrl: file://./src/providers/claude-api.js
+  - id: codex-cli
+    config:
+      apiBaseUrl: file://./src/providers/codex-cli.js
+  - id: copilot-cli
+    config:
+      apiBaseUrl: file://./src/providers/copilot-cli.js
+defaultTest:
+  assert:
+    - type: is-json
+    - type: javascript
+      value: file://./src/asserts/schema-conformance.js
+    - type: contains-any
+      value: "{{expectedSymbols}}"
+    - type: llm-rubric
+      provider: anthropic:claude-sonnet-4-7
+      value: file://./src/asserts/rubric.md
+    - type: latency
+      threshold: 90000
+tests: file://./tests.generated.json
+```
+
+`tests.generated.json` is produced by
+`packages/evals/scripts/generate-tests.mjs` at run time — it walks
+`fixtures/`, loads each `diff.patch` + `ground-truth.json`, and emits
+one test per fixture with `vars: { diff, expectedSymbols }`. This
+script is the only build step; it's invoked from `npm run evals` via
+`prepromptfoo`.
+
+The negative-control fixture (`docs-readme-update`) is excluded from
+the main config and gets its own file
+`packages/evals/promptfoo.empty-quiz.config.yaml` with a single
+javascript assertion checking
+`metadata.errKind === "malformed-response"`.
+
+#### 7 — CI / gating policy (NON-GATING)
+
+Evals are **explicitly excluded** from `npm run check`.
+
+- `npm run evals` (root, delegates to
+  `npm run evals -w @lgtm-buzzer/evals`) runs the full suite.
+- `npm run evals:quick` runs against three "fast" fixtures
+  (`ts-add-validator`, `dep-bump-only`, `docs-readme-update`) only.
+- CI (`#54`) is **not** modified by this ADR. The architect for #54
+  inherits the constraint that evals run on a separate workflow,
+  triggered by either (a) `label:run-evals` on the PR, (b) a weekly
+  schedule on `main`, or (c) manual `workflow_dispatch`.
+- The baseline result file
+  `packages/evals/results/baseline.json` is committed and updated by
+  a dedicated PR; never auto-updated by CI.
+
+Rationale: evals are slow (CLI providers take 30–60 s/call, API
+~5–15 s/call), consume real LLM credits, and have inherent variance
+even at temperature 0 (the CLI providers may not honour temperature
+settings). Gating PRs on them would either (a) make every PR slow
+and expensive, or (b) tempt contributors to disable the gate.
+Schema conformance — the only assertion that is deterministic — is
+already covered by each adapter's contract test.
+
+#### 8 — Dependencies and licences
+
+Runtime/dev deps in `packages/evals/package.json`:
+
+| Dep | Version | Where | Licence | Use |
+|---|---|---|---|---|
+| `promptfoo` | `^0.x` (latest stable at impl time) | devDependency | MIT | the runner |
+| `@lgtm-buzzer/adapter-shared` | `*` | dependency | MIT (workspace) | `spawnIO`, `LlmQuizSchema`, `parseQuizFromText` |
+| `@lgtm-buzzer/adapter-claude-cli` | `*` | dependency | MIT (workspace) | `createClaudeCliProvider` |
+| `@lgtm-buzzer/adapter-claude-api` | `*` | dependency | MIT (workspace) | `createClaudeApiProvider` |
+| `@lgtm-buzzer/adapter-codex-cli` | `*` | dependency | MIT (workspace) | `createCodexCliProvider` |
+| `@lgtm-buzzer/adapter-copilot-cli` | `*` | dependency | MIT (workspace) | `createCopilotCliProvider` |
+| `@lgtm-buzzer/core` | `*` | dependency | MIT (workspace) | `Quiz`/`LLMProviderError` types only |
+| `monadyssey` | `2.0.1` | dependency | MIT | `io.unsafeRun()` (same exact-pin as everywhere else) |
+| `zod` | `^4.4.3` | dependency | MIT | re-using `LlmQuizSchema` from `_shared` |
+
+`promptfoo` is **dev-only**. No core or protocol surface is affected.
+ADR-1's exact-pin rule for `monadyssey` is honoured. ADR-3's
+forbidden-FP-libs ESLint rule already applies (the workspace globs
+match `packages/*/**`, but a new override block is added below to
+match the workspace's `evals` patterns so the same forbidden-lib
+patterns apply).
+
+#### 9 — Constitution constraints that still apply
+
+- **Diff-only invariant** (key differentiator): only `vars.diff`
+  reaches the adapter — §4 audit above.
+- **No real PR data**: §3 fixture provenance — synthetic only.
+- **Licence allowlist** (CLAUDE.md §Dependency rules): all deps above
+  on the approved list.
+- **No throw for expected failures**: providers map `LLMProviderError`
+  into the result shape; no exception is allowed to escape `callApi`
+  except for programmer errors. A top-level `try/catch` in each
+  provider rethrows after recording `errKind: "internal"` so the
+  promptfoo run isn't crashed by a bug in the eval harness.
+- **ESLint `no-restricted-imports`**: a new override block is added
+  for `packages/evals/**/*.ts` that re-applies
+  `FORBIDDEN_FP_LIBS.paths` + `patterns`. No DOM-API ban (evals run
+  in Node). Node APIs are explicitly allowed (`fs`, `path`,
+  `child_process` via `spawnIO`).
+
+Constitution constraints that do **not** apply to evals:
+- The `core`/`adapter` IO discipline. Eval providers convert
+  `IO<E, A>` to a `Promise<EvalProviderResult>` at the harness
+  boundary — that's the analogue of the host's `unsafeRun()` call
+  site, not a new boundary violation.
+
+### Affected workspaces
+
+New:
+- `packages/evals/` (this workspace; not a TS project reference)
+
+Modified:
+- `package.json` (root) — add `packages/evals` to `workspaces`; add
+  `evals` and `evals:quick` scripts; do NOT add `evals` to `check`.
+- `eslint.config.js` — new override block for
+  `packages/evals/**/*.ts` re-applying `FORBIDDEN_FP_LIBS`.
+
+Untouched:
+- `tsconfig.json` (root) — evals are not a TS project reference.
+- `scripts/build-libs.mjs` — same reason.
+- `scripts/typecheck-tests.mjs` — same reason.
+- All existing workspaces — no API surface changes.
+
+Dependency direction (ADR-1) reaffirmed:
+
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+                  ← evals (dev-only, sibling of host)
+```
+
+`evals` imports from `adapters/*` and `core` (type-only); nothing
+imports `evals`.
+
+### Types and functions
+
+```ts
+// packages/evals/src/providers/types.ts
+export type EvalProviderResult = {
+  readonly output: string;
+  readonly error?: string;
+  readonly metadata: {
+    readonly adapter: string;
+    readonly latencyMs: number;
+    readonly errKind?:
+      | "skipped"
+      | "internal"
+      | "subprocess"
+      | "transport"
+      | "malformed-response"
+      | "timeout"
+      | "cancelled";
+  };
+  readonly cached: false;
+};
+
+export type CallApiContext = { readonly vars: { readonly diff: string } };
+
+export type EvalProviderModule = {
+  readonly default: {
+    readonly id: () => string;
+    readonly callApi: (
+      prompt: string,
+      context: CallApiContext,
+    ) => Promise<EvalProviderResult>;
+  };
+};
+```
+
+```ts
+// packages/evals/src/providers/<adapter>.ts (one per adapter)
+export declare const callApi: (
+  prompt: string,
+  context: CallApiContext,
+) => Promise<EvalProviderResult>;
+```
+
+```ts
+// packages/evals/src/asserts/schema-conformance.ts
+import { LlmQuizSchema } from "@lgtm-buzzer/adapter-shared";
+
+export declare const assertSchemaConformance: (
+  output: string,
+) => { pass: boolean; reason: string };
+```
+
+```ts
+// packages/evals/scripts/generate-tests.mjs
+// Emits tests.generated.json by walking fixtures/.
+// Pure ESM script, no exports.
+```
+
+### File layout
+
+New (all under `packages/evals/`):
+
+```
+package.json
+tsconfig.json
+README.md
+promptfoo.config.yaml
+promptfoo.empty-quiz.config.yaml
+scripts/
+  generate-tests.mjs
+src/
+  providers/
+    types.ts
+    claude-cli.ts
+    claude-api.ts
+    codex-cli.ts
+    copilot-cli.ts
+    precheck.ts       # shared --version probe with 3s spawnIO budget
+  asserts/
+    schema-conformance.ts
+    rubric.md         # plain text rubric, loaded by llm-rubric
+fixtures/
+  ts-add-validator/{diff.patch, ground-truth.json, README.md}
+  ts-rename-symbol/...
+  go-fix-nil-deref/...
+  python-add-route/...
+  rust-borrow-fix/...
+  sql-migration/...
+  dep-bump-only/...
+  refactor-extract-helper/...
+  test-only-change/...
+  docs-readme-update/...
+results/
+  baseline.json          # committed; updated by dedicated PR
+  .gitignore             # ignore everything else under results/
+```
+
+Modified:
+- `package.json` (root) — workspaces + scripts.
+- `eslint.config.js` — new override block.
+
+### Sequence
+
+Per `npm run evals`:
+
+1. `pretest` hook → `node scripts/generate-tests.mjs` walks
+   `fixtures/`, emits `tests.generated.json` with one entry per
+   fixture (`{ vars: { diff, expectedSymbols }, options: { ... } }`).
+2. `promptfoo eval -c promptfoo.config.yaml` runs.
+3. For each (test × provider) cell:
+   a. promptfoo loads the provider module (`file://.../*.js` after
+      `tsc`).
+   b. promptfoo calls `provider.callApi(prompt, { vars })`.
+   c. The provider runs its precheck (`<binary> --version` for CLI;
+      `ANTHROPIC_API_KEY` for API). Missing → `errKind: "skipped"`.
+   d. Otherwise, the provider builds the adapter via its factory,
+      `provider.generateQuiz({ diff, questionCount: 3 })`, runs the
+      IO with `unsafeRun()`, folds to `EvalProviderResult`.
+   e. promptfoo applies `defaultTest.assert` to the result.
+4. promptfoo writes the JSON + HTML report under `results/`.
+5. The dev compares against `results/baseline.json` manually before
+   committing a baseline update.
+
+For `npm run evals:empty-quiz-control`:
+- Same flow with `promptfoo.empty-quiz.config.yaml`; asserts every
+  cell returns `errKind: "malformed-response"`.
+
+### Error cases
+
+| Failure | Surfaced as | Eval cell verdict |
+|---|---|---|
+| Binary not on PATH | `errKind: "skipped"` | SKIP (neither pass nor fail) |
+| `ANTHROPIC_API_KEY` unset (claude-api) | `errKind: "skipped"` | SKIP |
+| Adapter returns `LLMProviderError.subprocess` | `errKind: "subprocess"`, `error` populated | FAIL |
+| Adapter returns `malformed-response` | `errKind: "malformed-response"` | FAIL (PASS for the negative-control fixture) |
+| Adapter returns `timeout` | `errKind: "timeout"` | FAIL |
+| Caller cancellation (Ctrl-C) | promptfoo propagates SIGINT to the provider; provider relies on `spawnIO` SIGTERM→SIGKILL bounded cancellation (ADR-9). | run aborts cleanly |
+| Internal harness bug | `errKind: "internal"`, top-level try/catch | FAIL with stack in `error` |
+| LLM-rubric judge call fails (network) | promptfoo reports as `error` on the rubric assert | cell partial-PASS / partial-FAIL surfaced in report |
+
+No `throw` for expected failures. Programmer-error throws (e.g.,
+unexpected fixture shape) propagate to the promptfoo runner and red
+the run — which is the desired behaviour for harness bugs.
+
+### Test strategy
+
+Evals are themselves the test suite for the prompts. Tests **of the
+eval harness** (the provider modules and assertions) live in
+`packages/evals/src/**/*.test.ts` and run under the root `vitest`
+gate, contributing to `npm run check`:
+
+| File | Cases |
+|---|---|
+| `src/providers/precheck.test.ts` | spawnIO mock returns `spawn-failed` → `skipped`; happy path → `available`; 3s budget honoured |
+| `src/providers/claude-cli.test.ts` | factory wired with fake `spawnIO`; diff in `context.vars.diff` reaches `generateQuiz`; **canary: any non-diff `vars` key is ignored** (KEY DIFFERENTIATOR); `LLMProviderError.subprocess` → `errKind: "subprocess"`; happy path serialises Quiz JSON |
+| `src/providers/claude-api.test.ts` | fake HttpClient; same canary; `ANTHROPIC_API_KEY` precheck |
+| `src/providers/codex-cli.test.ts` | mirror of claude-cli |
+| `src/providers/copilot-cli.test.ts` | mirror of claude-cli |
+| `src/asserts/schema-conformance.test.ts` | valid Quiz JSON → pass; invalid JSON → fail; OOB index → fail; empty questions → fail; non-Quiz JSON → fail; reuses `LlmQuizSchema` from `_shared` to ensure single source of truth |
+| `scripts/generate-tests.test.mjs` | fixture walk produces N test cases; missing `ground-truth.json` → throws (programmer error) |
+
+The harness tests **do not** call real LLMs; they use the same fake
+spawnIO / HttpClient pattern the adapter tests use (ADR-14
+`provider.test.ts`, ADR-20 `provider.test.ts`).
+
+Coverage target: 80 % on provider modules; 95 % on
+`schema-conformance` (it's a pure function).
+
+A diff-only canary case is **mandatory** in each provider test
+(reviewer enforces): the test injects a fake `context.vars` containing
+`{ diff: SHORT_DIFF, expectedSymbols: ["LEAK_CANARY"], prTitle:
+"LEAK_CANARY", description: "LEAK_CANARY" }`, runs `callApi`, and
+asserts (a) the fake `spawnIO` / `HttpClient` was called once and (b)
+the captured stdin / HTTP body does NOT contain `"LEAK_CANARY"`.
+This is the same shape ADR-14 §Test strategy case #2 already uses
+for adapters — extending it to the evals harness is what keeps the
+diff-only invariant a closed loop end to end.
+
+### Consequences
+
+- **First quality signal for quiz output.** Prompt tweaks now have a
+  measurable target. The locked `SYSTEM_PROMPT` is calibrated against
+  the v1 fixture set; non-trivial prompt changes must update the
+  baseline.
+- **`packages/evals/` is a developer tool, not shipped code.**
+  Distinct from every other workspace: not in `tsconfig.json`
+  references, not in `build-libs.mjs`, not in `typecheck-tests.mjs`.
+  Documented in its `README.md`.
+- **Direct TS-API providers, not host plumbing.** Eval signal is
+  about LLM output quality, not framing-layer correctness. Two
+  separate concerns, two separate harnesses.
+- **Diff-only invariant extended to the eval boundary.** Each
+  provider has a mandatory canary test asserting non-diff `vars`
+  never reach the adapter.
+- **Non-gating CI policy.** Evals run on label / schedule, never on
+  every PR. Schema conformance — the only deterministic signal — is
+  already covered by adapter contract tests.
+- **Graceful skip on missing tools.** Contributors without all four
+  CLIs installed still get useful signal from the others. CI matrix
+  can run each provider in isolation.
+- **No new runtime deps in shipped code.** `promptfoo` is a
+  devDependency of the evals workspace only.
+- **Baseline file is a versioned artifact.** Regressions become
+  visible in diff review; refreshing the baseline is a deliberate
+  PR, not auto-updated by CI.
+- **Open path: A/B prompt variants, multi-turn eval, fairness/bias
+  testing, real `cost` assertions.** Explicitly out of v1 scope; each
+  is a future ADR.
+- **`SYSTEM_PROMPT` in `_shared` is now load-bearing for the evals.**
+  Comment in `_shared/prompt.ts` already references issue #52; the
+  evals workspace README points back. Any future ADR amendment to
+  `SYSTEM_PROMPT` must include a baseline-refresh step.
+- **Reversibility high.** Self-contained workspace; removing it is a
+  three-file revert (root `package.json`, `eslint.config.js`, delete
+  `packages/evals/`).
+- **Binding for reviewer (PR #52 implementation)**:
+  (a) `packages/evals/` is NOT a TS project reference.
+  (b) Each provider module passes ONLY `context.vars.diff` to
+      `generateQuiz`; canary test enforced.
+  (c) `npm run check` does NOT run evals.
+  (d) Every fixture has `diff.patch`, `ground-truth.json`,
+      `README.md`.
+  (e) `promptfoo` is a `devDependency`, not a `dependency`, of the
+      evals workspace.
+  (f) ESLint forbidden-FP-libs block is re-applied via
+      `packages/evals/**/*.ts` override.
+  (g) Baseline file is committed; results directory otherwise
+      `.gitignore`d.
+
+---
+
+## ADR-27 (2026-05-23): CI workflows — required check + e2e on PR, manual/scheduled evals, branch protection
+**Date**: 2026-05-23
+**Issue**: #54
+**Status**: Accepted
+
+### Context
+
+M3 ships 854 unit tests across the workspaces, 19 Playwright e2e specs in
+`packages/extension/e2e/` (ADR-25), and a non-gating promptfoo evals suite in
+`packages/evals/` (ADR-26). The only quality gate today is the developer's
+local `npm run check`. Every push to `main` is implicitly trusted; nothing
+prevents a regressed build, a failing unit test, an ESLint error, or a broken
+e2e spec from landing.
+
+Constraints that shape this design:
+
+- **`npm run check` is the canonical gate** (root `package.json` L30):
+  `build → test → lint → typecheck:tests`. ADR-2 made `typecheck:tests`
+  binding because `tsc -b` excludes `**/*.test.ts` in every workspace. CI
+  must run the same command — not a hand-assembled re-implementation that
+  drifts.
+- **Playwright e2e cannot run in headless mode.** ADR-19 §spec-comment-1 and
+  ADR-25 §Context both bind `headless: false`: Chrome does not expose MV3
+  extension service workers to CDP in headless mode;
+  `context.waitForEvent("serviceworker")` times out unconditionally. The
+  e2e config (`packages/extension/e2e/playwright.config.ts` L36) carries
+  the binding comment `On CI: use xvfb-run (#54)`. Linux CI must therefore
+  run e2e under `xvfb-run`.
+- **Evals cost real money and require credentials.** ADR-26 §7 makes evals
+  explicitly NON-GATING. The `claude-api` provider needs
+  `ANTHROPIC_API_KEY`; the three CLI providers (`claude-cli`, `codex-cli`,
+  `copilot-cli`) need binaries that themselves require interactive logins
+  (`claude login`, `codex login`, `gh auth`). CI cannot acquire those
+  logins, so CLI-provider cells will SKIP in CI (ADR-26 §5 graceful-skip
+  contract). Only `claude-api` is meaningfully runnable in CI.
+- **Single-monorepo workspace.** All checks run from the repo root with
+  `npm install` (root) hoisting workspaces. No per-workspace install loops.
+- **MV3 manifest is built by `wxt`** (`packages/extension/build` script
+  invokes `wxt build`). E2e specs load the unpacked extension from
+  `packages/extension/.output/chrome-mv3/`. The `build` step in
+  `npm run check` already produces this output, so the e2e job can reuse
+  the build artifact rather than rebuilding.
+- **No release automation, no Docker, no coverage thresholds in v1.**
+  Issue #55 owns packaging; coverage gating is premature with the current
+  test count distribution.
+- **GitHub Actions only.** The user is on GitHub; no alternative CI exists.
+- **Linux-only runners for v1.** macOS minutes cost 10x; Windows minutes
+  cost 2x. v1 ships Chrome MV3 only — Linux is the cheapest correct host.
+
+### Decision
+
+Two workflow files under `.github/workflows/`:
+
+1. **`.github/workflows/ci.yml`** — required, blocking CI. Two jobs running
+   in parallel: `unit-and-build` (runs `npm run check`) and `e2e` (runs the
+   Playwright suite under `xvfb-run`). Triggers: `push` to `main` and
+   `pull_request` against `main`. Both jobs upload artifacts on failure.
+2. **`.github/workflows/evals.yml`** — non-blocking, cost-bearing evals.
+   Triggers: `workflow_dispatch` (manual), `schedule` (weekly Mon 09:00 UTC
+   on `main`), and `pull_request` gated on the `run-evals` label. Runs only
+   the `claude-api` provider via `ANTHROPIC_API_KEY`; the three CLI
+   providers SKIP in CI (no interactive login). Uploads
+   `packages/evals/results/` as artifact.
+
+Plus one documentation file `.github/workflows/README.md` describing how to
+trigger evals, what each workflow checks, and how to add new jobs.
+
+#### Affected workspaces
+
+Repo-level only (`.github/workflows/`). No `packages/*` source files touched
+by this ADR.
+
+- One root file added: `package.json` gets an `engines.node` bump from
+  `>=20` to `>=22` (Node 22 LTS) so the CI Node choice is anchored in
+  source rather than the workflow file. ADR-1's npm-workspaces decision is
+  unchanged; the bump is from "any 20+" to "anchored at the 22 LTS major"
+  so CI doesn't drift from the dev environment.
+
+Dependency arrows reaffirmed (ADR-1):
+
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+                  ← evals (dev-only, sibling of host)
+```
+
+CI workflows do not introduce any new code that imports across workspaces;
+they only run npm scripts.
+
+#### Workflow design
+
+##### 1. `.github/workflows/ci.yml`
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (saves minutes on rapid pushes).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default minimal permissions; jobs that need more grant explicitly.
+permissions:
+  contents: read
+
+jobs:
+  unit-and-build:
+    name: unit + build + lint + typecheck:tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run full check gate
+        run: npm run check
+
+      - name: Upload coverage on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.run_id }}
+          path: |
+            packages/*/coverage/
+            coverage/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  e2e:
+    name: extension e2e (xvfb + chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Chromium (with system deps for xvfb)
+        run: npx playwright install --with-deps chromium
+        # --with-deps installs xvfb + libs even on cache hit (cheap apt step).
+
+      - name: Build extension
+        run: npm run build:extension
+
+      - name: Run e2e under xvfb
+        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' npm --workspace=@lgtm-buzzer/extension run test:e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_id }}
+          path: |
+            packages/extension/playwright-report/
+            packages/extension/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+```
+
+Key design choices:
+
+- **`npm ci` not `npm install`.** Deterministic — required for reproducible
+  CI. Fails the build if `package-lock.json` is stale.
+- **`node-version-file: .nvmrc`.** Single source of truth. The file
+  contains `22` (LTS) and is checked into the repo by this ADR's
+  implementation. Bumping Node is a `.nvmrc` edit; the workflows
+  automatically follow.
+- **`cache: npm`** on `setup-node` caches `~/.npm` keyed on
+  `package-lock.json`. First run cold ~60s; warm ~10s.
+- **Playwright browsers cached separately** via `actions/cache@v4`.
+  Browser bundles are ~150 MiB; npm cache does not cover them.
+- **`--with-deps` runs on every job** (not gated on cache miss). It
+  installs OS-level libs (xvfb, libnss3, fonts) via `apt-get` —
+  necessary even when the browser binary is cached, because system libs
+  aren't part of `~/.cache/ms-playwright`.
+- **`xvfb-run --auto-servernum`** picks a free display number; the
+  `--server-args` give a 1280x1024 24-bit display, which matches what
+  `packages/extension/e2e/playwright.config.ts` and ADR-25's specs assume.
+- **Two parallel jobs, no cross-job dependency.** `e2e` does a separate
+  `npm ci` + build because cross-job artifacts cost more time to upload /
+  download than rebuilding from a warm npm cache. (Re-evaluate if
+  `unit-and-build` ever exceeds 7 minutes.)
+- **`concurrency` cancels superseded runs.** A rapid sequence of pushes
+  to the same PR branch cancels the older run. `cancel-in-progress: true`
+  is safe here because all gates are idempotent; no deployment lives in
+  this workflow.
+- **`permissions: contents: read`** minimises the GITHUB_TOKEN scope. The
+  default Actions token has broader perms; downgrading reduces blast
+  radius from a compromised action.
+- **Artifact retention 7 days.** Long enough for triage, short enough not
+  to bloat storage.
+
+##### 2. `.github/workflows/evals.yml`
+
+```yaml
+name: Evals (non-gating)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Which suite to run"
+        required: true
+        default: "quick"
+        type: choice
+        options:
+          - quick
+          - full
+          - empty-quiz-control
+  schedule:
+    # Mondays 09:00 UTC — weekly drift signal.
+    - cron: "0 9 * * 1"
+  pull_request:
+    types: [labeled, synchronize]
+    branches: [main]
+
+concurrency:
+  group: evals-${{ github.ref }}
+  cancel-in-progress: false  # Evals cost money; don't cancel a mid-run cell.
+
+permissions:
+  contents: read
+
+jobs:
+  evals:
+    name: promptfoo evals (claude-api only in CI)
+    # Run on workflow_dispatch / schedule unconditionally; on pull_request
+    # only when the PR carries the `run-evals` label.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'run-evals'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build workspace libs (evals depend on built adapter outputs)
+        run: npm run build:libs
+
+      - name: Run evals
+        run: |
+          case "${{ github.event_name == 'workflow_dispatch' && inputs.suite || 'quick' }}" in
+            quick)               npm run evals:quick ;;
+            full)                npm run evals ;;
+            empty-quiz-control)  npm --workspace=@lgtm-buzzer/evals run evals:empty-quiz-control ;;
+            *)                   npm run evals:quick ;;
+          esac
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evals-results-${{ github.run_id }}
+          path: packages/evals/results/
+          if-no-files-found: ignore
+          retention-days: 30
+```
+
+Key design choices:
+
+- **Manual dispatch is the default trigger.** Cost discipline. The
+  `workflow_dispatch` input lets the user pick `quick` (3 fixtures, ~$0.30)
+  or `full` (10 fixtures, ~$1) without editing the workflow.
+- **Weekly schedule runs `quick`.** ADR-26 §3 makes the full 10-fixture
+  set hand-authored; a weekly quick run on `main` produces a baseline
+  drift signal without burning $1/week.
+- **`pull_request: labeled`** plus `if: contains(... labels ..., 'run-evals')`
+  lets a reviewer opt a PR into evals by labelling it. Required because the
+  reviewer agent or human reviewer may want to validate a prompt change
+  before merging.
+- **Only `claude-api` actually executes.** CLI adapters' precheck
+  (ADR-26 §5) returns `errKind: "skipped"` because `claude` / `codex` /
+  `gh copilot` are not on PATH. The eval cell is reported SKIP, not FAIL.
+  No CLI binary install attempted — interactive login requirement is
+  inherently incompatible with CI.
+- **`ANTHROPIC_API_KEY` lives in repo secrets**, NOT in `vars`. Required
+  for the API provider and for the `llm-rubric` judge call.
+- **`cancel-in-progress: false`.** A mid-run cancellation can leak credits
+  (the API call is in flight when the cancel arrives) without producing a
+  result.
+- **Build only libs, not the extension.** Evals don't need the MV3 bundle.
+- **30-day artifact retention.** Evals are a quality signal; longer-lived
+  than CI artifacts because the baseline conversation spans weeks.
+- **Use `npm --workspace=@lgtm-buzzer/evals run evals:empty-quiz-control`**
+  directly for the negative-control suite — there's no root-level
+  pass-through script for it. `quick` and `full` have root scripts; the
+  control suite does not.
+- **No matrix.** A four-way provider matrix on each fixture would make
+  the workflow file ~3x more complex without changing what runs in CI
+  (only `claude-api` has credentials). Locally, the matrix is implicit
+  via the four provider modules; in CI, it collapses to one.
+
+##### 3. `.github/workflows/README.md`
+
+A short prose file (one screen) covering:
+- "What runs when" table mapping trigger → workflow → suite.
+- How to manually dispatch the evals workflow (`gh workflow run evals.yml -f suite=full`).
+- How to opt a PR into evals (add the `run-evals` label).
+- How to add a new job to `ci.yml` (must keep it under the timeout budget;
+  must run `npm ci` deterministically; must be gated on
+  `pull_request` + `push` only).
+- Where to add new secrets (Repo Settings → Secrets and variables → Actions).
+- Why we don't run CLI evals in CI (the `claude` / `codex` / `gh copilot`
+  CLIs require interactive login that CI cannot complete).
+- The branch-protection follow-up (see §Branch protection follow-up below).
+
+#### Branch protection follow-up (manual, post-merge)
+
+After this ADR's workflow lands and runs green at least once on `main`,
+the repo admin (the user) must update the branch-protection rule for
+`main` in Repo Settings → Branches:
+
+1. Mark the following status checks as **Required**:
+   - `unit-and-build` (from `ci.yml`).
+   - `e2e` (from `ci.yml`).
+2. Leave `evals` UN-required (it's intentionally non-gating).
+3. Keep "Require branches to be up to date" enabled.
+4. Keep "Require pull request reviews before merging" at its current
+   setting (out of scope for this ADR).
+
+This step is manual because GitHub branch-protection API changes via
+Actions require a PAT with `repo` scope and we don't want to introduce
+PAT management for a one-time toggle. Document the step in
+`.github/workflows/README.md` so it's reproducible if the repo is ever
+re-bootstrapped.
+
+#### Node version anchoring
+
+The root `package.json` currently has `"engines": { "node": ">=20" }`,
+which is too loose for CI (range, not a pin) and doesn't match the LTS
+schedule. This ADR anchors Node 22 LTS:
+
+1. `package.json` `engines.node` → `">=22"`.
+2. New `.nvmrc` containing `22` at repo root. The CI workflows read this
+   via `node-version-file: .nvmrc` (single source of truth — no value
+   duplicated in the YAML).
+3. Dev contributors with `nvm` get the right version automatically (`nvm
+   use`).
+
+Node 22 LTS support extends to April 2027. Reassess at v1.1.
+
+#### Types
+
+This ADR introduces no application-level types. It does anchor one
+configuration shape:
+
+```yaml
+# .github/workflows/evals.yml workflow_dispatch input
+inputs:
+  suite:
+    type: choice
+    options: [quick, full, empty-quiz-control]
+    default: quick
+```
+
+#### File layout
+
+New files:
+
+```
+.github/
+  workflows/
+    ci.yml                # required CI: unit+build, e2e
+    evals.yml             # non-gating: manual + scheduled + label
+    README.md             # how to trigger / extend / required secrets
+.nvmrc                    # contains "22"
+```
+
+Modified files:
+
+```
+package.json              # engines.node: ">=20" → ">=22"
+README.md                 # adds CI status badge (top of doc, under title)
+CLAUDE.md                 # references .github/workflows/ in the Build/Test/Lint section
+```
+
+No `packages/*` source files modified.
+
+#### Sequence
+
+**On `push` to `main` or `pull_request` against `main`:**
+
+1. GitHub Actions schedules `unit-and-build` and `e2e` jobs in parallel.
+2. `unit-and-build`:
+   a. Checkout → setup Node from `.nvmrc` → `npm ci`.
+   b. `npm run check` (build → test → lint → typecheck:tests).
+   c. On failure: upload `coverage/` artifacts; job fails red.
+3. `e2e` (in parallel):
+   a. Checkout → setup Node from `.nvmrc` → `npm ci`.
+   b. Restore Playwright browser cache.
+   c. `npx playwright install --with-deps chromium` (installs system
+      deps including `xvfb` even on cache hit).
+   d. `npm run build:extension` (produces `.output/chrome-mv3/`).
+   e. `xvfb-run … npm --workspace=@lgtm-buzzer/extension run test:e2e`.
+   f. On failure: upload `playwright-report/`, `test-results/`; job
+      fails red.
+4. Both jobs report their status to the PR's check suite.
+5. Branch protection (manual follow-up) blocks merge until both are
+   green.
+
+**On `workflow_dispatch` (evals.yml):**
+
+1. User invokes `gh workflow run evals.yml -f suite=<quick|full|empty-quiz-control>`.
+2. `evals` job runs:
+   a. Checkout → setup Node → `npm ci` → `npm run build:libs`.
+   b. Switch on `inputs.suite`:
+      - `quick` → `npm run evals:quick`.
+      - `full` → `npm run evals`.
+      - `empty-quiz-control` → workspace-direct
+        `npm --workspace=@lgtm-buzzer/evals run evals:empty-quiz-control`.
+   c. `promptfoo` executes; `claude-api` provider runs, three CLI
+      providers SKIP per ADR-26 §5.
+   d. Upload `packages/evals/results/` artifact (30-day retention).
+
+**On `schedule` (Mon 09:00 UTC, evals.yml):**
+
+1. Same as `workflow_dispatch` with `inputs.suite` defaulted to `quick`
+   (the YAML conditional `github.event_name == 'workflow_dispatch' &&
+   inputs.suite || 'quick'` resolves to `'quick'` because `inputs` is
+   absent on schedule triggers).
+2. Result artifact retained for 30 days; surfaces baseline drift.
+
+**On `pull_request` with `run-evals` label (evals.yml):**
+
+1. The job's `if:` condition matches; the run proceeds with
+   `inputs.suite || 'quick'` (defaults to quick because no
+   `workflow_dispatch` input is present).
+2. Same flow as schedule.
+3. Artifact uploaded; PR reviewer downloads to inspect.
+
+#### Error cases
+
+| Failure | Surfaced as | Handling |
+|---|---|---|
+| `npm ci` fails (stale lockfile) | `unit-and-build` red | Dev runs `npm install` locally, commits lockfile update. |
+| `npm run check` fails (unit/lint/typecheck) | `unit-and-build` red, coverage uploaded | Dev fixes locally, re-pushes. |
+| Playwright browser install fails (network) | `e2e` red | Retry; if persistent, file infra issue. Cache hit avoids re-download on the next run. |
+| `xvfb-run` not present | `e2e` red at xvfb invocation | `--with-deps` installs `xvfb`; if it didn't, infra regression. |
+| `e2e` flake (timeout in a spec) | `e2e` red with HTML report uploaded | Dev opens the artifact, decides if it's a genuine break or flake. **Retries are NOT auto-added in v1**; flaky tests are a quality smell, not a CI knob. |
+| `ANTHROPIC_API_KEY` missing in evals run | All `claude-api` cells SKIP per ADR-26 §5; CLI cells SKIP independently | Workflow still goes green (evals are non-gating); artifact shows the SKIPs. User notices via the artifact's report. |
+| `ANTHROPIC_API_KEY` present but invalid | `claude-api` cells return `LLMProviderError.transport` → `errKind: "transport"`, cell FAILs | Run reports red but doesn't block merge (workflow not in branch-protection required list). |
+| Scheduled run on a weekend skip-day | n/a | Mondays 09:00 UTC is intentional — captures the start-of-week drift. |
+| Concurrency cancellation on `ci.yml` | Older run cancelled; new run starts fresh | Expected. Idempotent gates make cancellation safe. |
+| Concurrency cancellation on `evals.yml` | Disabled (`cancel-in-progress: false`) | Avoids leaking $$$ mid-call. |
+| `actions/checkout@v4` major-version drift | Pinned to `v4` major; minor versions auto-resolve | Re-pin via dedicated PR if the major bumps. |
+| Forked-PR access to `ANTHROPIC_API_KEY` | GitHub's default is to NOT expose secrets to forked-PR runs | Evals on forked PRs SKIP API too — by design (no token leak). Document in README. |
+
+No `throw` paths apply here — workflows aren't TS code; the equivalent
+discipline is "every step's exit code is checked, every artifact uploaded
+on failure, no `continue-on-error: true` hides a real break."
+
+#### Test strategy
+
+CI workflows are themselves the test strategy for the project. There is
+no automated test of the workflows other than running them. Validation
+plan for the implementation PR:
+
+1. **Local validation** before push:
+   - `act -W .github/workflows/ci.yml` (optional; `act` doesn't reproduce
+     xvfb perfectly so this is a smoke check only).
+   - `gh workflow view ci.yml` after push to inspect the parsed YAML.
+2. **First-push validation**:
+   - Open a draft PR; observe both jobs run to completion.
+   - Intentionally break one test in the draft; observe `unit-and-build`
+     fails red and uploads coverage.
+   - Revert; observe both green.
+3. **e2e validation**: confirm `xvfb-run` produces a 30+-second e2e run
+   (cold) and 15+-second run (warm browser cache). If durations vastly
+   exceed budget (10/15-min timeouts), open a follow-up to investigate.
+4. **Evals validation**: dispatch `evals.yml` with `suite=quick` once
+   the secret is set. Confirm `claude-api` cells run, CLI cells SKIP,
+   artifact uploaded. Cost should be ~$0.30.
+5. **Branch-protection toggle**: after first green run on `main`,
+   the user manually adds `unit-and-build` and `e2e` to required checks.
+
+Manual smoke is acceptable here because workflow logic is small,
+self-checking (CI is its own test), and the workflows themselves run
+the project's full unit/e2e suites which carry deep test coverage.
+
+#### Speed budget
+
+| Job | Cold | Warm (cache hit) | Timeout |
+|---|---|---|---|
+| `unit-and-build` | ~4 min | ~2 min | 10 min |
+| `e2e` | ~8 min | ~5 min | 15 min |
+| `evals` (quick) | ~5 min | ~3 min | 30 min |
+| `evals` (full) | ~20 min | ~15 min | 30 min |
+
+If `unit-and-build` regularly exceeds 7 minutes, revisit whether to
+split `test` into per-workspace parallel jobs. If `e2e` regularly
+exceeds 12 minutes, revisit the test-count budget set by ADR-25 (15-25
+cases).
+
+#### What is NOT in v1 (explicit out-of-scope)
+
+- **Coverage threshold gates.** ADR-1 sets coverage targets (90% core,
+  80% adapters) as goals, not gates. Adding a gate is premature given
+  current test count distribution.
+- **macOS / Windows runners.** Linux is sufficient for v1 (Chrome MV3
+  only). Adding macOS or Windows costs 10x and 2x respectively.
+- **Release automation.** Issue #55 owns packaging the host binary.
+  Release tag → asset upload comes after #55 ships.
+- **Auto-merge.** Manual merge is fine at v1's velocity.
+- **Dependabot / Renovate.** Manual deps for v1; revisit at v1.1.
+- **Docker container builds.** No Docker image yet.
+- **Native messaging host integration test in CI.** The host expects a
+  configured `claude` CLI; CI can't reproduce that. Smoke is manual.
+- **Cross-browser e2e (Firefox / Safari).** Chrome MV3 only at v1.
+- **PR comment bots.** GitHub's native check UI is enough.
+- **Flake-retry knobs.** `retries: 0` on the Playwright config carries.
+  Adding `retries: 2` in CI would mask real instability. Reassess only
+  if a specific spec flakes ≥ 5% on otherwise-passing PRs.
+
+### Consequences
+
+- **First automated quality gate.** Every PR now runs the same `npm run
+  check` the dev runs locally, plus the e2e suite under xvfb. Drift
+  between "works on my machine" and "works on `main`" closes.
+- **Two independent gates.** `unit-and-build` and `e2e` run in parallel;
+  one job's failure doesn't mask the other. Both are required for merge
+  (after manual branch-protection toggle).
+- **Evals stay non-gating.** ADR-26 §7 is preserved verbatim — evals
+  never block a PR; they produce a quality signal on demand or weekly.
+- **Cost discipline.** Only `claude-api` runs in CI. Three CLI providers
+  SKIP because their binaries can't be installed-and-authenticated
+  unattended. Weekly schedule on `quick` keeps the API bill ~$1.30/month.
+- **Single source of truth for Node version.** `.nvmrc` is read by both
+  the workflows and any contributor with `nvm`. Bumping Node is a
+  one-line `.nvmrc` edit.
+- **Cancellation policy split**: `ci.yml` cancels superseded runs
+  (idempotent gates); `evals.yml` does not (avoids $$$ leak).
+- **One manual follow-up step.** After the first green run, the user
+  toggles branch protection to require `unit-and-build` + `e2e`. This is
+  documented in `.github/workflows/README.md`.
+- **Workflow files are reviewable.** Each YAML file stays under ~150
+  lines; total surface ~300 lines + a short README. Easy to audit.
+- **Reversibility high.** Workflows are self-contained; deletion is one
+  PR with no impact on the runtime monorepo.
+- **Security posture**:
+  - GITHUB_TOKEN scoped to `contents: read`.
+  - `ANTHROPIC_API_KEY` is a repo secret, never exposed to forked PRs
+    (GitHub default).
+  - No third-party Actions beyond `actions/checkout`, `actions/setup-node`,
+    `actions/cache`, `actions/upload-artifact` — all official.
+  - Action versions pinned to majors (`@v4`). Re-evaluate dedicated
+    SHA pinning if the security threat model evolves.
+- **Future-proofing**: evals workflow's matrix-collapse to one provider
+  is intentional. If CI ever acquires CLI-login automation (e.g.,
+  pre-baked container images with logged-in CLIs), the YAML can fan out
+  into a provider matrix without restructuring the rest.
+- **Binding for the reviewer (PR #54 implementation)**:
+  (a) `ci.yml` runs on `push: main` and `pull_request: main`; nothing else.
+  (b) `unit-and-build` invokes `npm run check`, NOT a hand-assembled
+      `npm test && npm run lint && …` chain.
+  (c) `e2e` uses `xvfb-run`; `headless: true` is forbidden.
+  (d) `npm ci`, not `npm install`. Stale lockfiles must fail.
+  (e) `node-version-file: .nvmrc`. No hardcoded Node version in YAML.
+  (f) `evals.yml` is NOT triggered on regular `pull_request`; only on
+      `labeled` with `run-evals`.
+  (g) `evals.yml` reads `ANTHROPIC_API_KEY` from secrets; no other
+      secret accessed.
+  (h) Workflow `permissions:` is `contents: read` (minimum viable).
+  (i) Failure artifacts uploaded with `if-no-files-found: ignore` so the
+      artifact step doesn't itself fail a broken job.
+  (j) `.github/workflows/README.md` documents the branch-protection
+      follow-up and the manual dispatch syntax.
+
+---
+
+## ADR-28 (2026-05-23): Release packaging script — extension zip + bundled host tarball, version from root package.json
+**Date**: 2026-05-23
+**Issue**: #55
+**Status**: Accepted
+
+### Context
+
+M3 is shipping and the project needs an artifact pair a stranger can install
+without building from source. Today:
+
+- `packages/extension/package.json` already exposes `wxt zip`, which writes
+  `packages/extension/.output/lgtm-buzzer-<version>-chrome.zip` next to the
+  unpacked `chrome-mv3/` directory. The MV3 manifest version is set in
+  `packages/extension/wxt.config.ts` (`manifest.version: "0.0.0"`).
+- `packages/host` builds with `tsc -b` into `packages/host/dist/` and ships
+  three runtime-relevant files: `cli.js` (entry), `install-manifest.js`
+  (ADR-23 §install-manifest), and a tree of compiled module files. The host
+  depends on six adapter packages, `@lgtm-buzzer/core`, `@lgtm-buzzer/protocol`,
+  `monadyssey`, and `pino`.
+- The native-messaging install logic in `packages/host/src/install-manifest.ts`
+  already builds the per-OS manifest in memory (`buildManifest`) — but it
+  resolves `hostBinaryPath` relative to its own `import.meta.url`, which
+  hard-codes the install layout (`<install-root>/cli.js` next to
+  `install-manifest.js`).
+- Root `package.json` has `version: "0.0.0"` and lists all workspaces.
+  Workspaces individually carry `0.0.0`. There is no version bump flow.
+- `.gitignore` already ignores `dist/`, `.output/`, and `node_modules/`.
+- ADR-27 §"What is NOT in v1" explicitly defers release packaging to this
+  issue. ADR-27 also ensures CI runs `npm run check` on every PR — so the
+  packaging script can rely on that gate having passed.
+- Issue #55 open questions:
+  1. Bundle the host into a single JS file, or ship a directory + `npm install`.
+  2. Whether to emit a checksums file.
+
+Constraints that shape this design:
+
+- **Two artifacts only**: extension zip (Chrome MV3) and host tarball
+  (everything the user needs to install the native-messaging side).
+- **Linux + macOS in scope; Windows out of scope** (ACK from issue #55 AC).
+  Windows registry installation is documented as a future-work item.
+- **Single source of truth for version**. The artifact pair must move in
+  lockstep — the host and extension speak a versioned protocol (ADR-7) and
+  drifting the two creates a mystery-failure mode.
+- **No network at install time.** A user extracting the tarball must not
+  need `npm install`. The host has many transitive deps (monadyssey, pino,
+  zod, plus six adapter workspaces). Shipping `node_modules` bloats the
+  tarball and ties it to a glibc/macOS variant; shipping `package.json`
+  forces `npm install` which forces network + npm-on-PATH. Bundling to a
+  single JS file is the only no-network path that fits the host's actual
+  deps.
+- **No new runtime deps in `core` or `protocol`.** The script lives at
+  the repo root and is dev-tooling only (`scripts/*.mjs`), so it does not
+  touch the dependency-direction rule.
+- **Existing tooling**: `esbuild` is already a transitive dep through wxt
+  (`packages/extension/node_modules/.../esbuild`), and pinning a direct
+  devDep ensures the bundler version is stable. `tar` is in the macOS and
+  Linux POSIX baseline; no Node-side tar lib needed.
+
+### Decision
+
+Add one repo-root script — `scripts/release.mjs` — invoked via
+`npm run release:build`. It produces exactly two artifacts plus an
+optional checksums file under `dist/` at the repo root:
+
+```
+dist/
+  lgtm-buzzer-extension-v<version>.zip       MV3-ready, just the wxt output renamed
+  lgtm-buzzer-host-v<version>.tar.gz         Single-file bundled host + installer
+  checksums.txt                              SHA256 + byte size of both artifacts
+```
+
+The script is platform-aware (macOS + Linux); Windows packaging stays
+out of scope. The host is bundled to a single ESM file via `esbuild`
+so users extract the tarball and run `node host/index.js` immediately —
+no `npm install` step.
+
+#### Affected workspaces
+
+This is a **repo-root tooling change**. Files added under `scripts/` and
+modified at the repo root plus minimal touch-ups under `packages/host/`
+and `packages/extension/`:
+
+- `scripts/release.mjs` — new, repo-root dev tooling. Not a workspace.
+- `scripts/release.mjs.test.ts` location — see "File layout" below; the
+  tests live as a Vitest file under `scripts/` and are picked up by the
+  root `vitest run`.
+- `packages/host/` — small additions: a `manifest.template.json` file
+  (newly authored) and a refactor of `install-manifest.ts` so it can
+  resolve the host binary either from the existing dev layout
+  (`dist/cli.js` next to `dist/install-manifest.js`) or from the
+  bundled-tarball layout (`index.js` next to `install-manifest.js` at
+  the tarball's host root). This keeps the existing test suite green.
+- `packages/extension/wxt.config.ts` — its `manifest.version` field
+  reads from the root `package.json` `version` at config-load time so
+  the extension's MV3 manifest carries the same version as the tarball.
+- Root `package.json` — `version` bumps from `0.0.0` to `0.1.0` as part
+  of the same PR (M3 release version). New devDep `esbuild` pinned with
+  the project's default caret. New scripts: `release:build`, `release:clean`.
+
+Dependency arrows reaffirmed (ADR-1):
+
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+```
+
+The release script is dev tooling outside the package graph — it does
+not import workspace source. It only orchestrates `npm` invocations,
+file copies, `esbuild` bundling, and `tar`/`zip` operations. The
+dependency-direction rule is intact.
+
+#### Bundling strategy for the host
+
+The host is bundled to a **single ESM file** via `esbuild` with the
+following configuration:
+
+```js
+// inside scripts/release.mjs
+await esbuild.build({
+  entryPoints: ["packages/host/dist/cli.js"],
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node22",
+  outfile: "<tmpdir>/host/index.js",
+  banner: { js: "#!/usr/bin/env node" },
+  external: [],
+  minify: false,
+  sourcemap: "inline",
+  legalComments: "inline",
+  logLevel: "warning",
+});
+```
+
+Notes binding the implementation:
+
+- **Entry is `packages/host/dist/cli.js`**, not `src/cli.ts`. The script
+  runs `npm run check` first (per ADR-27), which produces the compiled
+  output. Bundling pre-compiled JS keeps the script simple (no TS plugin
+  needed) and ensures the same source the test gate validated is what
+  gets shipped.
+- **`platform: "node"`** so Node built-ins (`node:fs`, `node:os`,
+  `node:child_process`, `node:stream`, `node:process`, `node:util`,
+  `node:path`, `node:url`) are externalised automatically.
+- **`format: "esm"`** because the project is ESM-only (`type: "module"`
+  in every `package.json`). `target: "node22"` matches ADR-27's anchor.
+- **`external: []`** explicitly — everything (monadyssey, pino, zod,
+  every adapter workspace) gets bundled in. No `node_modules` ships.
+- **`minify: false`** — debuggability over bytes. The bundle is a few
+  hundred KB either way, and stack traces on a user's machine must be
+  legible.
+- **`sourcemap: "inline"`** — inline so the tarball stays a flat layout
+  (no `.js.map` sidecars) and so stack traces resolve out of the box.
+- **`legalComments: "inline"`** — preserves bundled deps' MIT/BSD/ISC
+  licence notices in the output, satisfying attribution requirements
+  without a separate THIRD-PARTY-NOTICES file in v1.
+- **`banner: { js: "#!/usr/bin/env node" }`** — the bundled file is
+  marked executable by the script (`chmod 0o755`) so the manifest's
+  `path` field can point at it directly.
+- **A second, smaller bundle for the installer** runs the same `esbuild`
+  call for `packages/host/dist/install-manifest.js`, output to
+  `<tmpdir>/host/install-manifest.js`, also with the
+  `#!/usr/bin/env node` banner and 0o755 permissions. The installer is
+  bundled (not just copied) so it has no relative-import dependency on
+  any sibling files — important because the installer ships standalone.
+
+Rejected alternatives:
+
+- **Ship workspace as-is + `npm install` at install time.** Forces a
+  network step on first install, ties the install to npm version, and
+  doubles tarball complexity. Rejected.
+- **`pkg` / `vercel/pkg` / `bun build --compile`** to produce a real
+  native binary. Forces per-OS variants (darwin-arm64, darwin-x64,
+  linux-x64, linux-arm64), changes the security story (now we ship a
+  binary blob), and requires CI matrix when we automate releases.
+  v1 ships interpreted JS; reassess at v1.1 if we ever need to remove
+  the "Node 22+ on PATH" install prerequisite.
+- **`tsc-alias` post-process + ship workspace + node_modules.**
+  Tarball size, glibc/musl portability problems. Rejected.
+
+#### Tarball layout
+
+After extraction (e.g. `tar -xzf lgtm-buzzer-host-v0.1.0.tar.gz`), the
+user sees:
+
+```
+lgtm-buzzer-host-v0.1.0/
+  host/
+    index.js                       Bundled host entry (executable, with shebang)
+    install-manifest.js            Bundled installer (executable, with shebang)
+    manifest.template.json         Native-messaging manifest template
+  README.md                        Host-specific quick install (host README, not repo README)
+  LICENSE                          Copy of the repo's MIT LICENSE
+```
+
+Notes:
+
+- The **outer directory matches the tarball stem** so `tar -xzf` does
+  not unpack into the user's cwd; a single extracted folder, easy to
+  remove.
+- **`host/` is the working root**. The installer derives the absolute
+  path of `host/index.js` from its own `import.meta.url` location and
+  writes that into the per-OS native-messaging manifest. The
+  template's `path` field is a placeholder (`__HOST_BINARY_PATH__`) and
+  the installer substitutes it at install time.
+- **`README.md` and `LICENSE` are sibling to `host/`**, not inside it,
+  so users find them when they `cd` into the extracted folder.
+- **No `package.json` ships.** The bundle is a complete, self-contained
+  ESM file plus its bundled installer. Users need Node 22+ on PATH;
+  nothing else.
+
+#### `manifest.template.json` contents
+
+A new file at `packages/host/manifest.template.json`, copied into the
+tarball's `host/` directory verbatim:
+
+```json
+{
+  "name": "com.lgtm_buzzer.host",
+  "description": "LGTM-Buzzer native messaging host",
+  "path": "__HOST_BINARY_PATH__",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://__EXTENSION_ID__/"]
+}
+```
+
+Two placeholder tokens:
+
+- `__HOST_BINARY_PATH__` — filled by `install-manifest.js` at install
+  time with the absolute path to `host/index.js`. The installer derives
+  this from its own `import.meta.url` (same trick the current
+  `resolveHostBinaryPath` uses; refactored to look for `index.js`
+  alongside `install-manifest.js`, falling back to `cli.js` in the dev
+  layout so the existing test suite still passes).
+- `__EXTENSION_ID__` — filled by `install-manifest.js` from the
+  `LGTM_BUZZER_EXTENSION_ID` environment variable (existing contract;
+  see `packages/host/src/install-manifest.ts` L133). If unset, the
+  installer prints the existing `<unset>` placeholder and exits 0 (no
+  change to current behaviour).
+
+The template is authored as a real file (not constructed in TS) so a
+package maintainer can inspect what gets shipped without reading code.
+The runtime path keeps using `buildManifest` for the in-memory shape;
+the template file is the on-disk artifact for users who want to install
+manually.
+
+#### Version source of truth
+
+Root `package.json` `version` is the **sole** source of truth. The
+script reads it once at startup and:
+
+1. Uses it to name the two artifacts (`v<version>` suffix).
+2. Asserts that `packages/extension/wxt.config.ts`'s `manifest.version`
+   resolves to the same value at extension-build time. Achieved by
+   making `wxt.config.ts` read the root `package.json` and substitute
+   `manifest.version` dynamically:
+
+```ts
+// packages/extension/wxt.config.ts
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { defineConfig } from "wxt";
+
+const rootPkgPath = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "package.json",
+);
+const rootVersion = JSON.parse(readFileSync(rootPkgPath, "utf8")).version;
+
+export default defineConfig({
+  manifest: {
+    name: "LGTM-Buzzer",
+    description: "Quiz yourself on the diff before approving PRs.",
+    version: rootVersion,
+    permissions: ["storage"],
+    host_permissions: [
+      "*://github.com/*",
+      "*://dev.azure.com/*",
+      "*://*.visualstudio.com/*",
+    ],
+  },
+});
+```
+
+Per-workspace `package.json` `version` fields stay at `0.0.0` (they're
+private, never published to npm — single-repo policy applies). The
+**root** version is what binds.
+
+**Bump-version flow** (documented in `docs/release.md`, see File layout):
+
+1. `npm version <patch|minor|major> --no-git-tag-version` at repo root.
+   This rewrites root `package.json` only (no workspace propagation
+   because `--workspaces` is omitted on purpose).
+2. Commit `chore(release): vX.Y.Z`.
+3. `npm run release:build`.
+4. `git tag vX.Y.Z` (annotated; signed if available).
+5. `git push origin main --tags`.
+6. Manually create a GitHub Release; attach the two `dist/` artifacts
+   plus `checksums.txt`.
+
+Auto-tag-on-CI is out of scope (issue #55 §"Out of scope" + ADR-27
+§"What is NOT in v1").
+
+#### CLI flags
+
+```
+Usage: npm run release:build -- [options]
+
+Options:
+  --force                Overwrite existing dist/ artifacts for the same version
+  --allow-dirty          Skip the "uncommitted changes" gate (CI / hotfix path)
+  --skip-check           Skip `npm run check`. NOT recommended; allowed for fast iteration on the packaging
+                         script itself. Refuses with --allow-dirty=false and a dirty tree.
+  --output-dir=<path>    Override the default `dist/` output directory (absolute path; default: `<repo>/dist`)
+  --no-checksums         Do not write `dist/checksums.txt`
+  --help, -h             Print this usage and exit 0
+```
+
+Default behaviour (no flags):
+
+1. Refuse if the working tree is dirty (`git status --porcelain`
+   non-empty), unless `--allow-dirty`.
+2. Refuse if `dist/lgtm-buzzer-extension-v<version>.zip` or
+   `dist/lgtm-buzzer-host-v<version>.tar.gz` already exists, unless
+   `--force`.
+3. Run `npm run check` (ADR-27's full gate). If it fails, abort.
+4. Build artifacts.
+5. Write `checksums.txt` unless `--no-checksums`.
+6. Print a final summary table.
+
+#### Types
+
+The script is plain JS (`.mjs`, no transpilation). Where TS types help
+(in the test file), they live in the test file or as JSDoc comments.
+
+One protocol-level type addition: none. This work introduces no new
+domain types.
+
+The release script's internal shape (documented as JSDoc, for the
+reviewer; not exported):
+
+```js
+/**
+ * @typedef {Object} ReleaseConfig
+ * @property {string} version            Read from root package.json.
+ * @property {string} repoRoot           Absolute path to the repo root.
+ * @property {string} outputDir          Where to write the two artifacts.
+ * @property {boolean} force             Overwrite existing artifacts.
+ * @property {boolean} allowDirty        Skip git-clean check.
+ * @property {boolean} skipCheck         Skip `npm run check`.
+ * @property {boolean} writeChecksums    Emit dist/checksums.txt.
+ */
+
+/**
+ * @typedef {Object} ReleaseArtifact
+ * @property {"extension" | "host"} kind
+ * @property {string} path               Absolute path to the artifact.
+ * @property {number} sizeBytes
+ * @property {string} sha256             Hex-encoded.
+ */
+```
+
+#### Functions and methods
+
+All exported from `scripts/release.mjs` so the test file can exercise
+them. The script's `main` runs only when the file is the entry point
+(same `isEntryPoint` trick as `install-manifest.ts` L157):
+
+```js
+// scripts/release.mjs
+
+/**
+ * Reads the root package.json and returns the version string.
+ * @param {string} repoRoot
+ * @returns {string}
+ * @throws if package.json is missing or has no version field (invariant violation).
+ */
+export const readRootVersion = (repoRoot) => /* ... */;
+
+/**
+ * Returns true when the working tree has no uncommitted changes.
+ * @param {string} repoRoot
+ * @returns {boolean}
+ */
+export const isWorkingTreeClean = (repoRoot) => /* ... */;
+
+/**
+ * Computes the two artifact paths under outputDir.
+ * @param {{ version: string, outputDir: string }} input
+ * @returns {{ extensionZip: string, hostTarball: string, checksums: string }}
+ */
+export const computeArtifactPaths = (input) => /* ... */;
+
+/**
+ * Substitutes __HOST_BINARY_PATH__ and __EXTENSION_ID__ in the manifest template.
+ * Pure; tested directly without I/O.
+ * @param {{ template: string, hostBinaryPath: string, extensionId: string }} input
+ * @returns {string} Substituted JSON text.
+ */
+export const fillManifestTemplate = (input) => /* ... */;
+
+/**
+ * Lists the absolute paths that go into the host tarball, given a
+ * staging directory laid out by stageHostFiles.
+ * @param {string} stagingDir
+ * @returns {readonly string[]}
+ */
+export const computeHostTarballFileList = (stagingDir) => /* ... */;
+
+/**
+ * Stages the host tarball contents under a temp dir.
+ * Bundles host/index.js + host/install-manifest.js, copies
+ * manifest.template.json, README.md, LICENSE. Effectful.
+ * @param {{ repoRoot: string, version: string, tmpDir: string }} input
+ * @returns {Promise<string>} Absolute path to the staging directory's root.
+ */
+export const stageHostFiles = async (input) => /* ... */;
+
+/**
+ * Bundles the host into a single ESM JS file using esbuild.
+ * @param {{ entryPoint: string, outFile: string }} input
+ * @returns {Promise<void>}
+ */
+export const bundleHost = async (input) => /* ... */;
+
+/**
+ * Runs `npm --workspace=@lgtm-buzzer/extension run zip`, then renames the
+ * wxt-produced zip into the dist output path.
+ * @param {{ repoRoot: string, outputZip: string }} input
+ * @returns {Promise<void>}
+ */
+export const buildExtensionZip = async (input) => /* ... */;
+
+/**
+ * Builds the host tarball from a staging directory.
+ * @param {{ stagingRoot: string, outputTarball: string }} input
+ * @returns {Promise<void>}
+ */
+export const buildHostTarball = async (input) => /* ... */;
+
+/**
+ * Computes the SHA256 of a file as a lowercase hex string.
+ * @param {string} filePath
+ * @returns {Promise<string>}
+ */
+export const sha256File = async (filePath) => /* ... */;
+
+/**
+ * Writes `<outputDir>/checksums.txt` with one line per artifact:
+ *   <sha256>  <byte_size>  <filename>
+ * @param {{ outputDir: string, artifacts: readonly ReleaseArtifact[] }} input
+ * @returns {Promise<void>}
+ */
+export const writeChecksumsFile = async (input) => /* ... */;
+
+/**
+ * Parses argv and returns a ReleaseConfig. Throws on unknown flags.
+ * @param {readonly string[]} argv
+ * @param {string} repoRoot
+ * @returns {ReleaseConfig}
+ */
+export const parseArgs = (argv, repoRoot) => /* ... */;
+
+/**
+ * Entry point. Runs the full pipeline.
+ * @param {ReleaseConfig} config
+ * @returns {Promise<readonly ReleaseArtifact[]>}
+ */
+export const runRelease = async (config) => /* ... */;
+```
+
+`runRelease` is the one effectful orchestrator. The other exports are
+either pure (`fillManifestTemplate`, `computeArtifactPaths`,
+`computeHostTarballFileList`, `parseArgs`) or small I/O wrappers
+(`isWorkingTreeClean`, `readRootVersion`, `bundleHost`, `sha256File`).
+The pure helpers carry the bulk of the test surface.
+
+This script is dev tooling, lives outside the workspace graph, and is
+the only `.mjs` file in the project that gets a Vitest test file — so
+the `monadyssey`-based `Either`/`IO` conventions don't apply. The
+script throws on unexpected error states; the `runRelease` wrapper
+catches and prints a useful message before `process.exit(1)`.
+
+#### Install-manifest refactor
+
+`packages/host/src/install-manifest.ts` already exports `buildManifest`
+(pure) and a `main()` that does I/O. Two small additions, no public-API
+break:
+
+1. Loosen `resolveHostBinaryPath` so it picks the bundled-tarball entry
+   when present:
+
+```ts
+const resolveHostBinaryPath = (): string => {
+  const thisFile = fileURLToPath(import.meta.url);
+  const distDir = path.dirname(thisFile);
+  // Bundled tarball layout: index.js next to install-manifest.js.
+  const bundled = path.join(distDir, "index.js");
+  if (fs.existsSync(bundled)) return bundled;
+  // Dev layout: cli.js next to install-manifest.js inside packages/host/dist/.
+  return path.join(distDir, "cli.js");
+};
+```
+
+2. Add a new exported pure helper that fills the on-disk template:
+
+```ts
+// pure; tested without I/O
+export const renderManifestTemplate = (input: {
+  template: string;
+  hostBinaryPath: string;
+  extensionId: string;
+}): string => /* substitutes __HOST_BINARY_PATH__ and __EXTENSION_ID__ */;
+```
+
+The release script imports this helper from
+`@lgtm-buzzer/host` so the substitution logic is exercised by both
+runtimes (release-time and install-time) and tested once in the host
+workspace.
+
+#### File layout
+
+New files:
+
+```
+scripts/
+  release.mjs                                 New: release packaging orchestrator
+  release.mjs.test.ts                         New: Vitest covering pure helpers + smoke
+docs/
+  release.md                                  New: maintainer-facing bump + release flow
+packages/host/
+  manifest.template.json                      New: shipped verbatim in the host tarball
+README.md                                     Modified: add "Download a release" section
+```
+
+Modified files:
+
+```
+package.json                                  version bump 0.0.0 → 0.1.0;
+                                              new scripts: release:build, release:clean;
+                                              new devDep: esbuild (pinned with caret)
+packages/host/src/install-manifest.ts         resolveHostBinaryPath dual-layout;
+                                              exports renderManifestTemplate
+packages/host/src/install-manifest.test.ts    tests renderManifestTemplate; dual-layout test for resolver
+packages/host/package.json                    files[] includes manifest.template.json so it
+                                              ships with the workspace
+packages/extension/wxt.config.ts              reads version from root package.json
+```
+
+Tests live in:
+
+```
+scripts/release.mjs.test.ts                   pure helpers + smoke (uses tmpdir)
+packages/host/src/install-manifest.test.ts    renderManifestTemplate + dual-layout resolver
+```
+
+`scripts/release.mjs.test.ts` is picked up by the root `vitest run` via
+the default include pattern (`**/*.test.ts`). No vitest-config change
+needed; `scripts/` is at the repo root and not excluded.
+
+#### Sequence
+
+**`npm run release:build`** (default flags):
+
+1. Parse argv → `ReleaseConfig` with `force=false`, `allowDirty=false`,
+   `skipCheck=false`, `writeChecksums=true`, `outputDir=<repo>/dist`.
+2. `readRootVersion(repoRoot)` → e.g. `"0.1.0"`.
+3. `computeArtifactPaths({ version, outputDir })` → expected output
+   filenames.
+4. **Pre-flight checks** (abort on first failure):
+   - If `--allow-dirty` is not set and `isWorkingTreeClean(repoRoot)`
+     is false → exit 1, print "uncommitted changes; pass --allow-dirty
+     to override".
+   - If either artifact path exists and `--force` is not set → exit 1,
+     print "artifact already exists; pass --force to overwrite".
+5. **Build gate**: if `--skip-check` is not set, run `npm run check`
+   via `spawn("npm", ["run", "check"], { stdio: "inherit" })`. If
+   exit != 0 → exit 1.
+6. **Stage host files** (under `os.tmpdir()/lgtm-buzzer-release-<pid>/`):
+   - Create the staging structure
+     `<tmp>/lgtm-buzzer-host-v<version>/host/`.
+   - `bundleHost({ entryPoint: packages/host/dist/cli.js,
+     outFile: <staging>/host/index.js })`.
+   - `bundleHost({ entryPoint: packages/host/dist/install-manifest.js,
+     outFile: <staging>/host/install-manifest.js })`.
+   - `chmod 0o755` on both bundled files.
+   - Copy `packages/host/manifest.template.json` →
+     `<staging>/host/manifest.template.json`.
+   - Render `docs/release-host-readme.md` template (a short, host-only
+     README authored alongside the script — see "README contents"
+     below) → `<staging>/README.md`.
+   - Copy `LICENSE` → `<staging>/LICENSE`.
+7. **Build extension zip**:
+   - `npm --workspace=@lgtm-buzzer/extension run zip` (this re-runs the
+     wxt build with the version from the updated root `package.json`).
+   - Identify the produced zip in
+     `packages/extension/.output/lgtm-buzzer-<version>-chrome.zip`.
+   - Move + rename to
+     `dist/lgtm-buzzer-extension-v<version>.zip`.
+   - If `--force` and the destination exists, `fs.rmSync` first.
+8. **Build host tarball**:
+   - `tar -czf dist/lgtm-buzzer-host-v<version>.tar.gz -C <tmp>
+     lgtm-buzzer-host-v<version>`.
+   - `-C <tmp>` means the tarball's top-level entry is the
+     `lgtm-buzzer-host-v<version>/` directory, not the tmpdir.
+9. **Compute checksums** (unless `--no-checksums`):
+   - `sha256File(extensionZip)`, `sha256File(hostTarball)`.
+   - `writeChecksumsFile({ outputDir, artifacts })`.
+10. **Summary**: print a table with kind / path / size / sha256 for each
+    artifact to stdout. Exit 0.
+11. **Cleanup**: remove the tmp staging dir on success and on any
+    failure (`process.on("exit", ...)` registered at script start).
+
+**Install flow on the user's machine** (downstream of the maintainer's
+release):
+
+1. User downloads `lgtm-buzzer-host-v0.1.0.tar.gz` from a GitHub
+   Release.
+2. User extracts: `tar -xzf lgtm-buzzer-host-v0.1.0.tar.gz`.
+3. User installs the Chrome extension zip via Chrome Web Store or as an
+   unpacked extension, copies the extension ID.
+4. User runs: `LGTM_BUZZER_EXTENSION_ID=<id> node lgtm-buzzer-host-v0.1.0/host/install-manifest.js`.
+5. `install-manifest.js` resolves
+   `host/index.js` next to itself, reads
+   `host/manifest.template.json`, substitutes
+   `__HOST_BINARY_PATH__` + `__EXTENSION_ID__`, writes to the per-OS
+   path (`buildManifest` already handles macOS + Linux, prints
+   "not supported" on other platforms).
+6. Chrome's native-messaging machinery now reaches `node host/index.js`
+   on first extension activation.
+
+#### Error cases
+
+| Failure | Where | Handling |
+|---|---|---|
+| Root `package.json` missing or no `version` field | `readRootVersion` | Throw `InvariantViolation`; script exits 1 with "missing root version". |
+| Working tree dirty without `--allow-dirty` | Pre-flight | Exit 1; message names the offending files (truncated to first 5). |
+| Artifact already exists without `--force` | Pre-flight | Exit 1; message lists which file(s) collide. |
+| `npm run check` fails | Build gate | Inherit npm's exit code; script exits 1 with a one-line summary. |
+| `esbuild` import resolution failure | `bundleHost` | Bubble up the esbuild error; exit 1 with the unresolved-module name. Likely cause: `npm run check` did not run, so `dist/` is empty — script suggests rerunning without `--skip-check`. |
+| `wxt zip` output filename drift | `buildExtensionZip` | The script reads `packages/extension/.output/` and uses a glob (`lgtm-buzzer-*.zip`) to find the produced file. If 0 or > 1 matches, exit 1 with the candidate list. |
+| `tar` command not on PATH | `buildHostTarball` | Exit 1 with "tar not found on PATH; install GNU tar or BSD tar". Both macOS and Linux ship `tar` in the baseline. Windows is out of scope. |
+| Tmp staging dir collision (rare) | `stageHostFiles` | Uses `os.tmpdir()/lgtm-buzzer-release-<pid>-<random>/`; collision is effectively impossible. If it occurs, `fs.rmSync` first, then continue. |
+| User Ctrl+C mid-build | Top-level | `process.on("SIGINT", cleanup)` removes the staging tmpdir and exits 130. |
+| `LGTM_BUZZER_EXTENSION_ID` unset at install time | `install-manifest.js` (downstream) | Existing behaviour: writes manifest with `<unset>` placeholder. User re-runs once the extension ID is known. **Future-work**: a friendlier prompt is out of scope. |
+| Windows platform at install time | `install-manifest.js` (downstream) | Existing behaviour: prints "not supported on this platform", exits 0. v1 limitation, documented in `docs/release.md` §Windows. |
+| Reproducibility drift between runs | Out of scope | Strict reproducibility is NOT a v1 goal. Document in `docs/release.md` that two runs from the same source may produce zip files with different SHA256s due to timestamp metadata; the `checksums.txt` is run-specific. |
+
+No `throw` paths inside long-lived monadyssey `IO` chains apply here —
+this script is plain Node, run once, by a human. Throws at the top
+level are caught by the entry-point wrapper and printed as `error:
+<msg>` before `process.exit(1)`.
+
+#### Test strategy
+
+Tests live in `scripts/release.mjs.test.ts`. Coverage targets per the
+project policy: tooling has no coverage gate, but the test file must
+exercise:
+
+1. **`readRootVersion`** — reads from a `tmpdir`-staged
+   `package.json`; missing file throws; missing `version` throws.
+2. **`computeArtifactPaths`** — given a version + outputDir, produces
+   the three expected absolute paths.
+3. **`fillManifestTemplate`** — given a template string with both
+   placeholders, the function substitutes correctly even when the
+   binary path contains a quote (`"`) or a backslash (paths must be
+   JSON-escaped because the template is a JSON file). Tests cover:
+   - Happy path: both placeholders substituted.
+   - Path containing `"` and `\` → properly JSON-escaped.
+   - Extension ID containing `/` → preserved verbatim.
+   - Placeholder absent from template → throws (invariant: template is
+     authored alongside the script).
+4. **`computeHostTarballFileList`** — given a staging dir with the
+   expected layout, returns the absolute paths in deterministic order.
+5. **`parseArgs`** — known flags, default values, `--help` exits 0,
+   unknown flag throws.
+6. **`sha256File`** — known-content fixture (e.g.,
+   `Buffer.from("hello")`) hashes to the known value.
+7. **Smoke** — `runRelease({ ...config, skipCheck: true })` in a tmp
+   workspace produces both artifacts; the test asserts files exist and
+   are non-empty. Bundling speed makes this acceptable (~3-5 s).
+   `skipCheck: true` here is the only valid use of that flag (faster
+   tests).
+
+`install-manifest.ts` additions tested in
+`packages/host/src/install-manifest.test.ts`:
+
+- **`renderManifestTemplate`** — same suite as the script's
+  `fillManifestTemplate` (single source of truth — script imports the
+  helper).
+- **`resolveHostBinaryPath` dual-layout** — given a tmpdir with
+  `install-manifest.js` and `index.js`, picks `index.js`. Given a
+  tmpdir with `install-manifest.js` and `cli.js`, picks `cli.js`.
+
+End-to-end manual smoke (documented in `docs/release.md`):
+
+1. Run `npm run release:build` on a clean tree.
+2. `tar -tzf dist/lgtm-buzzer-host-v0.1.0.tar.gz` shows the expected
+   structure.
+3. Extract into a scratch dir; `node lgtm-buzzer-host-v0.1.0/host/index.js`
+   prints nothing (it's a native-messaging host; stdin is the only
+   driver) and exits when stdin is closed.
+4. With a real extension ID:
+   `LGTM_BUZZER_EXTENSION_ID=<id> node lgtm-buzzer-host-v0.1.0/host/install-manifest.js`
+   → writes the per-OS manifest with the bundled `host/index.js` path.
+5. Load the extracted Chrome extension zip as an unpacked extension;
+   click Approve on a fixture PR; confirm the quiz appears.
+
+#### `README.md` and `docs/release.md` contents
+
+**`README.md` top-level** gains a short "Download a release" section
+linking to GitHub Releases and noting that releases ship two artifacts:
+the Chrome extension zip (loadable as unpacked) and the host tarball
+(extract + run the installer).
+
+**`docs/release.md`** is the maintainer's reference:
+
+- Bump-version flow (the 6-step sequence above).
+- Required tooling: Node 22+, npm, `tar` on PATH, `git`.
+- The `--force` / `--allow-dirty` / `--skip-check` flags and when each
+  is appropriate.
+- How to verify a release locally before tagging
+  (the 5-step smoke above).
+- Windows packaging limitation (v1: extension only; host requires WSL).
+- Future-work: auto-release on tag (GH Actions), code signing, Windows
+  registry installer, real reproducible builds.
+
+**Tarball `README.md`** (authored as a template fed by
+`stageHostFiles`):
+
+- "What is this": one paragraph.
+- Prerequisites: Node 22+ on PATH.
+- Install steps for macOS:
+  1. Extract.
+  2. Set the `LGTM_BUZZER_EXTENSION_ID` env var.
+  3. Run `node lgtm-buzzer-host-vX.Y.Z/host/install-manifest.js`.
+- Install steps for Linux: same as macOS, paths differ — the installer
+  picks the right one automatically.
+- Token / credential note: the host receives credentials in-band from
+  the extension (ADR-22). The user does NOT need to put tokens on disk
+  for v1.
+- Uninstall: delete `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.lgtm_buzzer.host.json`
+  (macOS) or `~/.config/google-chrome/NativeMessagingHosts/com.lgtm_buzzer.host.json`
+  (Linux), then `rm -rf` the extracted folder.
+
+#### What is NOT in v1 (explicit out-of-scope)
+
+- **Auto-release on tag push.** `release.mjs` is invoked manually by
+  the maintainer. CI release is a future ADR.
+- **Code signing.** The bundled JS file is not signed; macOS notarisation
+  is not performed (Node is interpreted; no native binary distribution).
+- **Chrome Web Store auto-submission.** Manual upload via the developer
+  dashboard for v1.
+- **Windows host installation.** Windows requires registry entries and
+  a `.bat` or `.exe` wrapper. v1: documented limitation, users run the
+  host under WSL if needed.
+- **Reproducible builds.** Two runs from the same source may produce
+  artifacts with different SHA256s due to zip / tar metadata
+  (timestamps, file ordering). Documented in `docs/release.md`.
+- **Multi-platform single-binary** (pkg / bun --compile). v1: requires
+  Node 22 on PATH.
+- **THIRD-PARTY-NOTICES generation.** `esbuild`'s `legalComments:
+  "inline"` preserves bundled-dep license comments in the output. A
+  separate NOTICE file is future-work.
+- **Cross-version compatibility matrix.** v1 assumes extension version
+  X.Y.Z exclusively pairs with host version X.Y.Z. Protocol version
+  negotiation (ADR-7) prevents catastrophic mismatch; release-pair
+  drift is not formally supported.
+- **`npm pack` of any workspace.** All workspaces are `private: true`
+  per CLAUDE.md; we do not publish to npm.
+- **Auto-update channel.** Users re-download to update.
+
+### Consequences
+
+- **Two-command release**: `npm version <bump> --no-git-tag-version` then
+  `npm run release:build` produces a complete artifact pair under
+  `dist/`. The maintainer creates the GitHub Release manually.
+- **Single source of truth for version**: root `package.json` `version`
+  binds both artifacts. The extension's MV3 manifest pulls the same
+  value at build time via `wxt.config.ts`, so a release pair cannot
+  drift.
+- **No `npm install` step at user install time.** The host tarball is
+  self-contained; users need only Node 22+ on PATH. This is the
+  highest-friction-reduction in the M3 install path.
+- **One new devDep**: `esbuild`, pinned with caret. Already a
+  transitive dep through wxt, so no new install surface. Future
+  bundler bumps go through the same caret-range mechanism as other
+  devDeps.
+- **The script is small and reviewable.** Pure helpers carry the bulk
+  of the logic; effectful glue (spawn npm, esbuild build, tar) is
+  exercised by the smoke test. No `monadyssey` in this file — it is
+  dev tooling, not a runtime adapter.
+- **`install-manifest.ts` becomes dual-layout aware.** The same module
+  works in the dev tree (`dist/cli.js`) and in the bundled tarball
+  (`host/index.js`). The test suite covers both paths.
+- **Reversibility**: `dist/` is git-ignored; deleting the script is one
+  PR. The `wxt.config.ts` change is the only edit with a runtime
+  effect (it changes the MV3 manifest's version field at build time);
+  reverting it pins the version back to `"0.0.0"` literal.
+- **Security posture**: the bundle is plain JS; we ship no binary blob,
+  no `node_modules`, no signed installer. License compliance is handled
+  via `legalComments: "inline"`. Users who don't trust the GH Release
+  hash can rebuild from source — `npm run release:build` is
+  deterministic enough for "same source, similar output" verification
+  even without strict reproducibility.
+- **Future-proofing**: the script's pure helpers (`fillManifestTemplate`,
+  `computeArtifactPaths`, `computeHostTarballFileList`) are decoupled
+  from the I/O glue. A future CI release workflow can import them
+  directly; an auto-tag-on-push action wraps `runRelease` with no other
+  changes.
+- **Binding for the reviewer (PR #55 implementation)**:
+  (a) Exactly one new repo-root script (`scripts/release.mjs`); no
+      per-workspace release scripts.
+  (b) Bundled host entry is `<staging>/host/index.js`, NOT renamed to
+      `lgtm-buzzer-host` or similar — the tarball README points users
+      at this exact path.
+  (c) `install-manifest.js` ships bundled, with shebang, and is
+      executable (`chmod 0o755`).
+  (d) `manifest.template.json` ships verbatim from
+      `packages/host/manifest.template.json`; no in-script generation.
+  (e) Tarball top-level dir name matches the tarball stem
+      (`lgtm-buzzer-host-v<version>/`), not the host workspace name.
+  (f) `dist/checksums.txt` format is `<sha256>  <size_bytes>  <filename>`,
+      two-space separator, lowercase hex. One line per artifact, sorted
+      by filename for stable diffs.
+  (g) `wxt.config.ts` reads the root version dynamically; no other
+      package.json fields propagate.
+  (h) Workspace-level `version` fields stay at `0.0.0`. Only root
+      bumps.
+  (i) The script's `--skip-check` flag is documented but discouraged;
+      `docs/release.md` calls it out as a release-blocker if used in
+      a real release.
+  (j) `scripts/release.mjs.test.ts` runs under the root `vitest run`;
+      no per-workspace test config change needed.
+
+---
