@@ -156,39 +156,63 @@ export const buildManifest = (input: BuildManifestInput): BuildManifestResult =>
 // ---------------------------------------------------------------------------
 
 /**
- * Resolves the absolute path to the host binary relative to this file.
+ * Picks the host binary in `distDir`. Exported for tests.
  *
  * Supports two layouts:
- * - **Bundled tarball layout**: `index.js` lives next to `install-manifest.js`
- *   (both are bundled files produced by `scripts/release.mjs`).
- * - **Dev layout**: `cli.js` lives next to `install-manifest.js` inside
- *   `packages/host/dist/` after a normal `tsc -b` build.
+ * - **Dev layout**: `cli.js` (shebang executable, `tsc -b` output) lives next
+ *   to `install-manifest.js` inside `packages/host/dist/`. `index.js` (the
+ *   library entry) is ALSO present here but is not a CLI — it has no shebang
+ *   and is not chmod +x. Chrome treats the manifest `path` as an executable
+ *   and `index.js` here breaks the connection silently.
+ * - **Bundled tarball layout**: only a single `index.js` (esbuild bundle with
+ *   shebang) is shipped next to `install-manifest.js`. No `cli.js`.
  *
- * The bundled path is checked first so the tarball install flow works without
- * any `dist/` directory present.
+ * Dev is detected by the presence of `cli.js` — that signal exists in dev
+ * AND only in dev. Order matters: a `dist/` containing both files (any dev
+ * checkout) MUST resolve to `cli.js`, never `index.js`.
  */
+export const pickHostBinaryPath = (distDir: string): string => {
+  const dev = path.join(distDir, "cli.js");
+  if (fs.existsSync(dev)) return dev;
+  return path.join(distDir, "index.js");
+};
+
+/** Resolves the host binary relative to this file. Thin wrapper around `pickHostBinaryPath`. */
 const resolveHostBinaryPath = (): string => {
   const thisFile = fileURLToPath(import.meta.url);
-  const distDir = path.dirname(thisFile);
-  // Bundled tarball layout: index.js next to install-manifest.js.
-  const bundled = path.join(distDir, "index.js");
-  if (fs.existsSync(bundled)) return bundled;
-  // Dev layout: cli.js next to install-manifest.js inside packages/host/dist/.
-  return path.join(distDir, "cli.js");
+  return pickHostBinaryPath(path.dirname(thisFile));
 };
 
 /**
  * Entry point: writes the native-messaging manifest to the per-OS Chrome path.
  *
- * Reads `process.platform`, `os.homedir()`, and the `LGTM_BUZZER_EXTENSION_ID`
- * environment variable. Logs to stderr. Exits 0 on success or unsupported
- * platform; does not catch fs errors (let Node print them naturally).
+ * Reads `process.platform`, `os.homedir()`, and requires the
+ * `LGTM_BUZZER_EXTENSION_ID` environment variable to be set to the Chrome
+ * extension ID. Exits 2 with an explanatory message when the env-var is
+ * missing — Chrome silently rejects any connectNative call from an extension
+ * whose ID does not match `allowed_origins`, so a placeholder would produce
+ * exactly the "Native host not installed" failure mode the user just hit.
+ *
+ * Logs to stderr. Exits 0 on success or unsupported platform; does not catch
+ * fs errors (let Node print them naturally).
  */
 export const main = (): void => {
   const platform = process.platform;
   const homedir = os.homedir();
   const hostBinaryPath = resolveHostBinaryPath();
-  const extensionId = process.env["LGTM_BUZZER_EXTENSION_ID"] ?? "<unset>";
+  const extensionId = process.env["LGTM_BUZZER_EXTENSION_ID"];
+
+  if (extensionId === undefined || extensionId.length === 0) {
+    process.stderr.write(
+      "install-manifest: LGTM_BUZZER_EXTENSION_ID env-var is required.\n" +
+        "\n" +
+        "Get the ID from chrome://extensions (Developer mode → LGTM-Buzzer → copy ID),\n" +
+        "then re-run:\n" +
+        "\n" +
+        "  LGTM_BUZZER_EXTENSION_ID=<your-id> node packages/host/dist/install-manifest.js\n",
+    );
+    process.exit(2);
+  }
 
   const result = buildManifest({ platform, homedir, hostBinaryPath, extensionId });
 

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildManifest, renderManifestTemplate } from "./install-manifest.js";
+import { buildManifest, pickHostBinaryPath, renderManifestTemplate } from "./install-manifest.js";
 import type { BuildManifestInput } from "./install-manifest.js";
 
 const baseInput: BuildManifestInput = {
@@ -160,15 +160,11 @@ describe("renderManifestTemplate", () => {
 });
 
 // ---------------------------------------------------------------------------
-// resolveHostBinaryPath dual-layout tests.
-// These tests exercise the private behaviour indirectly via the main() side
-// effects, but since the function is not exported we test it through a tmpdir
-// simulation used by the install flow. We test it by reading what main()
-// would compute — easier: we spy on the file-system layout and observe the
-// path written to the manifest.
+// pickHostBinaryPath dual-layout tests.
+// Tests the pure exported function directly with tmpdir-simulated layouts.
 // ---------------------------------------------------------------------------
 
-describe("resolveHostBinaryPath dual-layout", () => {
+describe("pickHostBinaryPath dual-layout", () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -179,31 +175,30 @@ describe("resolveHostBinaryPath dual-layout", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("picks index.js (bundled layout) when it exists next to install-manifest.js", () => {
-    // Simulate the bundled tarball layout: index.js + install-manifest.js side by side.
-    const indexJs = path.join(tmpDir, "index.js");
-    const cliJs = path.join(tmpDir, "cli.js");
-    fs.writeFileSync(indexJs, "// bundled\n");
-    // cli.js intentionally NOT written — only index.js present.
-
-    // We can't call resolveHostBinaryPath() directly (private), but we can
-    // verify the logic by checking which file exists in the layout that the
-    // dual-resolver would pick.
-    expect(fs.existsSync(indexJs)).toBe(true);
-    expect(fs.existsSync(cliJs)).toBe(false);
-    // The resolver picks index.js first → verify the bundled file is detectable.
-    expect(path.basename(indexJs)).toBe("index.js");
+  it("dev layout: returns cli.js when only cli.js is present", () => {
+    fs.writeFileSync(path.join(tmpDir, "cli.js"), "// dev build\n");
+    expect(pickHostBinaryPath(tmpDir)).toBe(path.join(tmpDir, "cli.js"));
   });
 
-  it("falls back to cli.js (dev layout) when index.js is absent", () => {
-    // Simulate the dev layout: only cli.js present.
-    const indexJs = path.join(tmpDir, "index.js");
-    const cliJs = path.join(tmpDir, "cli.js");
-    fs.writeFileSync(cliJs, "// dev build\n");
-    // index.js intentionally NOT written.
+  it("bundled layout: returns index.js when only index.js is present", () => {
+    fs.writeFileSync(path.join(tmpDir, "index.js"), "// bundled\n");
+    expect(pickHostBinaryPath(tmpDir)).toBe(path.join(tmpDir, "index.js"));
+  });
 
-    expect(fs.existsSync(indexJs)).toBe(false);
-    expect(fs.existsSync(cliJs)).toBe(true);
-    expect(path.basename(cliJs)).toBe("cli.js");
+  it("BUGFIX: returns cli.js when BOTH are present (the dev tsc -b case)", () => {
+    // This is the case install-manifest.ts previously got wrong, producing a
+    // manifest pointing at the non-executable library entry index.js. Real
+    // dev `dist/` always has both — tsc -b emits cli.js (the @lgtm-buzzer-host
+    // bin entry) alongside index.js (the library entry).
+    fs.writeFileSync(path.join(tmpDir, "cli.js"), "#!/usr/bin/env node\n");
+    fs.writeFileSync(path.join(tmpDir, "index.js"), "// library entry\n");
+    expect(pickHostBinaryPath(tmpDir)).toBe(path.join(tmpDir, "cli.js"));
+  });
+
+  it("falls back to index.js path even when neither file exists (caller can fs.stat)", () => {
+    // resolveHostBinaryPath never errors — it returns a path the caller can
+    // pass to fs/exec which will surface the real error. Verifies the empty
+    // tmpdir path is the bundled fallback (predictable).
+    expect(pickHostBinaryPath(tmpDir)).toBe(path.join(tmpDir, "index.js"));
   });
 });
