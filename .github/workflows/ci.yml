@@ -50,11 +50,6 @@ jobs:
     name: extension e2e (xvfb + chromium)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Non-blocking until #106 is resolved: 18/19 tests time out on Linux+xvfb
-    # MV3 bootstrap while passing 19/19 on local macOS. Tracked as a follow-up
-    # rather than gating merges. Re-enable strict blocking when the e2e harness
-    # is stable on this runner.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -86,9 +81,7 @@ jobs:
         run: npm run build
 
       - name: Run e2e under xvfb
-        env:
-          # Surface chromium logs in CI for #106 investigation; remove once stable.
-          LGTM_E2E_DEBUG: "1"
+        # Set LGTM_E2E_DEBUG=1 here to surface chromium stderr if e2e regresses.
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' npm --workspace=@lgtm-buzzer/extension run test:e2e
 
       - name: Upload Playwright report on failure
