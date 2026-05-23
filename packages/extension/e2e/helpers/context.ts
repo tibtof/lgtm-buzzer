@@ -92,7 +92,6 @@ export const launchExtensionContext = async (deps: {
 
   // headless: false is required — MV3 extension SWs are not visible to CDP
   // in headless mode. CI equivalent: xvfb-run + headless: false (#54).
-  // See spec-level comment 1 in quiz-happy-path.spec.ts (ADR-19).
   const debugChromium = process.env["LGTM_E2E_DEBUG"] === "1";
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: false,
