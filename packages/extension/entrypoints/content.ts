@@ -7,6 +7,7 @@ import {
   setupAdoVoteInterceptor,
   createGitHubNavigationWatcher,
   createAdoNavigationWatcher,
+  createManualTriggerButton,
   detectPRPage,
 } from "../src/lib/dom/index.js";
 import type {
@@ -117,6 +118,38 @@ export default defineContentScript({
     // ADR-23: forward "open options page" requests from the modal to the SW.
     document.addEventListener("lgtm-buzzer:open-options", () => {
       void browser.runtime.sendMessage({ kind: "open-options" });
+    });
+
+    // Floating "Quiz me on this PR" button (manual trigger). Renders only on
+    // PR pages and re-evaluates on SPA navigation through the same watcher
+    // the quiz flow uses.
+    const triggerButton = createManualTriggerButton({
+      doc: document,
+      onClick: () => {
+        controller.triggerManual();
+      },
+      subscribeNavigation: (cb: () => void) =>
+        navigationWatcher.start({
+          onWillNavigate: () => {},
+          onDidNavigate: cb,
+        }),
+    });
+    triggerButton.mount();
+
+    // Toolbar popup → CS message bridge. Popup sends
+    // `{ kind: "trigger-manual-quiz" }` via chrome.tabs.sendMessage; the SW
+    // ignores it (no `send-frame` shape) and Chrome routes it here too.
+    browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (
+        typeof msg === "object" &&
+        msg !== null &&
+        (msg as { kind?: string }).kind === "trigger-manual-quiz"
+      ) {
+        const result = controller.triggerManual();
+        sendResponse({ ok: result.ok });
+        return true;
+      }
+      return undefined;
     });
   },
 });
