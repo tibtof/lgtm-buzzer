@@ -190,4 +190,36 @@ describe("FrameSchema", () => {
       expect(result.data.kind).toBe("list-adapters-response");
     }
   });
+
+  // ADR-29: new check-auth frame kinds
+  it("parses a well-formed check-auth-request frame", () => {
+    const result = FrameSchema.safeParse({
+      v: 1,
+      kind: "check-auth-request",
+      correlationId: "cid-car",
+      payload: {},
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("check-auth-request");
+    }
+  });
+
+  it("parses a well-formed check-auth-response frame", () => {
+    const result = FrameSchema.safeParse({
+      v: 1,
+      kind: "check-auth-response",
+      correlationId: "cid-cars",
+      payload: {
+        statuses: [
+          { adapterId: "github", ok: true, detail: "via GITHUB_TOKEN env" },
+          { adapterId: "claude-cli", ok: true, detail: "uses CLI's own login" },
+        ],
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("check-auth-response");
+    }
+  });
 });

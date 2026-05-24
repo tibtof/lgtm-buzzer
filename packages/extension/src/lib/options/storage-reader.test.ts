@@ -35,83 +35,50 @@ const makeCorruptStore = (): OptionsStore => {
 };
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests (ADR-29: slim projection — llmAdapterId only)
 // ---------------------------------------------------------------------------
 
-describe("readSwOptions", () => {
-  it("empty storage → all-undefined projection", async () => {
+describe("readSwOptions — ADR-29 slim projection", () => {
+  it("empty storage → { llmAdapterId: undefined }", async () => {
     const store = makeEmptyStore();
     const read = readSwOptions({ store });
     const projection = await read();
     expect(projection.llmAdapterId).toBeUndefined();
-    expect(projection.vcsAdapterId).toBeUndefined();
-    expect(projection.credentials).toBeUndefined();
+    // No vcsAdapterId or credentials on the type
+    expect(Object.keys(projection)).toEqual(["llmAdapterId"]);
   });
 
-  it("stored claude-api with creds → projection carries apiKey", async () => {
+  it("stored llmAdapterId: 'claude-api' → projection carries it", async () => {
     const store = makeStoreWithData({
       schemaVersion: SCHEMA_VERSION,
       llmAdapterId: "claude-api",
-      credentials: { "claude-api": { apiKey: "sk-x" } },
     });
     const read = readSwOptions({ store });
     const projection = await read();
     expect(projection.llmAdapterId).toBe("claude-api");
-    expect(projection.vcsAdapterId).toBeUndefined();
-    expect(projection.credentials).toEqual({ apiKey: "sk-x" });
   });
 
-  it("stored LLM + VCS both with creds → projection merges both bags (VCS wins)", async () => {
-    const store = makeStoreWithData({
-      schemaVersion: SCHEMA_VERSION,
-      llmAdapterId: "claude-api",
-      vcsAdapterId: "github",
-      credentials: {
-        "claude-api": { apiKey: "sk-x" },
-        github: { pat: "ghp_xxx" },
-      },
-    });
-    const read = readSwOptions({ store });
-    const projection = await read();
-    expect(projection.llmAdapterId).toBe("claude-api");
-    expect(projection.vcsAdapterId).toBe("github");
-    expect(projection.credentials).toEqual({ apiKey: "sk-x", pat: "ghp_xxx" });
-  });
-
-  it("stored llmAdapterId but no credentials entry → credentials: undefined (not empty {})", async () => {
+  it("stored llmAdapterId: 'claude-cli' → projection carries it", async () => {
     const store = makeStoreWithData({
       schemaVersion: SCHEMA_VERSION,
       llmAdapterId: "claude-cli",
-      // No credentials field at all
     });
     const read = readSwOptions({ store });
     const projection = await read();
     expect(projection.llmAdapterId).toBe("claude-cli");
-    expect(projection.credentials).toBeUndefined();
   });
 
-  it("corrupt storage → projection is all-undefined, no throw", async () => {
+  it("corrupt storage → { llmAdapterId: undefined }, no throw", async () => {
     const store = makeCorruptStore();
     const read = readSwOptions({ store });
     const projection = await read();
     expect(projection.llmAdapterId).toBeUndefined();
-    expect(projection.vcsAdapterId).toBeUndefined();
-    expect(projection.credentials).toBeUndefined();
   });
 
-  it("VCS creds win on key conflict", async () => {
-    const store = makeStoreWithData({
-      schemaVersion: SCHEMA_VERSION,
-      llmAdapterId: "claude-api",
-      vcsAdapterId: "github",
-      credentials: {
-        // both define 'pat'; vcs should win
-        "claude-api": { pat: "llm-pat" },
-        github: { pat: "vcs-pat" },
-      },
-    });
+  it("storage with only schemaVersion → { llmAdapterId: undefined }", async () => {
+    const store = makeStoreWithData({ schemaVersion: SCHEMA_VERSION });
     const read = readSwOptions({ store });
     const projection = await read();
-    expect(projection.credentials).toEqual({ pat: "vcs-pat" });
+    expect(projection.llmAdapterId).toBeUndefined();
   });
 });

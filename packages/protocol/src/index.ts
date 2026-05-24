@@ -94,4 +94,20 @@ export {
   type ListAdaptersResponseFrame,
 } from "./messages/list-adapters-response.js";
 
+export {
+  CheckAuthRequestPayloadSchema,
+  CheckAuthRequestFrameSchema,
+  type CheckAuthRequestPayload,
+  type CheckAuthRequestFrame,
+} from "./messages/check-auth-request.js";
+
+export {
+  AuthStatusSchema,
+  CheckAuthResponsePayloadSchema,
+  CheckAuthResponseFrameSchema,
+  type AuthStatus,
+  type CheckAuthResponsePayload,
+  type CheckAuthResponseFrame,
+} from "./messages/check-auth-response.js";
+
 export { parseFrame } from "./parse.js";

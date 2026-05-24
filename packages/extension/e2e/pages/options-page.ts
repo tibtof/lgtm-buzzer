@@ -1,11 +1,12 @@
 /**
- * Page object for the LGTM-Buzzer options page (ADR-25 §4).
+ * Page object for the LGTM-Buzzer options page (ADR-25 §4, updated for ADR-29).
  *
  * Wraps the WXT options entrypoint at `chrome-extension://<id>/options.html`.
  * Uses the `data-lgtm-*` attribute contract from `packages/extension/src/lib/options/dom.ts`.
  *
- * The `extensionId` is parsed from the SW URL by `launchExtensionContext` and
- * passed to this constructor.
+ * ADR-29: VCS dropdown (`data-lgtm-select='vcs'`) and credential input methods
+ * (`setLlmCredential`, `setVcsCredential`, etc.) are removed.
+ * The options page now only exposes `llmAdapterId` selection.
  */
 
 import type { Page } from "@playwright/test";
@@ -33,26 +34,29 @@ export class OptionsPage {
   }
 
   /**
-   * Returns the currently-rendered LLM and VCS adapter dropdown option values.
+   * Returns the currently-rendered LLM adapter dropdown option values.
+   *
+   * ADR-29: VCS dropdown removed. Use this method for LLM choices only.
    */
-  async getAdapterChoices(): Promise<{ llm: string[]; vcs: string[] }> {
-    const llm = await this.page.evaluate(() => {
+  async getLlmChoices(): Promise<string[]> {
+    return this.page.evaluate(() => {
       const sel = document.querySelector(
         "[data-lgtm-select='llm']",
       ) as HTMLSelectElement | null;
       if (sel === null) return [];
       return Array.from(sel.options).map((o) => o.value);
     });
+  }
 
-    const vcs = await this.page.evaluate(() => {
-      const sel = document.querySelector(
-        "[data-lgtm-select='vcs']",
-      ) as HTMLSelectElement | null;
-      if (sel === null) return [];
-      return Array.from(sel.options).map((o) => o.value);
-    });
-
-    return { llm, vcs };
+  /**
+   * Returns the currently-rendered LLM and VCS adapter dropdown option values.
+   *
+   * @deprecated VCS choices are always empty post-ADR-29 (VCS dropdown removed).
+   * Use `getLlmChoices()` instead.
+   */
+  async getAdapterChoices(): Promise<{ llm: string[]; vcs: string[] }> {
+    const llm = await this.getLlmChoices();
+    return { llm, vcs: [] };
   }
 
   /**
@@ -68,56 +72,10 @@ export class OptionsPage {
   }
 
   /**
-   * Returns the currently selected VCS adapter value.
-   */
-  async getSelectedVcs(): Promise<string> {
-    return this.page.evaluate(() => {
-      const sel = document.querySelector(
-        "[data-lgtm-select='vcs']",
-      ) as HTMLSelectElement | null;
-      return sel?.value ?? "";
-    });
-  }
-
-  /**
-   * Selects an LLM adapter by value; triggers the change handler that renders
-   * its credential inputs.
+   * Selects an LLM adapter by value; triggers the change handler.
    */
   async selectLlmAdapter(id: string): Promise<void> {
     await this.page.selectOption("[data-lgtm-select='llm']", id);
-  }
-
-  /**
-   * Selects a VCS adapter by value.
-   */
-  async selectVcsAdapter(id: string): Promise<void> {
-    await this.page.selectOption("[data-lgtm-select='vcs']", id);
-  }
-
-  /**
-   * Fills the named credential input under the LLM section.
-   *
-   * @param field - The `data-lgtm-cred-input` attribute value (field key).
-   * @param value - The value to fill.
-   */
-  async setLlmCredential(field: string, value: string): Promise<void> {
-    await this.page.fill(
-      `[data-lgtm-creds='llm'] [data-lgtm-cred-input='${field}']`,
-      value,
-    );
-  }
-
-  /**
-   * Fills the named credential input under the VCS section.
-   *
-   * @param field - The `data-lgtm-cred-input` attribute value (field key).
-   * @param value - The value to fill.
-   */
-  async setVcsCredential(field: string, value: string): Promise<void> {
-    await this.page.fill(
-      `[data-lgtm-creds='vcs'] [data-lgtm-cred-input='${field}']`,
-      value,
-    );
   }
 
   /**
@@ -152,26 +110,5 @@ export class OptionsPage {
     const normalised: "success" | "error" =
       kind === "success" ? "success" : "error";
     return { kind: normalised, message: (message ?? "").trim() };
-  }
-
-  /**
-   * Returns the value of the named credential input (LLM section).
-   *
-   * Used to assert persistence: after a page reload the input should be
-   * pre-filled with the stored value.
-   */
-  async getLlmCredentialValue(field: string): Promise<string> {
-    return this.page.inputValue(
-      `[data-lgtm-creds='llm'] [data-lgtm-cred-input='${field}']`,
-    );
-  }
-
-  /**
-   * Returns the value of the named credential input (VCS section).
-   */
-  async getVcsCredentialValue(field: string): Promise<string> {
-    return this.page.inputValue(
-      `[data-lgtm-creds='vcs'] [data-lgtm-cred-input='${field}']`,
-    );
   }
 }

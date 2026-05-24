@@ -72,7 +72,6 @@ describe("classifyError — 1:1 wire reason mapping", () => {
     { reason: "unknown-quiz-id",         expected: { kind: "unknown-quiz-id" } },
     { reason: "unsupported-llm-adapter", expected: { kind: "unsupported-llm-adapter" } },
     { reason: "unsupported-vcs-adapter", expected: { kind: "unsupported-vcs-adapter" } },
-    { reason: "bad-credentials",         expected: { kind: "bad-credentials" } },
     { reason: "missing-credentials",     expected: { kind: "missing-credentials" } },
   ];
 
@@ -100,7 +99,6 @@ describe("errorClassToUI — exhaustive title + body", () => {
     { kind: "unknown-quiz-id" },
     { kind: "unsupported-llm-adapter" },
     { kind: "unsupported-vcs-adapter" },
-    { kind: "bad-credentials" },
     { kind: "missing-credentials" },
   ];
 
@@ -128,10 +126,6 @@ describe("errorClassToUI — specific CTA assertions", () => {
 
   it('host-timeout → retry CTA', () => {
     expect(errorClassToUI({ kind: "host-timeout" }).cta?.action.kind).toBe("retry");
-  });
-
-  it('bad-credentials → open-options CTA', () => {
-    expect(errorClassToUI({ kind: "bad-credentials" }).cta?.action.kind).toBe("open-options");
   });
 
   it('missing-credentials → open-options CTA', () => {

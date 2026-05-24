@@ -81,8 +81,10 @@ describe("QuizRequestFrameSchema", () => {
     expect(result.success).toBe(false);
   });
 
-  // ADR-22: optional adapter selection + credentials fields
-  it("parses a quiz-request with all three new optional fields present", () => {
+  // ADR-29: credentials field is REMOVED. Test passthrough behaviour.
+  it("parses a stale quiz-request that still contains a credentials field (passthrough)", () => {
+    // A stale extension still sends credentials. The schema should still parse
+    // (zod passthrough default) without crashing the host.
     const result = QuizRequestFrameSchema.safeParse({
       ...BASE,
       payload: {
@@ -95,13 +97,15 @@ describe("QuizRequestFrameSchema", () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
+      // adapter IDs are still parsed
       expect(result.data.payload.llmAdapterId).toBe("claude-api");
       expect(result.data.payload.vcsAdapterId).toBe("github");
-      expect(result.data.payload.credentials?.["apiKey"]).toBe("sk-ant-xxx");
+      // credentials field is NOT on the typed payload — the handler should never read it
+      // (TypeScript type does not expose it, but zod passthrough keeps it in the runtime object)
     }
   });
 
-  it("parses a quiz-request with only pr + questionCount (legacy envelope — no new fields)", () => {
+  it("parses a quiz-request with only pr + questionCount (minimal envelope)", () => {
     const result = QuizRequestFrameSchema.safeParse({
       ...BASE,
       payload: { pr: GITHUB_PR, questionCount: 5 },
@@ -110,20 +114,7 @@ describe("QuizRequestFrameSchema", () => {
     if (result.success) {
       expect(result.data.payload.llmAdapterId).toBeUndefined();
       expect(result.data.payload.vcsAdapterId).toBeUndefined();
-      expect(result.data.payload.credentials).toBeUndefined();
     }
-  });
-
-  it("rejects when credentials contains a non-string value", () => {
-    const result = QuizRequestFrameSchema.safeParse({
-      ...BASE,
-      payload: {
-        pr: GITHUB_PR,
-        questionCount: 3,
-        credentials: { apiKey: 12345 },
-      },
-    });
-    expect(result.success).toBe(false);
   });
 
   it("rejects when llmAdapterId is an empty string", () => {

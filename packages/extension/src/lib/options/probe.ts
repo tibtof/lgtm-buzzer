@@ -1,5 +1,5 @@
 import { type Either, Left, Right } from "monadyssey";
-import type { Frame, CredentialsBag } from "@lgtm-buzzer/protocol";
+import type { Frame } from "@lgtm-buzzer/protocol";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -18,14 +18,12 @@ export type ProbeError =
  * Function that pings the host to verify the connection is working.
  *
  * v1: sends a `ping` frame with a fresh nonce and asserts the `pong` echoes
- * it back. The `llmAdapterId`, `vcsAdapterId`, and `credentials` inputs are
- * accepted for forward compatibility — a future probe will exercise the
- * full adapter pipeline rather than just ping.
+ * it back. As of ADR-29, the `credentials` input is REMOVED — credentials
+ * are resolved host-side. Only the LLM adapter ID is kept for forward
+ * compatibility (a future probe may exercise the full adapter pipeline).
  */
 export type Probe = (input: {
   readonly llmAdapterId: string;
-  readonly vcsAdapterId: string;
-  readonly credentials: CredentialsBag;
 }) => Promise<Either<ProbeError, "ok">>;
 
 // ---------------------------------------------------------------------------

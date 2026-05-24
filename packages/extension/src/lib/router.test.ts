@@ -30,12 +30,15 @@ const errorFrame = (correlationId: string, message: string): Frame => ({
   payload: { reason: "internal", message },
 });
 
-const quizRequestFrame = (correlationId: string): Frame => ({
+const quizRequestFrame = (correlationId: string, prKind: "github" | "ado" = "github"): Frame => ({
   v: 1,
   kind: "quiz-request",
   correlationId,
   payload: {
-    pr: { kind: "github", owner: "tibtof", repo: "lgtm-buzzer", number: 42 },
+    pr:
+      prKind === "github"
+        ? { kind: "github", owner: "tibtof", repo: "lgtm-buzzer", number: 42 }
+        : { kind: "ado", org: "myorg", project: "myproject", repo: "myrepo", pullRequestId: 7 },
     questionCount: 3,
   },
 });
@@ -47,10 +50,9 @@ const makeFakePortClient = (reply: Frame): PortClient => ({
     .mockResolvedValue(reply),
 });
 
+// ADR-29: SwOptionsProjection now only has llmAdapterId
 const noopReadSwOptions = async (): Promise<SwOptionsProjection> => ({
   llmAdapterId: undefined,
-  vcsAdapterId: undefined,
-  credentials: undefined,
 });
 
 const noSender = { tab: { id: 7 } };
@@ -177,23 +179,19 @@ describe("createCSMessageHandler", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // ADR-23: quiz-request storage merge tests
+  // ADR-29: quiz-request VCS auto-pick from pr.kind
   // ---------------------------------------------------------------------------
 
-  it("quiz-request with empty storage → forwards with undefined adapter fields", async () => {
-    const portClient = makeFakePortClient(pongFrame("c-qr"));
+  it("quiz-request with pr.kind='github' → SW forwards with vcsAdapterId='github'", async () => {
+    const portClient = makeFakePortClient(pongFrame("c-qr-gh"));
     const handler = createCSMessageHandler({
       portClient,
-      readSwOptions: async () => ({
-        llmAdapterId: undefined,
-        vcsAdapterId: undefined,
-        credentials: undefined,
-      }),
+      readSwOptions: async () => ({ llmAdapterId: undefined }),
     });
     const sendResponse = vi.fn<(response: CSResponse) => void>();
 
     handler(
-      { kind: "send-frame", frame: quizRequestFrame("c-qr") },
+      { kind: "send-frame", frame: quizRequestFrame("c-qr-gh", "github") },
       noSender,
       sendResponse,
     );
@@ -204,30 +202,23 @@ describe("createCSMessageHandler", () => {
 
     const forwardedFrame = (portClient.sendFrame as ReturnType<typeof vi.fn>).mock
       .calls[0]?.[0] as Frame;
-    const p = forwardedFrame.payload as {
-      llmAdapterId?: string;
-      vcsAdapterId?: string;
-      credentials?: unknown;
-    };
-    expect(p.llmAdapterId).toBeUndefined();
-    expect(p.vcsAdapterId).toBeUndefined();
+    const p = forwardedFrame.payload as { vcsAdapterId?: string; credentials?: unknown };
+    expect(p.vcsAdapterId).toBe("github");
+    // ADR-29: credentials must NOT be in the forwarded frame
     expect(p.credentials).toBeUndefined();
+    expect(JSON.stringify(forwardedFrame)).not.toContain('"credentials"');
   });
 
-  it("quiz-request with stored claude-api + apiKey → forwards with adapter fields merged", async () => {
-    const portClient = makeFakePortClient(pongFrame("c-qr2"));
+  it("quiz-request with pr.kind='ado' → SW forwards with vcsAdapterId='ado'", async () => {
+    const portClient = makeFakePortClient(pongFrame("c-qr-ado"));
     const handler = createCSMessageHandler({
       portClient,
-      readSwOptions: async () => ({
-        llmAdapterId: "claude-api",
-        vcsAdapterId: undefined,
-        credentials: { apiKey: "k" },
-      }),
+      readSwOptions: async () => ({ llmAdapterId: undefined }),
     });
     const sendResponse = vi.fn<(response: CSResponse) => void>();
 
     handler(
-      { kind: "send-frame", frame: quizRequestFrame("c-qr2") },
+      { kind: "send-frame", frame: quizRequestFrame("c-qr-ado", "ado") },
       noSender,
       sendResponse,
     );
@@ -238,20 +229,102 @@ describe("createCSMessageHandler", () => {
 
     const forwardedFrame = (portClient.sendFrame as ReturnType<typeof vi.fn>).mock
       .calls[0]?.[0] as Frame;
-    const p = forwardedFrame.payload as {
-      llmAdapterId?: string;
-      credentials?: { apiKey?: string };
-    };
+    const p = forwardedFrame.payload as { vcsAdapterId?: string };
+    expect(p.vcsAdapterId).toBe("ado");
+  });
+
+  it("quiz-request with stored llmAdapterId='claude-api' → SW merges it", async () => {
+    const portClient = makeFakePortClient(pongFrame("c-qr-llm"));
+    const handler = createCSMessageHandler({
+      portClient,
+      readSwOptions: async () => ({ llmAdapterId: "claude-api" }),
+    });
+    const sendResponse = vi.fn<(response: CSResponse) => void>();
+
+    handler(
+      { kind: "send-frame", frame: quizRequestFrame("c-qr-llm", "github") },
+      noSender,
+      sendResponse,
+    );
+
+    await vi.waitFor(() => {
+      expect(sendResponse).toHaveBeenCalledOnce();
+    });
+
+    const forwardedFrame = (portClient.sendFrame as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0] as Frame;
+    const p = forwardedFrame.payload as { llmAdapterId?: string };
     expect(p.llmAdapterId).toBe("claude-api");
-    expect(p.credentials?.apiKey).toBe("k");
+  });
+
+  it("quiz-request where CS sent a stale credentials field → SW strips it", async () => {
+    const portClient = makeFakePortClient(pongFrame("c-qr-stale"));
+    const handler = createCSMessageHandler({
+      portClient,
+      readSwOptions: async () => ({ llmAdapterId: undefined }),
+    });
+    const sendResponse = vi.fn<(response: CSResponse) => void>();
+
+    // Stale CS sends a credentials field — the router must strip it.
+    // Use `as unknown as Frame` because the payload contains a stale `credentials`
+    // field that is no longer on the typed QuizRequestPayload (ADR-29).
+    const staleFrame = {
+      v: 1,
+      kind: "quiz-request",
+      correlationId: "c-qr-stale",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 3,
+        credentials: { pat: "ghp_stale" }, // stale — must be stripped by router
+      },
+    } as unknown as Frame;
+
+    handler({ kind: "send-frame", frame: staleFrame }, noSender, sendResponse);
+
+    await vi.waitFor(() => {
+      expect(sendResponse).toHaveBeenCalledOnce();
+    });
+
+    const forwardedFrame = (portClient.sendFrame as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0] as Frame;
+    // credentials must have been stripped
+    const p = forwardedFrame.payload as Record<string, unknown>;
+    expect(p["credentials"]).toBeUndefined();
+    expect(JSON.stringify(forwardedFrame)).not.toContain('"credentials"');
+    expect(JSON.stringify(forwardedFrame)).not.toContain("ghp_stale");
+  });
+
+  it("quiz-request with stored llmAdapterId overrides same field from CS, vcsAdapterId always from pr.kind", async () => {
+    const portClient = makeFakePortClient(pongFrame("c-qr-override"));
+    const handler = createCSMessageHandler({
+      portClient,
+      // Storage has a stale vcsAdapterId — it should NOT be used (ADR-29)
+      readSwOptions: async () => ({ llmAdapterId: "codex-cli" }),
+    });
+    const sendResponse = vi.fn<(response: CSResponse) => void>();
+
+    handler(
+      { kind: "send-frame", frame: quizRequestFrame("c-qr-override", "github") },
+      noSender,
+      sendResponse,
+    );
+
+    await vi.waitFor(() => {
+      expect(sendResponse).toHaveBeenCalledOnce();
+    });
+
+    const forwardedFrame = (portClient.sendFrame as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0] as Frame;
+    const p = forwardedFrame.payload as { llmAdapterId?: string; vcsAdapterId?: string };
+    expect(p.llmAdapterId).toBe("codex-cli");
+    // vcsAdapterId comes from pr.kind, not from storage
+    expect(p.vcsAdapterId).toBe("github");
   });
 
   it("ping frame passes through unchanged — no storage read, no credential injection", async () => {
     const portClient = makeFakePortClient(pongFrame("c-ping"));
     const readSwOptions = vi.fn<() => Promise<SwOptionsProjection>>().mockResolvedValue({
       llmAdapterId: "should-not-appear",
-      vcsAdapterId: undefined,
-      credentials: { secret: "should-not-appear" },
     });
 
     const handler = createCSMessageHandler({ portClient, readSwOptions });

@@ -29,14 +29,6 @@ type ErrorCase = {
 
 const ERROR_CASES: ReadonlyArray<ErrorCase> = [
   {
-    name: "bad-credentials",
-    reason: "bad-credentials",
-    message: "Credentials rejected",
-    expectedTitle: "Credentials rejected",
-    expectedCta: "Open options",
-    ctaAction: "open-options",
-  },
-  {
     name: "missing-credentials",
     reason: "missing-credentials",
     message: "Credentials required",

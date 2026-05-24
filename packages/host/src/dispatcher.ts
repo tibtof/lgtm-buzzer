@@ -12,8 +12,9 @@ import type {
 } from "@lgtm-buzzer/core";
 import { pickCorrectAnswers, scoreSubmission, decidePassed } from "@lgtm-buzzer/core";
 import type { Logger } from "@lgtm-buzzer/core";
-import type { Frame, CredentialsBag } from "@lgtm-buzzer/protocol";
+import type { Frame } from "@lgtm-buzzer/protocol";
 import { PROTOCOL_VERSION } from "@lgtm-buzzer/protocol";
+import type { AuthStatus } from "@lgtm-buzzer/protocol";
 import type { FrameWriter } from "./framing/writer.js";
 import type { WriteError } from "./framing/errors.js";
 import type { SessionStore } from "./session-store.js";
@@ -37,8 +38,6 @@ export type DispatcherDeps = {
   readonly logger: Logger;
   /** Adapter registry — resolves adapter IDs to provider instances per-request. */
   readonly registry: AdapterRegistry;
-  /** @deprecated env is kept for test backward-compat but no longer used for adapter selection. */
-  readonly env?: Readonly<Record<string, string | undefined>>;
 };
 
 // ---------------------------------------------------------------------------
@@ -62,7 +61,6 @@ export const buildErrorFrame = (
     | "unknown-message"
     | "unsupported-llm-adapter"
     | "unsupported-vcs-adapter"
-    | "bad-credentials"
     | "missing-credentials",
   message: string,
   correlationId: string | null,
@@ -77,8 +75,8 @@ export const buildErrorFrame = (
 /**
  * Map a `RegistryError` to the appropriate wire `ErrorFrame`.
  *
- * BINDING: `details` MUST NOT include credential bytes. For `bad-credentials`,
- * only the `adapterId` and `detail` (field paths) are included.
+ * BINDING: `details` MUST NOT include credential bytes. Only the `adapterId`,
+ * `attempted` (step labels), and `hint` (remediation copy) are included.
  *
  * @param err - The registry error to map.
  * @param correlationId - Frame correlation ID.
@@ -106,17 +104,9 @@ const buildRegistryErrorFrame = (
     case "missing-credentials":
       return buildErrorFrame(
         "missing-credentials",
-        `Adapter ${err.adapterId} requires credentials`,
+        `Adapter ${err.adapterId} could not resolve credentials`,
         correlationId,
-        { adapterId: err.adapterId },
-      );
-    case "bad-credentials":
-      // detail contains field paths only — never credential values.
-      return buildErrorFrame(
-        "bad-credentials",
-        `Credentials for adapter ${err.adapterId} are invalid`,
-        correlationId,
-        { adapterId: err.adapterId, detail: err.detail },
+        { adapterId: err.adapterId, attempted: err.attempted, hint: err.hint },
       );
   }
 };
@@ -216,20 +206,121 @@ const handleListAdaptersRequest = (
 };
 
 // ---------------------------------------------------------------------------
+// check-auth-request handler
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle a `check-auth-request` frame.
+ *
+ * Iterates every adapter in the registry, calls `resolver.resolve` on each
+ * (via `buildLlm` / `buildVcs`), collects an `AuthStatus` per adapter, and
+ * writes a `check-auth-response` frame.
+ *
+ * Resolution failures are NOT propagated to the IO error channel — they are
+ * individual `ok: false` rows in the response. The outer IO is `IO<never, void>`.
+ *
+ * BINDING: `detail` and `hint` in `AuthStatus` rows MUST NOT contain secret
+ * bytes. The registry error shape already enforces this (field labels only).
+ *
+ * @param correlationId - Frame correlation ID.
+ * @param deps - Injected dependencies.
+ * @returns `IO<never, void>` — never fails.
+ */
+const handleCheckAuthRequest = (
+  correlationId: string | null,
+  deps: DispatcherDeps,
+): IO<never, void> => {
+  const { write, logger, registry } = deps;
+
+  return IO.lift<never, void>(async () => {
+    const llmIds = registry.listLlm();
+    const vcsIds = registry.listVcs();
+    const allIds = [...llmIds, ...vcsIds];
+
+    const statuses: AuthStatus[] = [];
+
+    // Resolve each adapter sequentially (simple, bounded by 5s per adapter via spawnIO).
+    for (const adapterId of allIds) {
+      let result;
+      try {
+        // Build the adapter — this triggers the resolver internally.
+        // We use buildLlm for LLM IDs and buildVcs for VCS IDs.
+        if ((llmIds as readonly string[]).includes(adapterId)) {
+          result = await registry.buildLlm(adapterId).unsafeRun();
+        } else {
+          result = await registry.buildVcs(adapterId).unsafeRun();
+        }
+      } catch {
+        statuses.push({
+          adapterId,
+          ok: false,
+          detail: "resolver threw unexpectedly",
+          hint: "Check host logs for details",
+        });
+        continue;
+      }
+
+      if (result.type === "Ok") {
+        // Determine detail from adapter ID (CLI-managed vs env-based)
+        const isCliManaged =
+          adapterId === "claude-cli" ||
+          adapterId === "codex-cli" ||
+          adapterId === "copilot-cli";
+        statuses.push({
+          adapterId,
+          ok: true,
+          detail: isCliManaged ? "uses CLI's own login" : "credentials resolved",
+        });
+      } else {
+        const err = result.error;
+        // err is RegistryError — extract hint if present.
+        if (err.kind === "missing-credentials") {
+          statuses.push({
+            adapterId,
+            ok: false,
+            hint: err.hint,
+          });
+        } else {
+          statuses.push({
+            adapterId,
+            ok: false,
+            detail: `${err.kind}: ${err.id}`,
+          });
+        }
+      }
+    }
+
+    logger.info("check-auth-request handled", { adapterCount: statuses.length });
+
+    const responseFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "check-auth-response",
+      correlationId,
+      payload: { statuses },
+    };
+
+    await safeWrite(write, responseFrame, logger).unsafeRun();
+  });
+};
+
+// ---------------------------------------------------------------------------
 // quiz-request handler
 // ---------------------------------------------------------------------------
 
 /**
  * Handle a `quiz-request` frame.
  *
- * Sequence (ADR-16 §Sequence binding, extended by ADR-22):
+ * Sequence (ADR-16 §Sequence binding, updated by ADR-29):
  * 1. Resolve adapter IDs (defaults applied when absent).
- * 2. Build VCS + LLM providers via registry (validates credentials).
+ * 2. Build VCS + LLM providers via registry (resolves credentials from host env).
  * 3. Fetch diff from VCS adapter (IO).
  * 4. Generate quiz from LLM adapter (IO).
  * 5. `pickCorrectAnswers` + store answer key.
  * 6. Build `quiz-response` frame (no `correctChoiceId`).
  * 7. Write frame to extension.
+ *
+ * As of ADR-29, step 2 is IO-bearing (credential resolution). The
+ * `credentials` parameter is REMOVED — credentials come from the host env.
  *
  * All IO work is forked into a per-request Fiber so it can be cancelled
  * independently. Cancellation → log at info, no wire frame.
@@ -239,7 +330,6 @@ const handleListAdaptersRequest = (
  * @param questionCount - Number of questions requested.
  * @param llmAdapterId - Requested LLM adapter ID (defaults to "claude-cli").
  * @param vcsAdapterId - Requested VCS adapter ID (defaults to "github").
- * @param credentials - Per-request credentials bag (may be undefined).
  * @param correlationId - Frame correlation ID.
  * @param deps - Injected dependencies.
  * @returns `IO<never, void>` — the outer IO never fails.
@@ -249,58 +339,42 @@ const handleQuizRequest = (
   questionCount: number,
   llmAdapterId: string,
   vcsAdapterId: string,
-  credentials: CredentialsBag | undefined,
   correlationId: string | null,
   deps: DispatcherDeps,
 ): IO<never, void> => {
   const { write, store, logger, registry } = deps;
   const log = logger.child({ correlationId: correlationId ?? "", kind: "quiz-request" });
 
-  type WorkError = VCSProviderError | LLMProviderError | WriteError;
+  type WorkError = RegistryError | VCSProviderError | LLMProviderError | WriteError;
 
-  // Step 1: resolve adapters via registry (pure Either).
-  // Use .self for narrowing — Either<A,B> does not expose .value directly,
-  // but .self narrows to Left<RegistryError> | Right<Provider>.
-  const vcsResult = registry.buildVcs(vcsAdapterId, credentials);
-  const llmResult = registry.buildLlm(llmAdapterId, credentials);
-
-  // Step 2: if either adapter fails, send the appropriate error frame immediately.
-  // Diff is NEVER fetched in registry-error branches.
-  if (vcsResult.self.type === "Left") {
-    const err = vcsResult.self.value;
-    const errFrame = buildRegistryErrorFrame(err, correlationId);
-    log.warn("VCS adapter construction failed", { kind: err.kind });
-    return safeWrite(write, errFrame, log);
-  }
-
-  if (llmResult.self.type === "Left") {
-    const err = llmResult.self.value;
-    const errFrame = buildRegistryErrorFrame(err, correlationId);
-    log.warn("LLM adapter construction failed", { kind: err.kind });
-    return safeWrite(write, errFrame, log);
-  }
-
-  const vcs: VCSProvider = vcsResult.self.value;
-  const llm: LLMProvider = llmResult.self.value;
-
-  // Step 3–7: fetch diff, generate quiz, store answer key, write response.
-  const work: IO<WorkError, void> = vcs
-    .fetchDiff(pr)
+  // Step 1–7: resolve adapters, fetch diff, generate quiz, store answer key, write response.
+  const work: IO<WorkError, void> = registry
+    .buildVcs(vcsAdapterId)
     .mapErr((e): WorkError => e)
-    .flatMap((diff): IO<WorkError, void> => {
-      log.info("Generating quiz", { llmId: llm.id, questionCount });
-      return llm
-        .generateQuiz({ diff, questionCount })
+    .flatMap((vcs: VCSProvider): IO<WorkError, void> =>
+      registry
+        .buildLlm(llmAdapterId)
         .mapErr((e): WorkError => e)
-        .flatMap((quiz): IO<WorkError, void> => {
-          const answerKey = pickCorrectAnswers(quiz);
-          store.set(quiz.id as QuizId, answerKey);
-          log.info("Quiz generated — answer key stored", { quizId: quiz.id });
+        .flatMap((llm: LLMProvider): IO<WorkError, void> => {
+          return vcs
+            .fetchDiff(pr)
+            .mapErr((e): WorkError => e)
+            .flatMap((diff): IO<WorkError, void> => {
+              log.info("Generating quiz", { llmId: llm.id, questionCount });
+              return llm
+                .generateQuiz({ diff, questionCount })
+                .mapErr((e): WorkError => e)
+                .flatMap((quiz): IO<WorkError, void> => {
+                  const answerKey = pickCorrectAnswers(quiz);
+                  store.set(quiz.id as QuizId, answerKey);
+                  log.info("Quiz generated — answer key stored", { quizId: quiz.id });
 
-          const responseFrame = buildQuizResponseFrame(quiz, correlationId);
-          return write(responseFrame).mapErr((e): WorkError => e);
-        });
-    });
+                  const responseFrame = buildQuizResponseFrame(quiz, correlationId);
+                  return write(responseFrame).mapErr((e): WorkError => e);
+                });
+            });
+        }),
+    );
 
   // Fork into a per-request fiber. Join and handle all three outcomes.
   return work.fork().flatMap((fiber) =>
@@ -313,13 +387,24 @@ const handleQuizRequest = (
 
         case "Err": {
           const e = outcome.error;
-          log.error("quiz-request failed", { kind: e.kind });
-          const errFrame = buildErrorFrame(
-            "internal",
-            `quiz-request failed: ${e.kind}`,
-            correlationId,
-          );
-          await safeWrite(write, errFrame, log).unsafeRun();
+          // Registry errors get a specific error reason; all others are "internal".
+          if (
+            e.kind === "unsupported-llm-adapter" ||
+            e.kind === "unsupported-vcs-adapter" ||
+            e.kind === "missing-credentials"
+          ) {
+            log.warn("Adapter construction failed", { kind: e.kind });
+            const errFrame = buildRegistryErrorFrame(e as RegistryError, correlationId);
+            await safeWrite(write, errFrame, log).unsafeRun();
+          } else {
+            log.error("quiz-request failed", { kind: e.kind });
+            const errFrame = buildErrorFrame(
+              "internal",
+              `quiz-request failed: ${e.kind}`,
+              correlationId,
+            );
+            await safeWrite(write, errFrame, log).unsafeRun();
+          }
           break;
         }
 
@@ -445,8 +530,9 @@ export type DispatcherFactory = {
 /**
  * Create the frame dispatcher.
  *
- * Handles `quiz-request`, `quiz-submit`, `list-adapters-request`, `error`
- * (log + ignore), and unexpected kinds (reply with `ErrorFrame { reason: "unknown-message" }`).
+ * Handles `quiz-request`, `quiz-submit`, `list-adapters-request`,
+ * `check-auth-request`, `error` (log + ignore), and unexpected kinds
+ * (reply with `ErrorFrame { reason: "unknown-message" }`).
  *
  * @param deps - Injected dependencies (write, store, logger, registry).
  * @returns A `DispatcherFactory` with a single `dispatch` method.
@@ -483,19 +569,21 @@ export const createDispatcher = (deps: DispatcherDeps): DispatcherFactory => {
       case "list-adapters-request":
         return handleListAdaptersRequest(frame.correlationId, deps);
 
+      case "check-auth-request":
+        return handleCheckAuthRequest(frame.correlationId, deps);
+
       case "quiz-request": {
         const llmAdapterId =
           frame.payload.llmAdapterId ?? DEFAULT_LLM_ADAPTER_ID;
         const vcsAdapterId =
           frame.payload.vcsAdapterId ?? DEFAULT_VCS_ADAPTER_ID;
-        const credentials = frame.payload.credentials;
+        // ADR-29: credentials field is REMOVED. Never read payload.credentials.
 
         return handleQuizRequest(
           frame.payload.pr as PRIdentifier,
           frame.payload.questionCount,
           llmAdapterId,
           vcsAdapterId,
-          credentials,
           frame.correlationId,
           deps,
         );
@@ -512,7 +600,8 @@ export const createDispatcher = (deps: DispatcherDeps): DispatcherFactory => {
       case "pong":
       case "quiz-response":
       case "quiz-result":
-      case "list-adapters-response": {
+      case "list-adapters-response":
+      case "check-auth-response": {
         // These are host→extension frame kinds; receiving them is unexpected.
         logger.warn("Received unexpected frame kind — replying with unknown-message", {
           kind: frame.kind,

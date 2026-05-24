@@ -16,9 +16,10 @@ export type RouterDeps = {
   /**
    * Reads the stored options projection for the SW.
    *
-   * Called on every outbound `quiz-request` frame to merge `llmAdapterId`,
-   * `vcsAdapterId`, and `credentials` into the payload. Injected so tests can
-   * supply a stub without touching `chrome.storage`.
+   * Called on every outbound `quiz-request` frame to merge `llmAdapterId`
+   * into the payload. As of ADR-29, `vcsAdapterId` is inferred from `pr.kind`
+   * and `credentials` are resolved host-side — neither is read from storage.
+   * Injected so tests can supply a stub without touching `chrome.storage`.
    */
   readonly readSwOptions: () => Promise<SwOptionsProjection>;
   /** Called when the CS sends an `open-options` message. */
@@ -45,8 +46,15 @@ export type CSMessageHandler = (
  *
  * Changes in ADR-23:
  * - On `quiz-request` frames, reads chrome.storage.local (via `readSwOptions`)
- *   and merges `llmAdapterId`, `vcsAdapterId`, and `credentials` into the
- *   outgoing payload. Fresh read on every request — no caching.
+ *   and merges `llmAdapterId` into the outgoing payload. Fresh read on every
+ *   request — no caching.
+ *
+ * Changes in ADR-29:
+ * - `vcsAdapterId` is now inferred from `pr.kind` (`"github"` → `"github"`,
+ *   `"ado"` → `"ado"`). Storage is no longer read for VCS adapter selection.
+ * - `credentials` are REMOVED from the outgoing frame entirely. If a stale
+ *   content script sends a `credentials` field, it is defensively stripped
+ *   before forwarding to the host.
  * - On `open-options` messages, calls `openOptionsPage()` to open the options
  *   page without any frame exchange with the host.
  *
@@ -103,22 +111,33 @@ export const createCSMessageHandler = (deps: RouterDeps): CSMessageHandler => {
         const projection = await readSwOptions();
 
         const originalPayload = frame.payload as {
-          pr: unknown;
+          pr: { kind?: string } | unknown;
           questionCount: unknown;
           llmAdapterId?: string;
           vcsAdapterId?: string;
           credentials?: unknown;
         };
 
-        const mergedPayload = {
+        // ADR-29: auto-pick VCS adapter from the PR kind.
+        const prKind =
+          originalPayload.pr !== null &&
+          typeof originalPayload.pr === "object" &&
+          "kind" in (originalPayload.pr as object)
+            ? (originalPayload.pr as { kind: unknown }).kind
+            : undefined;
+
+        const vcsFromPrKind: "github" | "ado" | undefined =
+          prKind === "github" ? "github" : prKind === "ado" ? "ado" : undefined;
+
+        const mergedPayload: Record<string, unknown> = {
           ...originalPayload,
           llmAdapterId:
             projection.llmAdapterId ?? originalPayload.llmAdapterId,
-          vcsAdapterId:
-            projection.vcsAdapterId ?? originalPayload.vcsAdapterId,
-          credentials:
-            projection.credentials ?? originalPayload.credentials,
+          vcsAdapterId: vcsFromPrKind ?? originalPayload.vcsAdapterId,
         };
+
+        // ADR-29: strip credentials field entirely (stale CS may still send it).
+        delete mergedPayload["credentials"];
 
         // Cast is safe: we're only filling optional fields on a quiz-request
         // payload; the host validates the wire format on receipt.

@@ -3,6 +3,9 @@
  *
  * The entrypoint (`entrypoints/options/main.ts`) imports from this barrel.
  * The service worker imports `readSwOptions` directly from `./storage-reader`.
+ *
+ * ADR-29: `StoredCredentialsMap` and `adapter-creds` exports are REMOVED.
+ *         `createCheckAuth` / `CheckAuth` / `CheckAuthError` are added.
  */
 export {
   STORAGE_KEY,
@@ -10,7 +13,6 @@ export {
   StoredOptionsSchema,
   DEFAULT_OPTIONS,
   type StoredOptions,
-  type StoredCredentialsMap,
 } from "./schema.js";
 
 export {
@@ -37,11 +39,10 @@ export {
 } from "./probe.js";
 
 export {
-  getCredsSpec,
-  ADAPTER_CREDS_SPECS,
-  type AdapterCredsSpec,
-  type CredFieldSpec,
-} from "./adapter-creds.js";
+  createCheckAuth,
+  type CheckAuth,
+  type CheckAuthError,
+} from "./auth-status.js";
 
 export {
   createOptionsView,

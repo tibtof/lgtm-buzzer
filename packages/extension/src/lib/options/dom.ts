@@ -1,10 +1,10 @@
 import { type Either } from "monadyssey";
-import type { CredentialsBag } from "@lgtm-buzzer/protocol";
 import type { OptionsStore, StorageError } from "./storage.js";
 import type { StoredOptions } from "./schema.js";
 import { SCHEMA_VERSION } from "./schema.js";
 import type { Probe, ProbeError } from "./probe.js";
-import { getCredsSpec } from "./adapter-creds.js";
+import type { CheckAuth, CheckAuthError } from "./auth-status.js";
+import type { AuthStatus } from "@lgtm-buzzer/protocol";
 
 // ---------------------------------------------------------------------------
 // Exported types (imported by sw-bridge, probe, and the entrypoint)
@@ -42,6 +42,7 @@ export type OptionsDOMDeps = {
   readonly store: OptionsStore;
   readonly listAdapters: () => Promise<Either<ListAdaptersError, AdapterCatalog>>;
   readonly probe: Probe;
+  readonly checkAuth: CheckAuth;
   readonly logger?: OptionsDOMLogger;
 };
 
@@ -87,25 +88,24 @@ const textEl = <K extends keyof HTMLElementTagNameMap>(
 /**
  * Creates the options page view that renders into the supplied `root` element.
  *
+ * ADR-29: credential inputs and VCS dropdown are REMOVED. The view now shows:
+ * - LLM adapter dropdown (only user preference left).
+ * - Auth-status panel with one row per adapter and a refresh button.
+ * - Test connection button (sends `ping` with `llmAdapterId` only).
+ *
  * Designed to be mounted inside a caller-supplied `<main>` element so that
  * jsdom tests can mount it without touching `document.body`.
  *
  * @param deps - Injected dependencies.
  */
 export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
-  const { doc, root, store, listAdapters, probe } = deps;
+  const { doc, root, store, listAdapters, probe, checkAuth } = deps;
 
   // ---------------------------------------------------------------------------
   // Internal state — mutable, scoped to the factory
   // ---------------------------------------------------------------------------
 
-  // Current form selections (keyed by select element id).
   let selectedLlm = "";
-  let selectedVcs = "";
-
-  // Credential inputs currently in the DOM (keyed by field key).
-  let llmCredInputs: Map<string, HTMLInputElement> = new Map();
-  let vcsCredInputs: Map<string, HTMLInputElement> = new Map();
 
   // ---------------------------------------------------------------------------
   // Banner helpers
@@ -142,89 +142,63 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
   };
 
   // ---------------------------------------------------------------------------
-  // Credential input section
+  // Auth-status panel helpers
   // ---------------------------------------------------------------------------
 
-  const renderCredInputs = (
-    container: HTMLElement,
-    adapterId: string,
-    currentCreds: Record<string, unknown>,
-    inputsMap: Map<string, HTMLInputElement>,
-    category: "llm" | "vcs",
+  const renderAuthStatusRows = (
+    panel: HTMLElement,
+    statuses: ReadonlyArray<AuthStatus>,
   ): void => {
-    // Clear existing inputs from the map and container
-    inputsMap.clear();
-    const existing = container.querySelector(`[data-lgtm-creds="${category}"]`);
-    existing?.remove();
+    // Clear existing rows (but leave the heading and refresh button).
+    const existing = panel.querySelectorAll("[data-lgtm-auth-row]");
+    for (const row of existing) { row.remove(); }
 
-    const spec = getCredsSpec(adapterId);
-    const section = el(doc, "div", { "data-lgtm-creds": category });
+    for (const status of statuses) {
+      const row = el(doc, "div", {
+        "data-lgtm-auth-row": status.adapterId,
+        "data-lgtm-auth-ok": String(status.ok),
+      });
 
-    if (spec === undefined) {
-      // Unknown adapter
-      const warn = textEl(
-        doc,
-        "p",
-        "Unknown adapter — credentials may be required by the host.",
-        { "data-lgtm-unknown-adapter": "" },
-      );
-      section.appendChild(warn);
-    } else if (spec.fields.length === 0) {
-      if (spec.note !== undefined) {
-        const note = textEl(doc, "p", spec.note, { "data-lgtm-no-creds": "" });
-        section.appendChild(note);
+      const statusIcon = textEl(doc, "span", status.ok ? "✓" : "✗", {
+        "data-lgtm-auth-icon": "",
+      });
+      const idLabel = textEl(doc, "span", status.adapterId, {
+        "data-lgtm-auth-adapter-id": "",
+      });
+      row.appendChild(statusIcon);
+      row.appendChild(idLabel);
+
+      const detailText = status.ok
+        ? (status.detail ?? "")
+        : (status.hint ?? "");
+
+      if (detailText !== "") {
+        const detail = textEl(doc, "span", detailText, {
+          "data-lgtm-auth-detail": "",
+        });
+        row.appendChild(detail);
       }
-    } else {
-      for (const field of spec.fields) {
-        const fieldDiv = el(doc, "div", { "data-lgtm-field": field.key });
 
-        const label = el(doc, "label");
-        label.textContent = field.label;
-        label.setAttribute("for", `lgtm-cred-${category}-${field.key}`);
-
-        const input = el(doc, "input", {
-          type: "password",
-          id: `lgtm-cred-${category}-${field.key}`,
-          autocomplete: "off",
-          spellcheck: "false",
-          placeholder: field.placeholder,
-          "data-lgtm-cred-input": field.key,
-        }) as HTMLInputElement;
-
-        // Pre-fill from stored credentials (value never logged).
-        const stored = currentCreds[field.key];
-        if (typeof stored === "string") {
-          input.value = stored;
-        }
-
-        inputsMap.set(field.key, input);
-        fieldDiv.appendChild(label);
-        fieldDiv.appendChild(input);
-        section.appendChild(fieldDiv);
-      }
+      panel.appendChild(row);
     }
-
-    container.appendChild(section);
   };
 
-  // ---------------------------------------------------------------------------
-  // Collect form credentials
-  // ---------------------------------------------------------------------------
+  const renderAuthStatusError = (
+    panel: HTMLElement,
+    err: CheckAuthError,
+  ): void => {
+    const existing = panel.querySelectorAll("[data-lgtm-auth-row]");
+    for (const row of existing) { row.remove(); }
 
-  const collectCreds = (
-    adapterId: string,
-    inputsMap: Map<string, HTMLInputElement>,
-  ): Record<string, string> => {
-    const result: Record<string, string> = {};
-    const spec = getCredsSpec(adapterId);
-    if (spec === undefined) return result;
-    for (const field of spec.fields) {
-      const input = inputsMap.get(field.key);
-      if (input !== undefined) {
-        result[field.key] = input.value;
-      }
+    const banner = el(doc, "div", { "data-lgtm-auth-error-banner": "" });
+    if (err.kind === "host-not-installed") {
+      banner.textContent =
+        "Native host not installed. Run the host install script and reload.";
+    } else {
+      banner.textContent =
+        err.kind === "host-error" ? err.message : err.message;
     }
-    return result;
+    panel.appendChild(banner);
   };
 
   // ---------------------------------------------------------------------------
@@ -242,7 +216,7 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
     const adapterHeading = textEl(doc, "h2", "Adapter selection");
     adapterSection.appendChild(adapterHeading);
 
-    // LLM select
+    // LLM select — the only selection remaining after ADR-29.
     const llmGroup = el(doc, "div", { "data-lgtm-group": "llm" });
     const llmLabel = textEl(doc, "label", "LLM adapter", { for: "lgtm-llm-select" });
     const llmSelect = el(doc, "select", {
@@ -253,30 +227,22 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
     llmGroup.appendChild(llmSelect);
     adapterSection.appendChild(llmGroup);
 
-    // LLM credential inputs container
-    const llmCredsContainer = el(doc, "div", {
-      "data-lgtm-creds-container": "llm",
-    });
-    adapterSection.appendChild(llmCredsContainer);
-
-    // VCS select
-    const vcsGroup = el(doc, "div", { "data-lgtm-group": "vcs" });
-    const vcsLabel = textEl(doc, "label", "VCS adapter", { for: "lgtm-vcs-select" });
-    const vcsSelect = el(doc, "select", {
-      id: "lgtm-vcs-select",
-      "data-lgtm-select": "vcs",
-    }) as HTMLSelectElement;
-    vcsGroup.appendChild(vcsLabel);
-    vcsGroup.appendChild(vcsSelect);
-    adapterSection.appendChild(vcsGroup);
-
-    // VCS credential inputs container
-    const vcsCredsContainer = el(doc, "div", {
-      "data-lgtm-creds-container": "vcs",
-    });
-    adapterSection.appendChild(vcsCredsContainer);
+    // NOTE: VCS dropdown removed in ADR-29 — VCS is auto-picked from pr.kind.
+    // NOTE: Credential input sections removed in ADR-29 — credentials are host-resolved.
 
     root.appendChild(adapterSection);
+
+    // ---- Auth-status panel -----------------------------------------------
+    const authPanel = el(doc, "section", { "data-lgtm-section": "auth-status" });
+    const authHeading = textEl(doc, "h2", "Authentication status");
+    authPanel.appendChild(authHeading);
+
+    const refreshBtn = textEl(doc, "button", "Refresh", {
+      "data-lgtm-btn": "refresh-auth",
+    }) as HTMLButtonElement;
+    authPanel.appendChild(refreshBtn);
+
+    root.appendChild(authPanel);
 
     // ---- Action buttons ---------------------------------------------------
     const actionsDiv = el(doc, "div", { "data-lgtm-actions": "" });
@@ -293,19 +259,8 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
     actionsDiv.appendChild(testBtn);
     root.appendChild(actionsDiv);
 
-    // ---- Footnote ---------------------------------------------------------
-    const footnote = textEl(
-      doc,
-      "p",
-      "Note: credentials are stored in plaintext in chrome.storage.local (v1 limitation).",
-      { "data-lgtm-footnote": "" },
-    );
-    root.appendChild(footnote);
-
     // ---- Read stored options ----------------------------------------------
     let storedLlm = "";
-    let storedVcs = "";
-    let storedCreds: Record<string, CredentialsBag> = {};
 
     const storedResult = await store.read();
     storedResult.fold(
@@ -317,13 +272,10 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
             true,
           );
         }
-        // absent is normal first-run; io falls through to defaults
+        // absent is normal first-run; falls through to defaults
       },
       (opts) => {
         storedLlm = opts.llmAdapterId ?? "";
-        storedVcs = opts.vcsAdapterId ?? "";
-        // Build typed copy of credentials
-        storedCreds = { ...(opts.credentials ?? {}) };
       },
     );
 
@@ -337,149 +289,65 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
             "error",
           );
         } else {
-          const msg =
-            err.kind === "host-error" ? err.message : err.message;
+          const msg = err.kind === "host-error" ? err.message : err.message;
           showBanner(`Failed to load adapters: ${msg}`, "error");
         }
         llmSelect.disabled = true;
-        vcsSelect.disabled = true;
         saveBtn.disabled = true;
         testBtn.disabled = true;
         return;
       },
       (cat: AdapterCatalog) => {
-        // Populate LLM dropdown
+        // Populate LLM dropdown only (VCS removed in ADR-29).
         for (const id of cat.llm) {
           const opt = textEl(doc, "option", id, { value: id });
           llmSelect.appendChild(opt);
         }
 
-        // Populate VCS dropdown
-        for (const id of cat.vcs) {
-          const opt = textEl(doc, "option", id, { value: id });
-          vcsSelect.appendChild(opt);
-        }
-
-        // Pre-select stored values (or fall back to first option).
+        // Pre-select stored LLM (or fall back to first option).
         if (storedLlm !== "" && cat.llm.includes(storedLlm)) {
           llmSelect.value = storedLlm;
         } else if (cat.llm.length > 0) {
           llmSelect.value = cat.llm[0] ?? "";
         }
 
-        if (storedVcs !== "" && cat.vcs.includes(storedVcs)) {
-          vcsSelect.value = storedVcs;
-        } else if (cat.vcs.length > 0) {
-          vcsSelect.value = cat.vcs[0] ?? "";
-        }
-
         selectedLlm = llmSelect.value;
-        selectedVcs = vcsSelect.value;
-
-        // Render initial credential inputs.
-        llmCredInputs = new Map();
-        vcsCredInputs = new Map();
-        renderCredInputs(
-          llmCredsContainer,
-          selectedLlm,
-          storedCreds[selectedLlm] ?? {},
-          llmCredInputs,
-          "llm",
-        );
-        renderCredInputs(
-          vcsCredsContainer,
-          selectedVcs,
-          storedCreds[selectedVcs] ?? {},
-          vcsCredInputs,
-          "vcs",
-        );
       },
     );
 
-    // ---- Dropdown change handlers ----------------------------------------
+    // ---- LLM dropdown change handler --------------------------------------
     llmSelect.addEventListener("change", () => {
       selectedLlm = llmSelect.value;
-      llmCredInputs = new Map();
-      renderCredInputs(
-        llmCredsContainer,
-        selectedLlm,
-        storedCreds[selectedLlm] ?? {},
-        llmCredInputs,
-        "llm",
-      );
     });
 
-    vcsSelect.addEventListener("change", () => {
-      selectedVcs = vcsSelect.value;
-      vcsCredInputs = new Map();
-      renderCredInputs(
-        vcsCredsContainer,
-        selectedVcs,
-        storedCreds[selectedVcs] ?? {},
-        vcsCredInputs,
-        "vcs",
+    // ---- Auth-status initial load ----------------------------------------
+    const loadAuthStatus = async (): Promise<void> => {
+      const result = await checkAuth();
+      result.fold(
+        (err: CheckAuthError) => {
+          renderAuthStatusError(authPanel, err);
+        },
+        (statuses) => {
+          renderAuthStatusRows(authPanel, statuses);
+        },
       );
+    };
+
+    void loadAuthStatus();
+
+    // ---- Refresh auth-status button handler ------------------------------
+    refreshBtn.addEventListener("click", () => {
+      void loadAuthStatus();
     });
 
     // ---- Save handler ----------------------------------------------------
     saveBtn.addEventListener("click", async () => {
       clearBanner();
 
-      const llmCreds = collectCreds(selectedLlm, llmCredInputs);
-      const vcsCreds = collectCreds(selectedVcs, vcsCredInputs);
-
-      // Validate required fields (non-empty).
-      const llmSpec = getCredsSpec(selectedLlm);
-      if (llmSpec !== undefined) {
-        for (const field of llmSpec.fields) {
-          if (!llmCreds[field.key]) {
-            showBanner(
-              `${field.label} is required for ${selectedLlm}.`,
-              "error",
-            );
-            return;
-          }
-        }
-      }
-      const vcsSpec = getCredsSpec(selectedVcs);
-      if (vcsSpec !== undefined) {
-        for (const field of vcsSpec.fields) {
-          if (!vcsCreds[field.key]) {
-            showBanner(
-              `${field.label} is required for ${selectedVcs}.`,
-              "error",
-            );
-            return;
-          }
-        }
-      }
-
-      // Merge into credentials map — preserve other adapters' stored values.
-      const existingCredsResult = await store.read();
-      const existingCreds: Record<string, CredentialsBag> = {};
-      existingCredsResult.fold(
-        () => { /* use empty on error */ },
-        (opts) => {
-          const c = opts.credentials ?? {};
-          for (const [k, v] of Object.entries(c)) {
-            existingCreds[k] = v;
-          }
-        },
-      );
-
-      if (Object.keys(llmCreds).length > 0) {
-        existingCreds[selectedLlm] = llmCreds;
-      }
-      if (Object.keys(vcsCreds).length > 0) {
-        existingCreds[selectedVcs] = vcsCreds;
-      }
-
       const options: StoredOptions = {
         schemaVersion: SCHEMA_VERSION,
         llmAdapterId: selectedLlm !== "" ? selectedLlm : undefined,
-        vcsAdapterId: selectedVcs !== "" ? selectedVcs : undefined,
-        credentials:
-          Object.keys(existingCreds).length > 0 ? existingCreds : undefined,
+        // ADR-29: vcsAdapterId and credentials are REMOVED from storage.
       };
 
       const writeResult = await store.write(options);
@@ -489,10 +357,6 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
           showBanner(`Failed to save options: ${detail}`, "error");
         },
         () => {
-          // Update local storedCreds so subsequent saves accumulate correctly.
-          for (const [k, v] of Object.entries(existingCreds)) {
-            storedCreds[k] = v;
-          }
           showBanner("Save successful", "success", true);
         },
       );
@@ -502,16 +366,9 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
     testBtn.addEventListener("click", async () => {
       clearBanner();
 
-      // Read current form state (NOT storage — the user may not have saved yet).
-      const llmCreds = collectCreds(selectedLlm, llmCredInputs);
-      const vcsCreds = collectCreds(selectedVcs, vcsCredInputs);
-      // Merge for probe input — credentials must not be logged.
-      const mergedCreds: Record<string, string> = { ...llmCreds, ...vcsCreds };
-
+      // ADR-29: probe called with llmAdapterId only — no credentials.
       const result = await probe({
         llmAdapterId: selectedLlm,
-        vcsAdapterId: selectedVcs,
-        credentials: mergedCreds,
       });
 
       result.fold(
@@ -523,17 +380,8 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
               "Test connection failed: host returned an unexpected response.",
               "error",
             );
-          } else if (err.kind === "host-error") {
-            if (err.reason === "bad-credentials") {
-              showBanner(
-                "Credentials rejected by the adapter. Re-enter and try again.",
-                "error",
-              );
-            } else {
-              // NEVER include credential bytes — show only the host's message.
-              showBanner(`Test connection failed: ${err.message}`, "error");
-            }
           } else {
+            // NEVER include credential bytes — show only the host's message.
             showBanner(`Test connection failed: ${err.message}`, "error");
           }
         },
@@ -551,9 +399,6 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
   const unmount = (): void => {
     root.innerHTML = "";
     selectedLlm = "";
-    selectedVcs = "";
-    llmCredInputs = new Map();
-    vcsCredInputs = new Map();
   };
 
   return { mount, unmount };
