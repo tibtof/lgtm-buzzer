@@ -20,7 +20,10 @@ export default defineConfig({
     name: "LGTM-Buzzer",
     description: "Quiz yourself on the diff before approving PRs.",
     version: rootVersion,
-    permissions: ["storage"],
+    // `nativeMessaging` is required for chrome.runtime.connectNative — without
+    // it Chrome silently throws "Native messaging permission is required" at
+    // SW connect time, which the port client surfaces as "connect failed".
+    permissions: ["storage", "nativeMessaging"],
     host_permissions: [
       "*://github.com/*",
       "*://dev.azure.com/*",
