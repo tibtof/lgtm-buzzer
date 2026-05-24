@@ -58,3 +58,9 @@ export {
   type QuizModal,
   type QuizModalDeps,
 } from "./modal.js";
+
+export {
+  createManualTriggerButton,
+  type ManualTriggerButton,
+  type ManualTriggerButtonDeps,
+} from "./manual-trigger-button.js";

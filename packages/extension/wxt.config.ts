@@ -23,11 +23,18 @@ export default defineConfig({
     // `nativeMessaging` is required for chrome.runtime.connectNative — without
     // it Chrome silently throws "Native messaging permission is required" at
     // SW connect time, which the port client surfaces as "connect failed".
-    permissions: ["storage", "nativeMessaging"],
+    permissions: ["storage", "nativeMessaging", "activeTab"],
     host_permissions: [
       "*://github.com/*",
       "*://dev.azure.com/*",
       "*://*.visualstudio.com/*",
     ],
+    // Toolbar icon popup — shows "Quiz me on this PR" when the active tab is
+    // a GitHub or ADO PR. `activeTab` permission is enough to read the active
+    // tab's URL when the user clicks the toolbar icon.
+    action: {
+      default_title: "LGTM-Buzzer",
+      default_popup: "popup.html",
+    },
   },
 });

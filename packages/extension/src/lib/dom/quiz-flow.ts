@@ -101,18 +101,35 @@ export type QuizFlowDeps = {
  *
  * `start()` attaches all listeners and begins intercepting Approve submits.
  * `stop()` tears down all listeners and resets state.
+ * `triggerManual()` opens a quiz on the current PR WITHOUT a preceding
+ * Approve-click intercept. Used by the toolbar popup and the page-injected
+ * "Quiz me" button. On pass, the modal closes with a success message — there
+ * is no replay (you did not click Approve, so there is nothing to replay).
  */
 export type QuizFlowController = {
   /** Attaches all DOM and frame listeners. Safe to call only once. */
   readonly start: () => void;
   /** Removes all listeners and resets state. */
   readonly stop: () => void;
+  /**
+   * Starts a quiz for the current page's PR without intercepting an Approve.
+   *
+   * No-op when the current URL is not a PR page (returns `{ ok: false }`).
+   * On `{ ok: true }`, the modal will open in `generating` state shortly.
+   */
+  readonly triggerManual: () => { readonly ok: boolean };
 };
 
-/** Represents a pending Approve action waiting for a quiz result. */
+/**
+ * Represents a pending quiz action waiting for a quiz result.
+ *
+ * `blocked` is undefined for manual triggers (toolbar popup, injected button).
+ * In that case the pass path skips the replay step — the user did not click
+ * Approve, so there is nothing to replay.
+ */
 type PendingApprove = {
   readonly requestId: string;
-  readonly blocked: InterceptedApproveEvent;
+  readonly blocked?: InterceptedApproveEvent;
   readonly pr: PRIdentifier;
 };
 
@@ -233,6 +250,11 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
    *   flag lets the re-click pass the capture-phase listener.
    */
   const replayApprove = (requestId: string, p: PendingApprove): void => {
+    if (p.blocked === undefined) {
+      // Manual-trigger path — there is no Approve click to replay. Just close
+      // the modal via the pass result already emitted.
+      return;
+    }
     approveBypass = true;
     try {
       if (p.blocked.kind === "github") {
@@ -469,15 +491,8 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     const freshPending: PendingApprove = {
       requestId: freshRequestId,
       // If we had an old blocked event, carry it forward so pass → replay works.
-      blocked: blocked ?? {
-        // Minimal stub — kind = github so replayApprove has something to call.
-        // The actual replay only fires on quiz-passed; if the blocked event is
-        // gone we cannot replay, but we still want the quiz to proceed.
-        kind: "github",
-        pr,
-        form: doc.createElement("form"),
-        submitter: null,
-      },
+      // Otherwise leave undefined — replay is skipped (same as manual trigger).
+      ...(blocked !== undefined ? { blocked } : {}),
       pr,
     };
     pending.set(freshRequestId, freshPending);
@@ -569,6 +584,35 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
         dispose();
       }
       disposers.length = 0;
+    },
+
+    triggerManual: (): { readonly ok: boolean } => {
+      // Refresh from the current URL — currentPR may be stale right after a
+      // navigation if the popup fires before onDidNavigate.
+      const result = detectPRPage(doc.defaultView?.location.href ?? "");
+      if (!result.ok) {
+        logger?.warn("[lgtm-buzzer:cs] triggerManual called outside a PR page", {});
+        return { ok: false };
+      }
+      currentPR = result.pr;
+
+      const requestId = newRequestId();
+      const correlationId = newCorrelationId();
+      const p: PendingApprove = {
+        requestId,
+        // No `blocked` — manual trigger, replay is skipped on pass.
+        pr: result.pr,
+      };
+      pending.set(requestId, p);
+
+      emitDOMEvent(doc, DOM_EVENTS.quizRequest, {
+        requestId,
+        correlationId,
+        pr: result.pr,
+      });
+
+      void sendQuizRequest(requestId, p, correlationId);
+      return { ok: true };
     },
   };
 };
