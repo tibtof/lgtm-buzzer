@@ -9471,3 +9471,1031 @@ the Chrome extension zip (loadable as unpacked) and the host tarball
       no per-workspace test config change needed.
 
 ---
+
+## ADR-29 (2026-05-24): Host-resolved credentials + check-auth wire frame (supersedes ADR-22 §credentials)
+**Date**: 2026-05-24
+**Issue**: #112
+**Status**: Accepted
+
+### Context
+
+ADR-22 (#49) made `quiz-request` carry an opaque `credentials` bag, validated
+host-side by per-adapter `.strict()` zod schemas. ADR-23 (#50) shipped the
+options page that persists per-adapter credentials in `chrome.storage.local`
+and the SW that inlines them on every quiz-request. Real-Chrome testing
+turned up two problems that together make the M3 surface unusable end-to-end:
+
+1. **Strict-bag mismatch (release-blocking bug).** The SW projection in
+   `packages/extension/src/lib/options/storage-reader.ts` (~L52-L63) merges
+   the chosen LLM adapter's credential bag with the chosen VCS adapter's
+   credential bag into one flat `CredentialsBag`. The host's
+   `packages/host/src/registry.ts` then calls
+   `LLMCredsSchema.strict().safeParse(bag)` AND
+   `VCSCredsSchema.strict().safeParse(bag)` with the SAME merged bag. Any
+   field the other adapter contributed is "unexpected" to this adapter, so
+   every cross-category pair returns
+   `bad-credentials: invalid or unexpected fields: <root>`. The
+   `claude-cli + github` happy path requires a `pat` to satisfy `github` but
+   that same `pat` makes `claude-cli`'s `z.object({}).strict()` fail.
+   Effectively no adapter pair works end-to-end today.
+
+2. **Wrong abstraction (UX + security).** The host runs locally under the
+   user's account through native messaging. Engineers using this tool
+   already have `gh auth login`, `az login`, and/or `ANTHROPIC_API_KEY`
+   set up in their shell environment. Duplicating those secrets into
+   `chrome.storage.local` as plaintext is friction (re-enter every PAT,
+   manage rotation manually) PLUS a documented v1 security caveat
+   (ADR-23 §Credential storage posture). The host is the right layer to
+   answer "what credentials does this adapter need" because the host
+   already has access to the user's env and CLIs. The extension's job is
+   to tell the user whether resolution is currently working — not to be a
+   second secrets store.
+
+The user has reviewed and signed off on the redesign. Two M3 follow-ups
+(SSO-protected tokens, multi-account selection, keychain integration) are
+explicitly deferred and listed below.
+
+Five forces shape the redesign:
+
+- **Diff-only invariant preserved.** Credentials are not diff-derived;
+  they were never on the prompt path. Removing them from the wire
+  reduces the credential blast radius without touching the gate.
+- **Host owns identity, extension owns preferences.** The host already
+  has the privileged context (env, gh/az CLIs, future keychain). The
+  extension stays the source of truth for "which adapter to use", which
+  remains a user preference. This split keeps the wire small and the
+  permission surface narrow.
+- **No caching of resolution results.** A user who just ran
+  `gh auth login` must see a fresh `ok: true` on the next refresh-click
+  without restarting the host. The resolver runs on every
+  `check-auth-request` and every `quiz-request`.
+- **Subprocess invocations are bounded.** `gh auth token` and
+  `az account get-access-token` are external CLIs; they go through
+  `spawnIO` with a 5-second timeout. Output is treated as opaque token
+  bytes — never logged, never echoed.
+- **Backwards compatibility is cheap to skip.** Project has no real
+  deployment; M3 has not shipped. ADR-22's `credentials` field is
+  removed from `QuizRequestPayloadSchema` outright, not deprecated.
+  Same for `vcsAdapterId` in stored options (auto-picked from `pr.kind`).
+
+### Decision
+
+A new **host-side `CredentialResolver`** owns per-adapter credential
+resolution. The wire-format `credentials` field on `quiz-request` is
+removed. A new `check-auth-request` / `check-auth-response` frame pair
+lets the options page surface live auth status per adapter. The
+extension drops the credential map AND the VCS adapter selector; the SW
+infers `vcsAdapterId` from the `pr.kind` on every quiz-request.
+
+#### Affected workspaces
+
+- `packages/protocol/` — remove `credentials` from
+  `QuizRequestPayloadSchema`; add `check-auth-request` /
+  `check-auth-response` frames; keep `CredentialsBagSchema` exported but
+  unused on the wire (kept for type-safety in the resolver's internal
+  parse results). Two new `FrameKind` variants join `FrameSchema`.
+- `packages/host/` — new `CredentialResolver` port (in `host`, not
+  `core` — see below); new resolver implementation per adapter; updated
+  `registry.ts` whose factories no longer take wire creds; updated
+  `dispatcher.ts` that handles `check-auth-request` and stops threading
+  `credentials` through `quiz-request`.
+- `packages/extension/` — remove credential inputs from the options page;
+  add an auth-status panel that polls `check-auth-request` on load and
+  on refresh; drop the VCS dropdown; storage shape shrinks to
+  `{ schemaVersion, llmAdapterId }`; SW infers `vcsAdapterId` from
+  `pr.kind` and no longer reads credentials from storage.
+- `packages/core/` — **no changes.** The resolver is a host-only
+  concern. `LLMProvider` / `VCSProvider` ports stay as-is — they have
+  always taken their credentials inside their `config`, not at call
+  time.
+- `packages/adapters/*` — **no changes.** Adapter factories already
+  accept `{ config: { token | apiKey, ... } }` per provider; the
+  registry passes the resolved value in instead of the wire bag.
+
+**Dependency arrows reaffirmed**:
+
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+```
+
+The `CredentialResolver` lives in `host`, not in `core`, because it is
+inherently a host-only concern (it reads `process.env`, spawns external
+CLIs, may later integrate with OS keychain). Placing it in `core` would
+break the no-Node-no-IO purity rule. Adapters do not depend on the
+resolver — they continue to take their resolved secret as part of their
+`config`, exactly as ADR-15/ADR-20 specified.
+
+#### Why the resolver is not a `core` port
+
+ADR-22 routed credentials as plain data through the registry; the
+adapter factories consumed them at construction time. The resolver
+keeps that shape: the registry asks the resolver for "the resolved
+secret for adapter X", then constructs the adapter using
+`{ config: { token: <resolved> } }`. The resolver itself never crosses
+the host boundary. No `core` change is justified because:
+
+1. The resolver is intrinsically effectful (env reads, subprocess
+   spawning, future keychain access) — exactly what `core` forbids.
+2. Adapters do not need to know how their secret was obtained; the
+   construction-time shape from ADR-15 / ADR-20 / ADR-21 is unchanged.
+3. The contract the registry needs ("give me the secret for adapter X
+   or tell me why you cannot") is a host-internal contract, not a
+   domain port.
+
+If a future story moves credential resolution into the extension (e.g.,
+WebAuthn-mediated unlock), that ADR introduces a `CredentialSource`
+port in `core`. Not today.
+
+#### Wire-shape choices (binding)
+
+| Choice | Decision |
+|---|---|
+| `quiz-request.payload.credentials` | **Removed**. Schema rejects unknown fields where it can; otherwise the host silently drops the value if a stale extension sends it. |
+| `quiz-request.payload.vcsAdapterId` | **Kept optional**. The SW now infers it from `pr.kind`; the host's existing default (`"github"`) still applies as a belt-and-suspenders. |
+| `quiz-request.payload.llmAdapterId` | **Kept optional**. The options page sets it; absent → host default `"claude-cli"`. |
+| New `check-auth-request` frame | `{ kind: "check-auth-request", payload: {} }` — empty payload, strict zod. |
+| New `check-auth-response` frame | `{ kind: "check-auth-response", payload: { statuses: AuthStatus[] } }`. |
+| `AuthStatus` shape | `{ adapterId: string; ok: boolean; detail?: string; hint?: string }`. Strings only. NO secret bytes, NO field paths into env. |
+| Resolution timing | Fresh on every `check-auth-request` AND every `quiz-request`. No caching anywhere. |
+| Envelope version | **Stays `v: 1`**. Removing one optional field + adding two additive frame kinds is non-breaking on a pre-release codebase. |
+| Stored options shape | `{ schemaVersion: 2, llmAdapterId?: string }`. `vcsAdapterId` and `credentials` dropped. Reader strips unknown fields silently via zod's default behaviour. |
+| Storage envelope version | **Bumped to `2`** (different `STORAGE_KEY`: `"lgtm_buzzer.options.v2"`). Migration is "drop the v1 key on first read; v1 stored credentials are now meaningless and not worth migrating". |
+
+#### Per-adapter resolver chain (binding)
+
+| Adapter | Resolution order | Final-miss error |
+|---|---|---|
+| `github` (VCS) | 1. `env.GITHUB_TOKEN` → 2. `env.GH_TOKEN` → 3. `spawnIO("gh", ["auth", "token"], …)` exit-0 stdout | `MissingCredential { adapterId: "github", attempted: ["GITHUB_TOKEN env", "GH_TOKEN env", "gh auth token CLI"], hint: "Run \`gh auth login\` or export GITHUB_TOKEN" }` |
+| `ado` (VCS) | 1. `env.AZURE_DEVOPS_EXT_PAT` → 2. `spawnIO("az", ["account", "get-access-token", "--resource", "499b84ac-1321-427f-aa17-267ca6975798", "--query", "accessToken", "-o", "tsv"], …)` exit-0 stdout (resource GUID is Azure DevOps' well-known scope) | `MissingCredential { adapterId: "ado", attempted: ["AZURE_DEVOPS_EXT_PAT env", "az CLI access token"], hint: "Run \`az login\` or export AZURE_DEVOPS_EXT_PAT" }` |
+| `claude-api` (LLM) | 1. `env.ANTHROPIC_API_KEY` | `MissingCredential { adapterId: "claude-api", attempted: ["ANTHROPIC_API_KEY env"], hint: "Export ANTHROPIC_API_KEY" }` |
+| `claude-cli`, `codex-cli`, `copilot-cli` (LLM) | No-op — these CLIs manage their own auth via the user's prior `claude auth` / `codex login` / `gh auth login`. The resolver returns `Right<undefined>` (no secret to pass). | n/a — `ok: true` with `detail: "uses CLI's own login"`. |
+
+**Trimming policy**: subprocess stdout is `.trim()`-ed and used as the
+opaque secret. If trimmed length is zero, treat as a miss and continue
+the chain. Empty env vars are also treated as misses.
+
+**Subprocess timeout**: 5 seconds wall-clock per `spawnIO` invocation.
+Implemented as `spawnIO` cancellation (existing `Schedule` /
+`IO.cancellable` machinery from ADR-9). Timeout maps to a miss + the
+next chain step.
+
+**Subprocess exit codes**: any non-zero exit is treated as a miss and
+the chain continues. `gh auth token` exits 1 when logged out; `az`
+exits non-zero on error. The chain's error is built from the final
+miss, not from the underlying `SpawnError`.
+
+#### Types
+
+##### `packages/host/src/credentials/resolver.ts` (new)
+
+```ts
+import type { IO } from "monadyssey";
+
+/**
+ * Discriminated error for failed credential resolution.
+ *
+ * `attempted` lists the human-readable names of every chain step tried,
+ * in order. `hint` is a single remediation string suitable for surfacing
+ * to the user. Neither field carries env-var VALUES or token bytes —
+ * only well-known step labels.
+ */
+export type ResolverError = {
+  readonly kind: "missing-credential";
+  readonly adapterId: string;
+  readonly attempted: ReadonlyArray<string>;
+  readonly hint: string;
+};
+
+/**
+ * Outcome of a successful resolution.
+ *
+ * `secret` is the resolved token / API key, or `undefined` for adapters
+ * whose auth lives outside the resolver (CLI-managed login).
+ * `detail` is a short human-readable step label ("via GITHUB_TOKEN env",
+ * "via gh CLI", "uses CLI's own login"). NEVER includes the secret bytes.
+ */
+export type ResolvedCredential = {
+  readonly secret: string | undefined;
+  readonly detail: string;
+};
+
+/**
+ * Port: resolves a credential for an adapter from the host's environment.
+ *
+ * Implementation lives in `packages/host/src/credentials/`. The resolver
+ * is constructed once at host startup and injected into the registry.
+ *
+ * Resolution is IO-bearing (env reads are pure but subprocess spawning
+ * is not). No caching across calls — every call re-runs the chain.
+ */
+export type CredentialResolver = {
+  /**
+   * Resolve the credential for `adapterId`. Returns `Right<{ secret, detail }>`
+   * on a hit, `Left<ResolverError>` on a miss. NEVER throws — every failure
+   * lands in the IO error channel.
+   */
+  readonly resolve: (adapterId: string) => IO<ResolverError, ResolvedCredential>;
+};
+```
+
+##### `packages/host/src/credentials/types.ts` (new)
+
+```ts
+/** Dependencies needed by the default resolver chain. */
+export type ResolverDeps = {
+  /** Env source — defaults to `process.env` in production; tests pass a fake. */
+  readonly env: Readonly<Record<string, string | undefined>>;
+  /** Subprocess primitive (already wraps cancellation + 5s grace). */
+  readonly spawnIO: typeof import("@lgtm-buzzer/adapter-shared").spawnIO;
+  /** Per-subprocess timeout in ms. Default 5000. */
+  readonly subprocessTimeoutMs?: number;
+};
+```
+
+##### `packages/host/src/registry.ts` (modified)
+
+```ts
+// Adapter factories no longer take CredentialsBag.
+// They now invoke the resolver and pass the resolved secret to the
+// per-adapter factory function.
+
+export type RegistryError =
+  | { readonly kind: "unsupported-llm-adapter"; readonly id: string }
+  | { readonly kind: "unsupported-vcs-adapter"; readonly id: string }
+  | { readonly kind: "missing-credentials";     readonly adapterId: string;
+                                                readonly attempted: ReadonlyArray<string>;
+                                                readonly hint: string; };
+
+// "bad-credentials" is REMOVED — it described "wire payload failed
+// per-adapter zod". With no wire payload, there is no validation to fail.
+
+export type LLMAdapterFactory = () => IO<RegistryError, LLMProvider>;
+export type VCSAdapterFactory = () => IO<RegistryError, VCSProvider>;
+
+export type AdapterRegistry = {
+  readonly listLlm: () => readonly string[];
+  readonly listVcs: () => readonly string[];
+  readonly buildLlm: (id: string) => IO<RegistryError, LLMProvider>;
+  readonly buildVcs: (id: string) => IO<RegistryError, VCSProvider>;
+};
+
+export type AdapterRegistryDeps = {
+  readonly spawnIO: typeof SpawnIOFn;
+  readonly resolver: CredentialResolver;
+};
+
+export const createDefaultAdapterRegistry: (deps: AdapterRegistryDeps) => AdapterRegistry;
+```
+
+Notes:
+
+- `buildLlm` / `buildVcs` now return `IO`, not `Either`, because
+  resolution is IO-bearing (env is fine but subprocess is not).
+- `validateCreds` and the per-adapter `.strict()` schemas are
+  **deleted**. The wire bag no longer exists; the resolver returns a
+  single typed secret per adapter.
+- The dispatcher must `.foldM` the registry result into the existing
+  per-request fiber. The fiber-cancellation behaviour from ADR-16 is
+  unchanged.
+
+##### `packages/protocol/src/messages/quiz-request.ts` (modified)
+
+```ts
+export const QuizRequestPayloadSchema = z.object({
+  pr: PRIdentifierSchema,
+  questionCount: z.number().int().min(1).max(10),
+  llmAdapterId: z.string().min(1).optional(),
+  vcsAdapterId: z.string().min(1).optional(),
+  // REMOVED: credentials field
+});
+```
+
+The schema does NOT add `.strict()` here — keeping it `.passthrough()`
+default means a stale extension that still sends `credentials` does not
+crash the host's framing reader. The host's quiz-request handler simply
+never reads `payload.credentials`. The reviewer must assert this is the
+case via a unit test (see Test strategy).
+
+##### `packages/protocol/src/messages/check-auth-request.ts` (new)
+
+```ts
+import { z } from "zod";
+import { EnvelopeBase } from "../base.js";
+
+export const CheckAuthRequestPayloadSchema = z.object({}).strict();
+export type CheckAuthRequestPayload = z.infer<typeof CheckAuthRequestPayloadSchema>;
+
+export const CheckAuthRequestFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("check-auth-request"),
+  payload: CheckAuthRequestPayloadSchema,
+});
+export type CheckAuthRequestFrame = z.infer<typeof CheckAuthRequestFrameSchema>;
+```
+
+##### `packages/protocol/src/messages/check-auth-response.ts` (new)
+
+```ts
+import { z } from "zod";
+import { EnvelopeBase } from "../base.js";
+
+/**
+ * Per-adapter authentication status.
+ *
+ * SECURITY (binding): `detail` and `hint` MUST contain only human-readable
+ * step labels and remediation copy — never secret bytes, never env-var
+ * VALUES. Acceptable: "via GITHUB_TOKEN env", "Run `gh auth login`".
+ * Forbidden: "GITHUB_TOKEN=ghp_xxx", any prefix/suffix of a token.
+ */
+export const AuthStatusSchema = z.object({
+  adapterId: z.string().min(1),
+  ok: z.boolean(),
+  detail: z.string().min(1).optional(),
+  hint: z.string().min(1).optional(),
+});
+export type AuthStatus = z.infer<typeof AuthStatusSchema>;
+
+export const CheckAuthResponsePayloadSchema = z.object({
+  statuses: z.array(AuthStatusSchema),
+});
+export type CheckAuthResponsePayload = z.infer<typeof CheckAuthResponsePayloadSchema>;
+
+export const CheckAuthResponseFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("check-auth-response"),
+  payload: CheckAuthResponsePayloadSchema,
+});
+export type CheckAuthResponseFrame = z.infer<typeof CheckAuthResponseFrameSchema>;
+```
+
+##### `packages/extension/src/lib/options/schema.ts` (modified)
+
+```ts
+export const STORAGE_KEY = "lgtm_buzzer.options.v2" as const;
+export const SCHEMA_VERSION = 2 as const;
+
+export const StoredOptionsSchema = z.object({
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  llmAdapterId: z.string().min(1).optional(),
+  // REMOVED: vcsAdapterId, credentials
+});
+export type StoredOptions = z.infer<typeof StoredOptionsSchema>;
+
+export const DEFAULT_OPTIONS: StoredOptions = {
+  schemaVersion: SCHEMA_VERSION,
+};
+```
+
+##### `packages/extension/src/lib/options/storage-reader.ts` (modified)
+
+```ts
+export type SwOptionsProjection = {
+  readonly llmAdapterId: string | undefined;
+  // REMOVED: vcsAdapterId (auto-picked from pr.kind), credentials.
+};
+
+export const readSwOptions = (deps: {
+  readonly store: OptionsStore;
+}): (() => Promise<SwOptionsProjection>);
+```
+
+##### `packages/extension/src/lib/options/auth-status.ts` (new)
+
+```ts
+import type { Either } from "monadyssey";
+import type { Frame, AuthStatus } from "@lgtm-buzzer/protocol";
+
+export type CheckAuthError =
+  | { readonly kind: "host-not-installed" }
+  | { readonly kind: "host-error"; readonly reason: string; readonly message: string }
+  | { readonly kind: "internal";   readonly message: string };
+
+export type CheckAuth = () => Promise<Either<CheckAuthError, ReadonlyArray<AuthStatus>>>;
+
+export const createCheckAuth = (deps: {
+  readonly sendFrame: (frame: Frame) => Promise<Frame>;
+  readonly newCorrelationId: () => string;
+}): CheckAuth;
+```
+
+#### Functions and methods
+
+##### `packages/host/src/credentials/resolver.ts`
+
+```ts
+/**
+ * Builds the default per-adapter resolver. Chains env → CLI fallback as
+ * documented in §Per-adapter resolver chain.
+ *
+ * @param deps - env source + spawnIO + optional timeout override.
+ * @returns A CredentialResolver covering all six adapter IDs.
+ */
+export const createDefaultCredentialResolver = (deps: ResolverDeps): CredentialResolver;
+```
+
+Internal helpers (not exported):
+
+```ts
+/** Try env vars in order; return the first non-empty trimmed value. */
+const tryEnv = (
+  env: Readonly<Record<string, string | undefined>>,
+  keys: ReadonlyArray<string>,
+): { hit: string; via: string } | undefined;
+
+/** Run `gh auth token` (or `az`...) via spawnIO with bounded timeout. */
+const tryCli = (
+  spawnIO: typeof SpawnIOFn,
+  bin: string,
+  args: ReadonlyArray<string>,
+  timeoutMs: number,
+): IO<undefined, { hit: string; via: string }>;
+// Returns Right<{hit,via}> on hit, Err<undefined> on miss (caller treats
+// undefined as "try next chain step"). Crucially, we DO NOT surface
+// SpawnError detail (binary not found, exit non-zero, timeout) to the
+// user beyond "via X failed" — keeps the resolver opaque.
+```
+
+##### `packages/host/src/dispatcher.ts` (modified)
+
+The `quiz-request` handler stops threading `credentials`:
+
+```ts
+const handleQuizRequest = (
+  pr: PRIdentifier,
+  questionCount: number,
+  llmAdapterId: string,
+  vcsAdapterId: string,
+  correlationId: string | null,
+  deps: DispatcherDeps,
+): IO<never, void>;
+// (credentials parameter REMOVED)
+```
+
+The new check-auth handler:
+
+```ts
+/**
+ * Handle a `check-auth-request` frame.
+ *
+ * Iterates every adapter in the registry, calls `resolver.resolve` on each,
+ * collects an AuthStatus per adapter, writes a check-auth-response frame.
+ *
+ * Resolution failures are NOT propagated to the IO error channel — they
+ * are individual `ok: false` rows in the response. The outer IO is
+ * `IO<never, void>`.
+ */
+const handleCheckAuthRequest = (
+  correlationId: string | null,
+  deps: DispatcherDeps,
+): IO<never, void>;
+```
+
+The registry-error mapping in the dispatcher loses the `bad-credentials`
+arm and the `missing-credentials` arm grows to surface the `attempted`
+and `hint` fields:
+
+```ts
+case "missing-credentials":
+  return buildErrorFrame(
+    "missing-credentials",
+    `Adapter ${err.adapterId} could not resolve credentials`,
+    correlationId,
+    { adapterId: err.adapterId, attempted: err.attempted, hint: err.hint },
+  );
+// (bad-credentials case DELETED)
+```
+
+The wire `ErrorReason` enum loses `"bad-credentials"`. This is the only
+wire-format removal in this ADR; documented in §Backward compatibility.
+
+##### `packages/extension/src/lib/router.ts` (modified)
+
+```ts
+export type RouterDeps = {
+  readonly portClient: PortClient;
+  readonly readSwOptions: () => Promise<SwOptionsProjection>;
+  readonly openOptionsPage?: () => void;
+  readonly logger?: RouterLogger;
+};
+```
+
+In the merge for `quiz-request`:
+
+```ts
+// Auto-pick VCS adapter from the PR kind (ADR-29).
+const pr = (originalPayload.pr as { kind?: string } | undefined);
+const vcsFromPrKind: "github" | "ado" | undefined =
+  pr?.kind === "github" ? "github" : pr?.kind === "ado" ? "ado" : undefined;
+
+const mergedPayload = {
+  ...originalPayload,
+  llmAdapterId: projection.llmAdapterId ?? originalPayload.llmAdapterId,
+  vcsAdapterId: vcsFromPrKind ?? originalPayload.vcsAdapterId,
+  // credentials removed entirely
+};
+// If the originalPayload contained a stale `credentials` field, drop it.
+delete (mergedPayload as Record<string, unknown>).credentials;
+```
+
+##### `packages/extension/src/lib/options/auth-status.ts`
+
+```ts
+export const createCheckAuth = (deps: {
+  readonly sendFrame: (frame: Frame) => Promise<Frame>;
+  readonly newCorrelationId: () => string;
+}): CheckAuth;
+```
+
+#### File layout
+
+**New (protocol)**:
+
+- `packages/protocol/src/messages/check-auth-request.ts` + `.test.ts`
+- `packages/protocol/src/messages/check-auth-response.ts` + `.test.ts`
+
+**New (host)**:
+
+- `packages/host/src/credentials/resolver.ts` + `.test.ts`
+- `packages/host/src/credentials/types.ts`
+- `packages/host/src/credentials/index.ts` — barrel.
+
+**New (extension)**:
+
+- `packages/extension/src/lib/options/auth-status.ts` + `.test.ts`
+
+**Modified (protocol)**:
+
+- `packages/protocol/src/messages/quiz-request.ts` — remove
+  `credentials` field. Update tsdoc.
+- `packages/protocol/src/messages/quiz-request.test.ts` — drop the
+  `credentials`-shaped cases; add one case that asserts a stale request
+  with a `credentials` field still parses (passthrough is fine; host
+  ignores it).
+- `packages/protocol/src/messages/credentials.ts` — keep the file (still
+  used internally by adapter factories' typings); tsdoc updated to say
+  "no longer carried on the wire as of ADR-29 — kept for adapter-side
+  types".
+- `packages/protocol/src/messages/error.ts` — remove
+  `"bad-credentials"` from `ErrorReasonSchema`. Update tsdoc.
+- `packages/protocol/src/messages/error.test.ts` — drop the
+  `bad-credentials` round-trip case.
+- `packages/protocol/src/envelope.ts` — register the two new frame
+  schemas in `FrameSchema`.
+- `packages/protocol/src/envelope.test.ts` — extend coverage for the
+  new kinds.
+- `packages/protocol/src/index.ts` — export the new frames + AuthStatus.
+
+**Modified (host)**:
+
+- `packages/host/src/registry.ts` — factories take no creds; consult
+  `resolver`; return `IO<RegistryError, …>`. Remove per-adapter
+  zod schemas and `validateCreds`. Remove `"bad-credentials"` variant
+  from `RegistryError`.
+- `packages/host/src/registry.test.ts` — rewrite. New cases listed in
+  §Test strategy.
+- `packages/host/src/dispatcher.ts` — drop the `credentials` parameter
+  from `handleQuizRequest`; add `handleCheckAuthRequest`; remove
+  `bad-credentials` arm from `buildRegistryErrorFrame`. Wire the
+  registry's new `IO`-returning `buildLlm` / `buildVcs` into the
+  per-request fiber.
+- `packages/host/src/dispatcher.test.ts` — drop the `bad-credentials`
+  cases; add cases for `check-auth-request`; add cases for resolver
+  miss surfaced as `missing-credentials`.
+- `packages/host/src/cli.ts` — construct
+  `createDefaultCredentialResolver({ env: process.env, spawnIO })`,
+  pass to `createDefaultAdapterRegistry({ spawnIO, resolver })`. Remove
+  `LGTM_BUZZER_*` cred env vars from the docblock (already removed in
+  ADR-22; this just re-confirms).
+- `packages/host/src/logger.ts` — confirm `REDACT_PATHS` covers
+  `*.token`, `*.apiKey`, `*.pat`, `*.secret` (all already present from
+  ADR-22). No change needed beyond verifying coverage via the test
+  added in §Test strategy.
+- `packages/host/src/logger.test.ts` — add canary asserting that a log
+  entry with `{ resolved: { secret: "SECRET_xxx", detail: "via …" } }`
+  redacts `secret` and leaves `detail` visible. (`secret` is added to
+  `REDACT_PATHS` in this ADR.)
+
+**Modified (extension)**:
+
+- `packages/extension/src/lib/options/schema.ts` — bump
+  `STORAGE_KEY` to `v2`, bump `SCHEMA_VERSION` to `2`, drop
+  `vcsAdapterId` and `credentials` from `StoredOptionsSchema`.
+- `packages/extension/src/lib/options/schema.test.ts` — update cases
+  for new shape; add a case that the new schema rejects a v1-shaped
+  payload (`schemaVersion: 1`) as corrupt (which it is — wrong
+  version literal).
+- `packages/extension/src/lib/options/storage.ts` — no change beyond
+  re-export of the new `STORAGE_KEY`; the typed key already flows from
+  the schema.
+- `packages/extension/src/lib/options/storage.test.ts` — update fixtures
+  to `v2`; add a case that an existing v1 key in storage is treated as
+  `absent` (key mismatch), not `corrupt`.
+- `packages/extension/src/lib/options/storage-reader.ts` — drop the
+  credential merge logic; project only `llmAdapterId`.
+- `packages/extension/src/lib/options/storage-reader.test.ts` — rewrite
+  cases for the slim projection.
+- `packages/extension/src/lib/options/dom.ts` — drop the VCS dropdown
+  and the LLM credential inputs. Add the auth-status panel
+  (one row per adapter, refresh button). Keep "Test connection".
+- `packages/extension/src/lib/options/dom.test.ts` — rewrite per
+  §Test strategy.
+- `packages/extension/src/lib/options/probe.ts` — drop `vcsAdapterId`
+  and `credentials` from the probe input. Probe still sends `ping`.
+- `packages/extension/src/lib/options/probe.test.ts` — drop the
+  credential-shaped cases.
+- `packages/extension/src/lib/options/adapter-creds.ts` — **DELETE**
+  (no more credential inputs in the options page).
+- `packages/extension/src/lib/options/adapter-creds.test.ts` — DELETE.
+- `packages/extension/src/lib/options/index.ts` — drop barrel re-exports
+  for the deleted file; add re-exports for `auth-status.ts`.
+- `packages/extension/src/lib/router.ts` — drop credential merge; add
+  the `pr.kind`-based `vcsAdapterId` inference; delete any stale
+  `credentials` field defensively.
+- `packages/extension/src/lib/router.test.ts` — drop the credential
+  cases; add cases for VCS auto-pick by `pr.kind`.
+- `packages/extension/entrypoints/options/main.ts` — wire
+  `createCheckAuth`; drop credential plumbing.
+- `packages/extension/entrypoints/background.ts` — no change to the
+  router dep set beyond the existing `readSwOptions` (the projection
+  type narrowed, but the function shape is the same).
+- `packages/extension/README.md` — update the "Options page" section:
+  remove the plaintext-storage caveat, add the auth-resolution
+  description, add a "Known gotchas" subsection for SSO-protected
+  tokens (link to the deferred issue).
+
+**Unchanged**:
+
+- `packages/core/**`
+- `packages/adapters/**` — adapter `config` shapes remain
+  `{ token: string }` / `{ apiKey: string }`. The registry constructs
+  them from resolver output, not wire bag.
+
+#### Sequence
+
+##### A. Options page first load + refresh
+
+1. User opens the options page. `main.ts` constructs the SW bridge,
+   `listAdapters`, `probe`, AND `checkAuth`.
+2. `view.mount()` runs `listAdapters()` (unchanged) and `checkAuth()`
+   in parallel.
+3. SW receives `check-auth-request`; forwards via the existing port
+   client.
+4. Host dispatcher routes to `handleCheckAuthRequest`. The handler:
+   - Calls `registry.listLlm()` ∪ `registry.listVcs()`.
+   - For each adapter ID, calls `resolver.resolve(id).unsafeRun()` (
+     forked into parallel fibers — see Error cases for the joining
+     rule).
+   - Builds an `AuthStatus[]` row per adapter.
+   - Writes a `check-auth-response` frame.
+5. SW relays the response back to the options page.
+6. The options page renders one row per adapter: ✓ + `detail` on
+   `ok: true`; ✗ + `hint` on `ok: false`. Refresh button re-runs the
+   round-trip with no debounce (it is a deliberate user action).
+
+##### B. Quiz request (host-resolved creds)
+
+1. CS detects Approve click → builds `quiz-request` with `pr` +
+   `questionCount` (no adapter fields).
+2. CS sends to SW. SW infers `vcsAdapterId` from `pr.kind` and reads
+   `llmAdapterId` from storage projection. NO credentials read.
+3. SW forwards `quiz-request` to host.
+4. Host dispatcher calls `registry.buildVcs(vcsAdapterId)` →
+   `IO<RegistryError, VCSProvider>`. The registry internally calls
+   `resolver.resolve("github")` (or `"ado"`), then constructs the
+   adapter with `{ config: { token: <resolved> } }`.
+5. Same for `registry.buildLlm(llmAdapterId)`.
+6. On `Err<missing-credentials>` from either: write
+   `ErrorFrame { reason: "missing-credentials", details: { adapterId,
+   attempted, hint } }`. Diff is NOT fetched.
+7. On `Ok`: existing quiz pipeline (ADR-16). Diff fetched, quiz
+   generated, response written.
+
+**Diff-flow audit**: resolved secrets are read from env or CLI by the
+resolver and handed to the adapter factory inside the registry. They
+never appear in the wire frame, never reach the prompt construction,
+never enter the logger (REDACT_PATHS covers `*.secret`, `*.token`,
+`*.apiKey`, `*.pat`). The diff-only invariant is unchanged.
+
+##### C. Stale extension sending a `credentials` field
+
+A user with an old extension build will send `quiz-request` with a
+`credentials` field still attached. The host:
+
+1. Framing reader parses; the field is ignored by the updated
+   `QuizRequestPayloadSchema` (passthrough — zod retains it but the
+   handler never reads it).
+2. The dispatcher constructs adapters via the resolver.
+3. The resolver may succeed or fail depending on the user's host env;
+   the stale extension-side credential is irrelevant.
+
+This is acceptable because the wire fields were optional and no
+"production" deploys exist. Reviewer-enforced via the unit test that
+mocks a stale-shape payload.
+
+#### Error cases
+
+| Trigger | Wire frame / UX |
+|---|---|
+| `check-auth-request` arrives | Host returns `check-auth-response` with one row per adapter. Resolution failures per adapter become rows with `ok: false` + `hint`; they do NOT fail the whole frame. |
+| One adapter's resolver hangs > 5 s | `spawnIO` cancellation kicks in; the resolver step returns a miss; chain continues; final result is a miss for that adapter; row is `ok: false`. Other adapters proceed. |
+| `quiz-request` with `vcsAdapterId: "github"` + `gh auth token` returns empty | Host: `missing-credentials` error frame; modal renders existing missing-credentials copy + `hint` ("Run `gh auth login` or export `GITHUB_TOKEN`"). |
+| Stale extension sends `credentials: { pat: "x" }` | Field is parsed but ignored by the handler; resolver runs as if nothing was sent. No error. |
+| Options page receives `check-auth-response` with mixed `ok` values | Renders ✓ / ✗ rows; does not block save; LLM dropdown stays usable for the adapters that resolved. |
+| Host not installed | `check-auth-request` returns synthetic `ErrorFrame { reason: "internal", message: "...connect failed..." }`; auth-status panel renders the existing "Native host not installed" banner. |
+| `pr.kind` is unknown (future VCS) | Router falls back to whatever `originalPayload.vcsAdapterId` is (probably undefined → host default `"github"`). Acceptable for v1; future ADR adds new VCS kinds. |
+
+All expected failures travel as `Either` / `IO` errors. No new `throw`
+paths.
+
+#### Backwards compatibility
+
+- **Wire-format removal**: `quiz-request.payload.credentials` removed
+  AND `error.payload.reason` loses `"bad-credentials"`. Both are
+  technically breaking, but the project has no shipped users (no Chrome
+  Web Store entry, no release tag, M3 hasn't shipped). The risk of an
+  in-flight branch or local dev build that still uses these fields is
+  borne by the developer; the reviewer will catch it in PR review.
+- **Storage-key bump**: `lgtm_buzzer.options.v1` → `…v2`. The reader for
+  `v2` does not migrate or warn about a `v1` key — it returns
+  `Left<absent>` for missing `v2` (so the options page just shows
+  defaults). A short note in the README tells developers to re-pick
+  their LLM adapter on first load of the new options page; saved
+  credentials are no longer needed and are silently abandoned in
+  storage (until the user runs `chrome.storage.local.clear()` from
+  devtools).
+- **Envelope `v`**: stays at `1`. Pre-release codebase + additive
+  frames + one removed optional field do not justify a bump.
+
+#### Resolver redaction posture (binding)
+
+- The resolver writes ONE log line per `resolve(adapterId)` invocation,
+  at `debug` level, containing `{ adapterId, hit: boolean,
+  via: "GITHUB_TOKEN env" | "GH_TOKEN env" | "gh CLI" | "AZURE_DEVOPS_EXT_PAT env" | "az CLI" | "ANTHROPIC_API_KEY env" | "CLI-managed" | "miss" }`.
+  NEVER includes the secret bytes.
+- `REDACT_PATHS` in the host logger gains one entry: `"*.secret"` and
+  `"secret"`. Existing entries (`*.token`, `*.apiKey`, `*.pat`,
+  `*.x-api-key`, `credentials`, `*.credentials`) remain.
+- `AuthStatus.detail` and `AuthStatus.hint` are short strings drawn
+  from a closed enum of step labels and remediation copy. They are
+  enumerated in `packages/host/src/credentials/resolver.ts` as
+  constants; the reviewer asserts no env-var VALUE ever flows into
+  either field via a canary test that resolves with a sentinel env
+  var `GITHUB_TOKEN=SECRET_CANARY_xxx` and checks
+  `AuthStatus.detail` does NOT contain `"SECRET_CANARY_xxx"`.
+
+#### Test strategy
+
+**`packages/protocol/src/messages/quiz-request.test.ts`** — update:
+1. Old shape without `credentials` parses (always did).
+2. New "stale" case: shape with extraneous `credentials` field still
+   parses (zod passthrough); the parsed value does NOT have a
+   `credentials` field accessible on the typed payload.
+3. `llmAdapterId` empty string still rejected.
+
+**`packages/protocol/src/messages/check-auth-request.test.ts`** (new, ≥2):
+1. Empty payload parses.
+2. Extra field rejected (`.strict()`).
+
+**`packages/protocol/src/messages/check-auth-response.test.ts`** (new, ≥4):
+1. Empty `statuses` array parses.
+2. Multi-row statuses with mixed `ok` parse.
+3. `detail` and `hint` accepted as optional strings.
+4. `adapterId` empty rejected.
+
+**`packages/protocol/src/messages/error.test.ts`** — drop the
+`"bad-credentials"` round-trip; assert it now FAILS parsing.
+
+**`packages/protocol/src/envelope.test.ts`** — extend (≥2): both new
+frame kinds parse via `FrameSchema`.
+
+**`packages/host/src/credentials/resolver.test.ts`** (new, ≥18):
+1. `github` env hit (`GITHUB_TOKEN=ghp_a`) → `Right<{ secret: "ghp_a",
+   detail: "via GITHUB_TOKEN env" }>`.
+2. `github` env miss + `GH_TOKEN=ghp_b` hit → `Right<{ secret: "ghp_b",
+   detail: "via GH_TOKEN env" }>`.
+3. `github` both env miss + `gh auth token` exit-0 stdout `"ghp_c\n"`
+   → `Right<{ secret: "ghp_c", detail: "via gh CLI" }>` (note trim).
+4. `github` all miss + `gh auth token` exit-1 → `Left<{ kind:
+   "missing-credential", adapterId: "github", attempted: [3 labels],
+   hint: contains "gh auth login" }>`.
+5. `github` all miss + `gh auth token` exit-0 with empty stdout
+   → treated as miss, falls through to error.
+6. `github` `gh auth token` times out at 5 s → spawnIO cancels;
+   resolver returns miss; final error.
+7. `ado` `AZURE_DEVOPS_EXT_PAT` hit → `Right`.
+8. `ado` env miss + `az` exit-0 stdout with token → `Right<{ via: "az
+   CLI" }>`.
+9. `ado` env miss + `az` exit-non-zero → `Left`.
+10. `claude-api` `ANTHROPIC_API_KEY` hit → `Right<{ via: "ANTHROPIC_API_KEY env" }>`.
+11. `claude-api` env miss → `Left` with hint mentioning
+    `ANTHROPIC_API_KEY`.
+12. `claude-cli` always `Right<{ secret: undefined, detail: "uses
+    CLI's own login" }>`.
+13. `codex-cli` likewise.
+14. `copilot-cli` likewise.
+15. Unknown adapter ID → resolver returns `Left` with hint "no resolver
+    for adapter".
+16. **Canary**: `GITHUB_TOKEN=SECRET_CANARY_xxx`; assert
+    `Right.detail` does NOT contain `"SECRET_CANARY_xxx"`.
+17. **Canary**: `gh auth token` stdout `"SECRET_CANARY_yyy\n"`; assert
+    `Left.attempted` and `Left.hint` (for a forced full miss after
+    swallowing this hit) do NOT contain `"SECRET_CANARY_yyy"`.
+18. Subprocess invocation uses `spawnIO`, not raw `execa` — assert via
+    a fake `spawnIO` that records its calls.
+
+**`packages/host/src/registry.test.ts`** — rewrite:
+1. `listLlm()` / `listVcs()` unchanged.
+2. `buildLlm("claude-cli")` → `IO<…, LLMProvider>`; running it
+   succeeds; the fake resolver's `resolve("claude-cli")` was called
+   once.
+3. `buildLlm("claude-api")` with resolver returning `Right<{ secret:
+   "sk-x" }>` → `Right<LLMProvider>`; the adapter factory was called
+   with `{ config: { apiKey: "sk-x" } }`.
+4. `buildLlm("claude-api")` with resolver returning `Left<…>` →
+   `Left<{ kind: "missing-credentials", adapterId: "claude-api",
+   attempted, hint }>`.
+5. `buildVcs("github")` with resolver `Right` → adapter factory called
+   with `{ config: { token: <secret> } }`.
+6. `buildVcs("ado")` likewise.
+7. `buildVcs("unknown")` → `Left<{ kind: "unsupported-vcs-adapter" }>`.
+8. **Canary**: resolver returns `Right<{ secret: "SECRET_xxx" }>` and
+   `Left<{ hint: "Run gh auth login" }>` in separate calls; assert
+   the registry's returned `RegistryError` shape never contains
+   `"SECRET_xxx"`.
+
+**`packages/host/src/dispatcher.test.ts`** — update:
+1. Drop all `bad-credentials` cases.
+2. `quiz-request` with stale `credentials` field → host ignores it,
+   resolver runs, happy path completes (with a fake resolver returning
+   `Right`).
+3. `quiz-request` where resolver returns `Left` for github → wire
+   `ErrorFrame { reason: "missing-credentials", details: { adapterId,
+   attempted, hint } }`. No `fetchDiff` observed.
+4. `check-auth-request` → host writes `check-auth-response` with one
+   row per adapter; rows reflect the fake resolver's per-adapter
+   results.
+5. `check-auth-request` with one resolver step throwing — assert the
+   handler still writes a response (the row is `ok: false`); the
+   handler does not crash.
+
+**`packages/host/src/logger.test.ts`** — add:
+1. `{ resolved: { secret: "x" } }` → `secret` redacted.
+2. `{ resolved: { detail: "via gh CLI" } }` → `detail` visible.
+
+**`packages/extension/src/lib/options/schema.test.ts`** — update:
+1. v2 stored options round-trip.
+2. v1-shaped payload (`schemaVersion: 1`) → corrupt.
+3. Stored options with extraneous `vcsAdapterId` or `credentials`
+   keys → still parses (zod strips); typed result has no such fields.
+
+**`packages/extension/src/lib/options/storage-reader.test.ts`** —
+rewrite:
+1. Empty storage → `{ llmAdapterId: undefined }`.
+2. `{ llmAdapterId: "claude-api" }` → `{ llmAdapterId: "claude-api" }`.
+3. Corrupt storage → `{ llmAdapterId: undefined }`.
+
+**`packages/extension/src/lib/options/auth-status.test.ts`** (new, ≥4):
+1. Round-trip `check-auth-request` → host stub returns 6 rows → result
+   is `Right<AuthStatus[]>` with 6 rows.
+2. Host returns `ErrorFrame { reason: "internal", message: "connect
+   failed" }` → `Left<host-not-installed>`.
+3. Host returns `ErrorFrame { reason: "internal", message: "other" }`
+   → `Left<host-error>`.
+4. Send throws → `Left<internal>`.
+
+**`packages/extension/src/lib/options/probe.test.ts`** — drop
+credential-shaped inputs from the cases.
+
+**`packages/extension/src/lib/options/dom.test.ts`** — rewrite (≥9):
+1. Mount with empty storage → LLM dropdown populates; no VCS dropdown
+   in DOM; no credential inputs in DOM.
+2. Auth-status panel shows one row per adapter advertised by the
+   `checkAuth` stub.
+3. Refresh button re-invokes `checkAuth`.
+4. Row with `ok: true` and `detail: "via GH CLI"` renders the detail
+   text; ✓ icon (or `data-lgtm-status="ok"`) attached.
+5. Row with `ok: false` and `hint: "Run \`gh auth login\`"` renders
+   the hint; ✗ marker attached.
+6. Save handler persists only `{ schemaVersion: 2, llmAdapterId }`;
+   no `credentials` or `vcsAdapterId` reach `store.write`.
+7. Test-connection button (still present) calls `probe` with only the
+   `llmAdapterId` field; succeeds on `pong`.
+8. **Canary**: a row whose `hint` contains the literal string
+   `"SECRET_CANARY_xxx"` (impossible in practice but defended in
+   depth) renders the string into the DOM. The dom layer is NOT
+   the redaction layer — the host already enforces this — but the
+   test exists to document that the dom layer is not the line of
+   defense.
+9. Host-not-installed → auth-status panel shows the existing
+   "Native host not installed" banner.
+
+**`packages/extension/src/lib/router.test.ts`** — update:
+1. `quiz-request` with `pr.kind === "github"` → SW forwards with
+   `vcsAdapterId === "github"`, no `credentials` field.
+2. `quiz-request` with `pr.kind === "ado"` → SW forwards with
+   `vcsAdapterId === "ado"`.
+3. `quiz-request` with stored `llmAdapterId: "claude-api"` → SW
+   forwards with `llmAdapterId === "claude-api"` and no `credentials`.
+4. `quiz-request` where CS payload contained a stale `credentials`
+   field → SW strips it before forwarding.
+
+**Contract tests for adapters**: no change. Adapter factories still
+take `{ config: { token | apiKey } }`.
+
+**End-to-end**: the existing Playwright e2e (ADR-25) uses an SW stub;
+no host actually runs. This ADR does not add new e2e coverage —
+manual verification on a real Chrome + host install closes the loop
+on the resolver chain. Documented in the issue's acceptance criteria.
+
+Coverage target: ≥90% on `resolver.ts` (chain logic is core to the
+feature); ≥85% on the rewritten `dom.ts`; ≥85% on the rewritten
+`storage-reader.ts`.
+
+### Consequences
+
+- **The strict-bag bug is fixed by construction.** No wire bag exists
+  to validate; the per-adapter `.strict()` schemas are gone.
+- **No PATs in `chrome.storage.local`.** The plaintext-storage caveat
+  from ADR-22 / ADR-23 disappears. The README updates accordingly.
+- **One fewer permission worth of blast radius.** The `"storage"`
+  permission stays (still used for `llmAdapterId` + future
+  preferences), but the value behind it is no longer sensitive.
+- **Users with `gh auth login` / `az login` / `ANTHROPIC_API_KEY`
+  already exported get zero-config.** Open the options page, see
+  green checkmarks for the adapters they use, save the LLM choice,
+  approve a PR. No credential entry.
+- **SSO-protected tokens are a known gotcha.** `gh auth token` returns
+  a token that may be blocked by SAML SSO until the user runs
+  `gh auth refresh -h <host> -s read:user`. The resolver cannot detect
+  this. The hint copy and README explicitly call this out; a deferred
+  issue may add a richer probe that distinguishes "no token" from
+  "token but server returned 401".
+- **Subprocess invocation is bounded by `spawnIO`'s existing
+  cancellation contract.** 5-second timeout per CLI call; cancellation
+  sends SIGTERM then SIGKILL (ADR-9 contract). A user whose `gh` CLI
+  is wedged sees the row as `ok: false` instead of a hung options
+  page.
+- **One wire field removed + one error reason removed + two frame
+  kinds added.** Envelope `v` stays at `1`; on a pre-release codebase
+  the breakage cost is the dev who has to rebuild their local
+  extension.
+- **Storage envelope bumped to v2.** Old `v1` data is unmigrated and
+  abandoned. Documented in README.
+- **`bad-credentials` is gone from the wire error vocabulary.** The
+  modal's `errorClassToUI` (ADR-24) must lose its `bad-credentials`
+  arm; if any code path still references the string, the reviewer
+  catches it.
+- **Resolver redaction is structural.** `REDACT_PATHS` gains
+  `"secret"` and `"*.secret"`. The resolver's `via` strings are drawn
+  from a closed enumeration of step labels — no env-var VALUE ever
+  flows into a log line.
+- **No new runtime deps anywhere.** `monadyssey` + `zod` + `pino` +
+  `execa` (via spawnIO) cover everything. `pino` is dev-only, `execa`
+  is already used by `spawnIO`.
+- **Diff-only invariant preserved.** No new code path puts non-diff PR
+  text on the prompt path. Credentials never appear on the wire.
+- **Reversibility moderate.** The protocol changes are small but
+  technically breaking; rolling back means re-adding `credentials` to
+  the schema and the credential inputs to the options page. The
+  resolver itself is one file behind a typed interface.
+- **Out of scope (explicit non-goals, deferred to future issues)**:
+  - Multi-account selection (e.g., `gh auth status` lists multiple
+    accounts; v1 takes the default).
+  - SSO-protected token detection (resolver returns the token; the
+    adapter call gets 401; user is on their own).
+  - Mac Keychain / Windows Credential Manager integration.
+  - Per-repository credential overrides.
+  - HTTP-based auth flows from the options page (would require a new
+    permission and a separate ADR).
+
+**Binding for reviewer**:
+- (a) `quiz-request.payload.credentials` MUST be removed from the
+  schema. Reviewer asserts via the updated `quiz-request.test.ts`.
+- (b) `error.payload.reason` enum MUST NOT contain
+  `"bad-credentials"`. Reviewer asserts via the updated
+  `error.test.ts`.
+- (c) `CredentialResolver.resolve` MUST run on every invocation — no
+  caching. Reviewer asserts via a test with two consecutive calls
+  observing the env reader was called twice.
+- (d) `AuthStatus.detail` and `AuthStatus.hint` MUST be drawn from
+  closed sets of step labels and remediation copy. Reviewer asserts
+  via the SECRET_CANARY tests in `resolver.test.ts`.
+- (e) Subprocess invocations MUST go through `spawnIO`, not raw
+  `execa` or `child_process`. Reviewer asserts via the spawn-fake
+  test.
+- (f) `subprocessTimeoutMs` default MUST be 5000. Reviewer asserts via
+  a constant test.
+- (g) SW MUST NOT read credentials from storage on any frame kind.
+  Reviewer asserts by greping `storage-reader.ts` for the absence of
+  any `credentials` access.
+- (h) SW MUST infer `vcsAdapterId` from `pr.kind` on `quiz-request`.
+  Reviewer asserts via router tests.
+- (i) Resolver code paths MUST NOT throw for expected failures (env
+  miss, exit-non-zero, timeout). All travel through `IO`. Reviewer
+  asserts via the resolver tests.
+- (j) The `"options.v1"` storage key MUST NOT be migrated. Reviewer
+  asserts via the storage test (`v1` data → `Left<absent>` for the
+  `v2` reader).
+
+---

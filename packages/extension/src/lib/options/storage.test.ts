@@ -38,20 +38,15 @@ const makeThrowingArea = (method: "get" | "set" | "remove"): StorageArea => ({
 });
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests (ADR-29: v2 schema, no credentials)
 // ---------------------------------------------------------------------------
 
 const VALID_OPTIONS: StoredOptions = {
   schemaVersion: SCHEMA_VERSION,
   llmAdapterId: "claude-api",
-  vcsAdapterId: "github",
-  credentials: {
-    "claude-api": { apiKey: "sk-ant-xxx" },
-    github: { pat: "ghp_xxx" },
-  },
 };
 
-describe("createOptionsStore", () => {
+describe("createOptionsStore — v2 schema", () => {
   it("read of empty storage returns Left<absent>", async () => {
     const area = makeStorageArea();
     const store = createOptionsStore({ area });
@@ -66,7 +61,7 @@ describe("createOptionsStore", () => {
     expect(errorKind).toBe("absent");
   });
 
-  it("read of valid stored options returns Right<StoredOptions>", async () => {
+  it("read of valid v2 stored options returns Right<StoredOptions>", async () => {
     const area = makeStorageArea({ [STORAGE_KEY]: VALID_OPTIONS });
     const store = createOptionsStore({ area });
     const result = await store.read();
@@ -80,7 +75,7 @@ describe("createOptionsStore", () => {
     expect(llmAdapterId).toBe("claude-api");
   });
 
-  it("read of corrupt value returns Left<corrupt> with non-empty issues", async () => {
+  it("read of corrupt value (schemaVersion 99) returns Left<corrupt>", async () => {
     const area = makeStorageArea({
       [STORAGE_KEY]: { schemaVersion: 99, llmAdapterId: "" },
     });
@@ -99,7 +94,25 @@ describe("createOptionsStore", () => {
     expect(issueCount).toBeGreaterThan(0);
   });
 
-  it("write of valid options calls area.set with STORAGE_KEY", async () => {
+  it("v1 key in storage is treated as absent (key mismatch, not corrupt)", async () => {
+    // ADR-29: the reader uses the v2 key. If only a v1 entry exists, the v2
+    // read returns Left<absent> — the v1 entry is silently ignored.
+    const OLD_KEY = "lgtm_buzzer.options.v1";
+    const area = makeStorageArea({
+      [OLD_KEY]: { schemaVersion: 1, llmAdapterId: "claude-cli" },
+    });
+    const store = createOptionsStore({ area });
+    const result = await store.read();
+    let errorKind: string | undefined;
+    result.fold(
+      (e) => { errorKind = e.kind; },
+      () => { /* noop */ },
+    );
+    // The v1 key is absent from the v2 storage read — returns absent, not corrupt.
+    expect(errorKind).toBe("absent");
+  });
+
+  it("write of valid v2 options calls area.set with STORAGE_KEY", async () => {
     const area = makeStorageArea();
     const store = createOptionsStore({ area });
     const result = await store.write(VALID_OPTIONS);
@@ -110,6 +123,21 @@ describe("createOptionsStore", () => {
     );
     expect(wasLeft).toBe(false);
     expect(area.data[STORAGE_KEY]).toEqual(VALID_OPTIONS);
+  });
+
+  it("write only stores llmAdapterId — no vcsAdapterId or credentials", async () => {
+    const area = makeStorageArea();
+    const store = createOptionsStore({ area });
+    const opts: StoredOptions = {
+      schemaVersion: SCHEMA_VERSION,
+      llmAdapterId: "claude-cli",
+    };
+    await store.write(opts);
+    const stored = area.data[STORAGE_KEY] as Record<string, unknown>;
+    expect(stored["schemaVersion"]).toBe(2);
+    expect(stored["llmAdapterId"]).toBe("claude-cli");
+    expect(stored["vcsAdapterId"]).toBeUndefined();
+    expect(stored["credentials"]).toBeUndefined();
   });
 
   it("write failure returns Left<io>", async () => {

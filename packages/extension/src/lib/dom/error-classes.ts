@@ -49,7 +49,6 @@ export type DisplayErrorClass =
   | { readonly kind: "unknown-quiz-id" }
   | { readonly kind: "unsupported-llm-adapter" }
   | { readonly kind: "unsupported-vcs-adapter" }
-  | { readonly kind: "bad-credentials" }
   | { readonly kind: "missing-credentials" };
 
 /** The action a CTA button performs. */
@@ -238,13 +237,6 @@ export const errorClassToUI = (cls: DisplayErrorClass): ErrorUISpec => {
       return {
         title: "VCS adapter not available",
         body: "The selected VCS adapter is not registered in your native host. Pick a different adapter in options.",
-        cta: { label: "Open options", action: { kind: "open-options" } },
-      };
-
-    case "bad-credentials":
-      return {
-        title: "Credentials rejected",
-        body: "The adapter rejected your credentials. Update them in extension options.",
         cta: { label: "Open options", action: { kind: "open-options" } },
       };
 

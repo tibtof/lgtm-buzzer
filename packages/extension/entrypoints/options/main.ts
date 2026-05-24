@@ -2,6 +2,7 @@ import { browser } from "wxt/browser";
 import { createOptionsStore } from "../../src/lib/options/storage.js";
 import { createSWBridge, createListAdapters } from "../../src/lib/options/sw-bridge.js";
 import { createProbe } from "../../src/lib/options/probe.js";
+import { createCheckAuth } from "../../src/lib/options/auth-status.js";
 import { createOptionsView } from "../../src/lib/options/dom.js";
 
 /**
@@ -9,6 +10,10 @@ import { createOptionsView } from "../../src/lib/options/dom.js";
  *
  * Constructs the dependency graph and mounts the options view.
  * Vanilla TS + DOM — no framework (ADR-23 §Wire-shape choices).
+ *
+ * ADR-29: `checkAuth` replaces the removed credential plumbing.
+ * Credentials are now resolved host-side; the options page only stores
+ * `llmAdapterId` and shows the per-adapter auth status from the host.
  */
 const main = async (): Promise<void> => {
   const root = document.getElementById("lgtm-options-root");
@@ -44,12 +49,19 @@ const main = async (): Promise<void> => {
     newNonce: () => crypto.randomUUID(),
   });
 
+  // ADR-29: check-auth replaces wire-carried credentials.
+  const checkAuth = createCheckAuth({
+    sendFrame: bridge.sendFrame,
+    newCorrelationId: () => crypto.randomUUID(),
+  });
+
   const view = createOptionsView({
     doc: document,
     root: root as HTMLElement,
     store,
     listAdapters,
     probe,
+    checkAuth,
   });
 
   await view.mount();

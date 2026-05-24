@@ -9,17 +9,16 @@ import type { Frame } from "@lgtm-buzzer/protocol";
 const makeFrame = (kind: string, payload: Record<string, unknown> = {}): Frame =>
   ({ v: 1, kind, correlationId: "c-1", payload }) as Frame;
 
+// ADR-29: probe no longer accepts vcsAdapterId or credentials
 const stubInput = {
   llmAdapterId: "claude-cli",
-  vcsAdapterId: "github",
-  credentials: {},
 };
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("createProbe", () => {
+describe("createProbe — ADR-29 (no credentials in input)", () => {
   it("pong with matching nonce → Right<'ok'>", async () => {
     const probe = createProbe({
       sendFrame: async (frame) => {
@@ -57,10 +56,10 @@ describe("createProbe", () => {
     expect(errorKind).toBe("nonce-mismatch");
   });
 
-  it("error frame with 'bad-credentials' → Left<host-error> with reason propagated", async () => {
+  it("error frame with 'missing-credentials' → Left<host-error> with reason propagated", async () => {
     const probe = createProbe({
       sendFrame: async () =>
-        makeFrame("error", { reason: "bad-credentials", message: "invalid key" }),
+        makeFrame("error", { reason: "missing-credentials", message: "gh auth login" }),
       newCorrelationId: () => "c-1",
       newNonce: () => "nonce-abc",
     });
@@ -76,7 +75,7 @@ describe("createProbe", () => {
       () => { /* noop */ },
     );
     expect(errorKind).toBe("host-error");
-    expect(errorReason).toBe("bad-credentials");
+    expect(errorReason).toBe("missing-credentials");
   });
 
   it("connect failed → Left<host-not-installed>", async () => {
@@ -97,5 +96,25 @@ describe("createProbe", () => {
       () => { /* noop */ },
     );
     expect(errorKind).toBe("host-not-installed");
+  });
+
+  it("probe sends a ping frame (no credentials field in payload)", async () => {
+    let sentFrame: Frame | undefined;
+    const probe = createProbe({
+      sendFrame: async (frame) => {
+        sentFrame = frame;
+        const payload = frame.payload as { nonce?: string };
+        return makeFrame("pong", { nonce: payload.nonce });
+      },
+      newCorrelationId: () => "c-1",
+      newNonce: () => "nonce-abc",
+    });
+
+    await probe(stubInput);
+    expect(sentFrame?.kind).toBe("ping");
+    // probe must not include credentials in the ping payload
+    expect(JSON.stringify(sentFrame?.payload)).not.toContain("credentials");
+    expect(JSON.stringify(sentFrame?.payload)).not.toContain("apiKey");
+    expect(JSON.stringify(sentFrame?.payload)).not.toContain("pat");
   });
 });

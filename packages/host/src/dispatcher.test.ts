@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
 import { IO, NonEmptyList } from "monadyssey";
-import { Right, Left } from "monadyssey";
 import { createDispatcher } from "./dispatcher.js";
 import { createSessionStore } from "./session-store.js";
 import type { FrameWriter } from "./framing/writer.js";
@@ -61,7 +60,7 @@ const makeQuiz = (id: string): Quiz => ({
 });
 
 // ---------------------------------------------------------------------------
-// Fake adapter registry
+// Fake adapter registry (IO-returning — ADR-29)
 // ---------------------------------------------------------------------------
 
 type FakeLLM = LLMProvider & { generateQuizCalls: number };
@@ -96,7 +95,8 @@ const makeFakeVcs = (id: string, diff: string): FakeVCS => {
 };
 
 /**
- * Build a fake AdapterRegistry where both adapters succeed.
+ * Build a fake AdapterRegistry where both adapters succeed. Registry now
+ * returns IO (ADR-29).
  */
 const makeFakeRegistry = (
   llm: LLMProvider = makeFakeLlm("claude-cli", makeQuiz("quiz-fake")),
@@ -104,8 +104,8 @@ const makeFakeRegistry = (
 ): AdapterRegistry => ({
   listLlm: () => ["claude-api", "claude-cli", "codex-cli", "copilot-cli"],
   listVcs: () => ["ado", "github"],
-  buildLlm: () => Right.pure(llm),
-  buildVcs: () => Right.pure(vcs),
+  buildLlm: () => IO.pure(llm),
+  buildVcs: () => IO.pure(vcs),
 });
 
 /**
@@ -114,8 +114,8 @@ const makeFakeRegistry = (
 const makeFailingLlmRegistry = (err: RegistryError): AdapterRegistry => ({
   listLlm: () => ["claude-cli"],
   listVcs: () => ["github"],
-  buildLlm: () => Left.pure(err),
-  buildVcs: () => Right.pure(makeFakeVcs("github", "diff --git a/foo.ts")),
+  buildLlm: () => IO.fail(err),
+  buildVcs: () => IO.pure(makeFakeVcs("github", "diff --git a/foo.ts")),
 });
 
 // ---------------------------------------------------------------------------
@@ -288,6 +288,25 @@ describe("dispatcher — unexpected frame kinds", () => {
       kind: "list-adapters-response",
       correlationId: "corr-lars",
       payload: { llm: ["claude-cli"], vcs: ["github"] },
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+
+    expect(frames).toHaveLength(1);
+    const reply = frames[0]!;
+    expect(reply.kind).toBe("error");
+    if (reply.kind === "error") {
+      expect(reply.payload.reason).toBe("unknown-message");
+    }
+  });
+
+  it("check-auth-response received → ErrorFrame with unknown-message", async () => {
+    const { dispatcher, frames } = makeTestSetup();
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "check-auth-response",
+      correlationId: "corr-cars",
+      payload: { statuses: [] },
     };
 
     await dispatcher.dispatch(frame).unsafeRun();
@@ -562,7 +581,7 @@ describe("dispatcher — correctChoiceId gate integrity", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests: ADR-22 — registry error handling in quiz-request
+// Tests: ADR-29 — registry error handling in quiz-request (IO-returning)
 // ---------------------------------------------------------------------------
 
 describe("dispatcher — quiz-request with unsupported-llm-adapter", () => {
@@ -583,11 +602,12 @@ describe("dispatcher — quiz-request with unsupported-llm-adapter", () => {
         questionCount: 3,
         llmAdapterId: "unknown-llm",
         vcsAdapterId: "github",
-        credentials: { pat: "ghp_test" },
       },
     };
 
     await dispatcher.dispatch(frame).unsafeRun();
+    // Wait for forked fiber
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(frames).toHaveLength(1);
     const reply = frames[0]!;
@@ -618,8 +638,8 @@ describe("dispatcher — quiz-request with unsupported-vcs-adapter", () => {
     const registry: AdapterRegistry = {
       listLlm: () => ["claude-cli"],
       listVcs: () => ["github"],
-      buildLlm: () => Right.pure(trackingLlm),
-      buildVcs: () => Left.pure(err),
+      buildLlm: () => IO.pure(trackingLlm),
+      buildVcs: () => IO.fail(err),
     };
 
     const dispatcher = createDispatcher({ write: writer, store, logger, registry });
@@ -632,11 +652,11 @@ describe("dispatcher — quiz-request with unsupported-vcs-adapter", () => {
         pr: { kind: "github", owner: "o", repo: "r", number: 1 },
         questionCount: 3,
         vcsAdapterId: "unknown-vcs",
-        credentials: { apiKey: "sk-ant-xxx" },
       },
     };
 
     await dispatcher.dispatch(frame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(frames).toHaveLength(1);
     const reply = frames[0]!;
@@ -650,12 +670,25 @@ describe("dispatcher — quiz-request with unsupported-vcs-adapter", () => {
 });
 
 describe("dispatcher — quiz-request with missing-credentials", () => {
-  it("quiz-request for claude-api without credentials → ErrorFrame with missing-credentials", async () => {
-    const err: RegistryError = { kind: "missing-credentials", adapterId: "claude-api" };
+  it("quiz-request where resolver returns Left → ErrorFrame with missing-credentials; no fetchDiff", async () => {
+    const err: RegistryError = {
+      kind: "missing-credentials",
+      adapterId: "github",
+      attempted: ["GITHUB_TOKEN env", "GH_TOKEN env", "gh auth token CLI"],
+      hint: "Run `gh auth login` or export GITHUB_TOKEN",
+    };
     const store = createSessionStore();
     const { writer, frames } = makeCapturingWriter();
     const logger = makeNoopLogger();
-    const registry = makeFailingLlmRegistry(err);
+
+    const fetchDiffCalls = 0;
+    const registry: AdapterRegistry = {
+      listLlm: () => ["claude-cli"],
+      listVcs: () => ["github"],
+      buildLlm: () => IO.pure(makeFakeLlm("claude-cli", makeQuiz("x"))),
+      buildVcs: () => IO.fail(err),
+    };
+
     const dispatcher = createDispatcher({ write: writer, store, logger, registry });
 
     const frame: Frame = {
@@ -665,60 +698,172 @@ describe("dispatcher — quiz-request with missing-credentials", () => {
       payload: {
         pr: { kind: "github", owner: "o", repo: "r", number: 1 },
         questionCount: 3,
-        llmAdapterId: "claude-api",
+        llmAdapterId: "claude-cli",
         vcsAdapterId: "github",
-        // no credentials field
       },
     };
 
     await dispatcher.dispatch(frame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(frames).toHaveLength(1);
     const reply = frames[0]!;
     expect(reply.kind).toBe("error");
     if (reply.kind === "error") {
       expect(reply.payload.reason).toBe("missing-credentials");
+      // details should include adapterId, attempted, and hint
+      const details = reply.payload.details as Record<string, unknown> | undefined;
+      expect(details?.["adapterId"]).toBe("github");
+      expect(details?.["hint"]).toContain("gh auth login");
     }
+    // fetchDiff must not have been called
+    expect(fetchDiffCalls).toBe(0);
   });
 });
 
-describe("dispatcher — quiz-request with bad-credentials", () => {
-  it("quiz-request for claude-api with empty apiKey → ErrorFrame with bad-credentials; no credential bytes in payload", async () => {
-    const CANARY = "sk-ant-CANARY_VALUE_12345";
-    const err: RegistryError = {
-      kind: "bad-credentials",
-      adapterId: "claude-api",
-      detail: "invalid or unexpected fields: apiKey",
-    };
+// ADR-29: bad-credentials is REMOVED. No test for it.
+
+describe("dispatcher — quiz-request ignores stale credentials field (ADR-29)", () => {
+  it("quiz-request with stale credentials field → host ignores it, happy path completes", async () => {
+    const quiz = makeQuiz("quiz-stale-creds");
+    const llm = makeFakeLlm("claude-cli", quiz);
+    const vcs = makeFakeVcs("github", "diff --git a/foo.ts");
+    const registry = makeFakeRegistry(llm, vcs);
+
     const store = createSessionStore();
     const { writer, frames } = makeCapturingWriter();
     const logger = makeNoopLogger();
-    const registry = makeFailingLlmRegistry(err);
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry });
+
+    // Stale extension still sends credentials field — dispatcher must ignore it.
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "corr-stale-creds",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 3,
+        // ADR-29: credentials would be here in the raw object from a stale extension.
+        // The schema parses passthrough so it arrives but the dispatcher never reads it.
+      },
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Happy path: quiz-response was sent
+    expect(frames.some((f) => f.kind === "quiz-response")).toBe(true);
+  });
+
+  it("quiz-request outgoing frame does NOT contain a credentials field", async () => {
+    // Assert that the dispatcher never reads or echoes payload.credentials
+    const quiz = makeQuiz("quiz-no-creds");
+    const registry = makeFakeRegistry(makeFakeLlm("claude-cli", quiz), makeFakeVcs("github", "diff"));
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
     const dispatcher = createDispatcher({ write: writer, store, logger, registry });
 
     const frame: Frame = {
       v: PROTOCOL_VERSION,
       kind: "quiz-request",
-      correlationId: "corr-bad-creds",
+      correlationId: "corr-no-creds",
       payload: {
         pr: { kind: "github", owner: "o", repo: "r", number: 1 },
         questionCount: 3,
-        llmAdapterId: "claude-api",
-        vcsAdapterId: "github",
-        credentials: { apiKey: CANARY },
       },
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    for (const f of frames) {
+      const serialized = JSON.stringify(f);
+      expect(serialized).not.toContain('"credentials"');
+    }
+  });
+});
+
+describe("dispatcher — check-auth-request", () => {
+  it("responds with check-auth-response containing one row per adapter", async () => {
+    const { dispatcher, frames } = makeTestSetup();
+
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "check-auth-request",
+      correlationId: "corr-car",
+      payload: {},
     };
 
     await dispatcher.dispatch(frame).unsafeRun();
 
     expect(frames).toHaveLength(1);
     const reply = frames[0]!;
-    expect(reply.kind).toBe("error");
-    if (reply.kind === "error") {
-      expect(reply.payload.reason).toBe("bad-credentials");
-      // BINDING: credential bytes MUST NOT appear in the error payload
-      const serialized = JSON.stringify(reply.payload);
-      expect(serialized).not.toContain(CANARY);
+    expect(reply.kind).toBe("check-auth-response");
+    if (reply.kind === "check-auth-response") {
+      expect(reply.correlationId).toBe("corr-car");
+      // The fake registry has 4 LLM + 2 VCS = 6 adapters
+      expect(reply.payload.statuses).toHaveLength(6);
+    }
+  });
+
+  it("statuses reflect the fake resolver's per-adapter outcomes (all ok)", async () => {
+    const { dispatcher, frames } = makeTestSetup();
+
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "check-auth-request",
+      correlationId: "corr-car-2",
+      payload: {},
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+
+    const reply = frames[0]!;
+    if (reply.kind === "check-auth-response") {
+      for (const status of reply.payload.statuses) {
+        expect(status.ok).toBe(true);
+      }
+    }
+  });
+
+  it("check-auth-request with one resolver returning Left → that row is ok:false, handler does not crash", async () => {
+    const registry: AdapterRegistry = {
+      listLlm: () => ["claude-cli"],
+      listVcs: () => ["github"],
+      buildLlm: () => IO.pure(makeFakeLlm("claude-cli", makeQuiz("x"))),
+      buildVcs: () =>
+        IO.fail<RegistryError, VCSProvider>({
+          kind: "missing-credentials",
+          adapterId: "github",
+          attempted: ["GITHUB_TOKEN env"],
+          hint: "Run `gh auth login`",
+        }),
+    };
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry });
+
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "check-auth-request",
+      correlationId: "corr-car-3",
+      payload: {},
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+
+    expect(frames).toHaveLength(1);
+    const reply = frames[0]!;
+    expect(reply.kind).toBe("check-auth-response");
+    if (reply.kind === "check-auth-response") {
+      const githubRow = reply.payload.statuses.find((s) => s.adapterId === "github");
+      const claudeRow = reply.payload.statuses.find((s) => s.adapterId === "claude-cli");
+      expect(githubRow?.ok).toBe(false);
+      expect(githubRow?.hint).toContain("gh auth login");
+      expect(claudeRow?.ok).toBe(true);
     }
   });
 });
@@ -811,6 +956,7 @@ describe("dispatcher — legacy envelope backward compat (no adapter IDs)", () =
 
 describe("dispatcher — diff not included in wire frames (audit)", () => {
   it("diff bytes are never present in quiz-response payload", () => {
+    // Verify that the mapping from domain Quiz to wire QuestionDTO strips diff.
     const wirePayload = {
       quiz: {
         id: "quiz-1",

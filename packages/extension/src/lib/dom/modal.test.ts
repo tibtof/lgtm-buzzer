@@ -89,7 +89,7 @@ const fireQuizError = (
   doc: Document,
   requestId = "req-1",
   message = "host disconnected",
-  reason: "internal" | "missing-credentials" | "bad-credentials" = "internal",
+  reason: "internal" | "missing-credentials" = "internal",
 ): void => {
   const detail: QuizResultEventDetail = {
     requestId,
@@ -693,17 +693,17 @@ describe("createQuizModal — ADR-24 state machine", () => {
     document.removeEventListener(DOM_EVENTS.quizRetry, handler);
   });
 
-  // 7. Error bad-credentials → "Credentials rejected" + Open options CTA
-  it("7. bad-credentials error → 'Credentials rejected' title + Open options", () => {
+  // 7. Error missing-credentials → "Credentials required" + Open options CTA
+  it("7. missing-credentials error → 'Credentials required' title + Open options", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
-    fireQuizRequest(document, "req-bc");
-    fireQuizError(document, "req-bc", "rejected", "bad-credentials");
+    fireQuizRequest(document, "req-mc");
+    fireQuizError(document, "req-mc", "credentials not found", "missing-credentials");
 
     const shadow = getShadow(document)!;
     const title = shadow.querySelector(".error-title");
-    expect(title?.textContent).toBe("Credentials rejected");
+    expect(title?.textContent).toBe("Credentials required");
     expect(shadow.querySelector("[data-testid='lgtm-buzzer-configure-options']")).not.toBeNull();
   });
 

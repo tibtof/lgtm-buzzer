@@ -11,15 +11,21 @@
  *   ping                   → pong (echoes nonce + correlationId)
  *   error                  → warn + ignore (extension should not send error frames)
  *   list-adapters-request  → list-adapters-response (returns registered adapter IDs)
+ *   check-auth-request     → check-auth-response (per-adapter credential resolution status)
  *   quiz-request           → fetch diff, generate quiz, send quiz-response
  *   quiz-submit            → score submission, send quiz-result
  *   decode failure         → write ErrorFrame with reason "schema-violation"
  *
- * Adapter selection (ADR-22):
- *   Adapter IDs and credentials are supplied per-request in the quiz-request
- *   payload by the extension. The extension options page (#50) is the only
- *   supported credential source. No environment variables are used for
- *   adapter selection or authentication.
+ * Adapter selection (ADR-22 / ADR-29):
+ *   Adapter IDs are supplied per-request in the quiz-request payload by the
+ *   extension. Credentials are resolved host-side by the CredentialResolver —
+ *   the extension no longer stores or sends credentials.
+ *
+ *   Resolution chain (ADR-29 §Per-adapter resolver chain):
+ *     github:     GITHUB_TOKEN env → GH_TOKEN env → gh auth token CLI
+ *     ado:        AZURE_DEVOPS_EXT_PAT env → az account get-access-token CLI
+ *     claude-api: ANTHROPIC_API_KEY env
+ *     claude-cli / codex-cli / copilot-cli: CLI-managed (no host action needed)
  *
  *   Defaults (when fields are absent, preserving M2 behaviour):
  *     llmAdapterId → "claude-cli"
@@ -41,6 +47,7 @@ import type { DecodeError } from "./framing/errors.js";
 import { createSessionStore } from "./session-store.js";
 import { createDispatcher } from "./dispatcher.js";
 import { createDefaultAdapterRegistry } from "./registry.js";
+import { createDefaultCredentialResolver } from "./credentials/index.js";
 
 // ---------------------------------------------------------------------------
 // Decode-error helper
@@ -83,10 +90,19 @@ const main = async (): Promise<void> => {
   const write = createFrameWriter({ sink: process.stdout, logger });
   const store = createSessionStore();
 
-  // Construct the adapter registry once at startup (ADR-22).
+  // Construct the credential resolver once at startup (ADR-29).
+  // Each resolve() call is fresh — no caching. The resolver reads process.env
+  // at call time (not at construction time) so env changes after startup are
+  // picked up. Subprocess invocations are bounded to 5s each via spawnIO.
+  const resolver = createDefaultCredentialResolver({
+    env: process.env,
+    spawnIO,
+  });
+
+  // Construct the adapter registry once at startup (ADR-22 / ADR-29).
   // Adapter instances are built per-request inside the registry; the registry
   // itself holds no mutable state.
-  const registry = createDefaultAdapterRegistry({ spawnIO });
+  const registry = createDefaultAdapterRegistry({ spawnIO, resolver });
 
   const { dispatch } = createDispatcher({
     write,

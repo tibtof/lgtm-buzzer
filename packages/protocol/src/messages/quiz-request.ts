@@ -1,20 +1,21 @@
 import { z } from "zod";
 import { EnvelopeBase } from "../base.js";
 import { PRIdentifierSchema } from "./pr-identifier.js";
-import { CredentialsBagSchema } from "./credentials.js";
 
 /**
  * Zod schema for the quiz-request frame payload.
  *
  * @remarks
- * Contains `pr`, `questionCount`, and optional adapter selection + credentials fields
- * introduced by ADR-22. MUST NOT be extended with PR description, title, commits,
- * comments, or any other non-diff content without a dedicated ADR.
- * The diff-only invariant (CLAUDE.md §Key differentiator) is enforced at the type level.
+ * Contains `pr`, `questionCount`, and optional adapter selection fields.
+ * MUST NOT be extended with PR description, title, commits, comments, or any
+ * other non-diff content without a dedicated ADR.
+ * The diff-only invariant (CLAUDE.md §Key differentiator) is enforced at the
+ * type level.
  *
- * `credentials` carries user-supplied identity for VCS / LLM access. It is NOT
- * diff-derived and MUST be treated as sensitive: redacted in logs, never echoed in
- * error payloads. The host validates per-adapter shape in its registry layer.
+ * As of ADR-29, the `credentials` field is REMOVED from the wire format.
+ * Credentials are resolved host-side by the `CredentialResolver`. A stale
+ * extension that still sends a `credentials` field will have it silently
+ * ignored by the host (zod passthrough default).
  */
 export const QuizRequestPayloadSchema = z.object({
   pr: PRIdentifierSchema,
@@ -30,16 +31,14 @@ export const QuizRequestPayloadSchema = z.object({
    * Stable VCS adapter ID.
    *
    * Optional — when absent the host defaults to `"github"` (M2 behaviour preserved).
+   * As of ADR-29, the service worker infers this from `pr.kind`; the host default
+   * acts as a belt-and-suspenders fallback.
    * Minimum length 1 to reject empty strings.
    */
   vcsAdapterId: z.string().min(1).optional(),
-  /**
-   * Per-adapter credentials bag. Validated by the host's registry per adapter ID.
-   *
-   * SECURITY: MUST NOT appear in logs or error payloads. The host's ADR-6 REDACT_PATHS
-   * list censors `payload.credentials`, `*.credentials`, `*.apiKey`, `*.pat`.
-   */
-  credentials: CredentialsBagSchema.optional(),
+  // REMOVED (ADR-29): credentials field. Credentials are resolved host-side.
+  // Stale extensions that still send credentials have them silently ignored
+  // (zod passthrough). The host dispatcher never reads payload.credentials.
 });
 
 /** Payload of a quiz-request frame. */

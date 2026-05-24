@@ -10,6 +10,10 @@ const VALID_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal", "silen
  * ADR-6 §Constraint 4: existing diff/prompt redactions.
  * ADR-22 §Logger redaction: credential paths added — `credentials`, `apiKey`,
  * `pat`, `token`, `x-api-key` on any nesting level.
+ * ADR-29 §Resolver redaction: `secret` added — the resolved credential value
+ * returned by `CredentialResolver` is logged at the resolver level only as
+ * `{ adapterId, hit: boolean, via: "..." }`. The raw secret must never appear
+ * in any log line; `*.secret` and `secret` paths cover the resolver output.
  */
 const REDACT_PATHS: readonly string[] = [
   // ADR-6: diff and prompt paths
@@ -45,6 +49,9 @@ const REDACT_PATHS: readonly string[] = [
   "*.pat",
   "*.token",
   "*.x-api-key",
+  // ADR-29: resolver output — the resolved secret must never appear in logs.
+  "secret",
+  "*.secret",
 ];
 
 /** Options accepted by {@link createPinoLogger}. */

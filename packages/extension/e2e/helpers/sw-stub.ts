@@ -29,9 +29,10 @@ export type CannedCorrectAnswers = Readonly<Record<string, string>>;
 /**
  * The wire-level error reason values the stub can return.
  * Mirrors `ErrorReason` in `@lgtm-buzzer/protocol`.
+ *
+ * ADR-29: `"bad-credentials"` was removed from the protocol.
  */
 export type WireErrorReason =
-  | "bad-credentials"
   | "missing-credentials"
   | "internal"
   | "unsupported-llm-adapter"
@@ -45,7 +46,8 @@ export type WireErrorReason =
  * - `error-on-quiz-request` — quiz-request → ErrorFrame with the given reason.
  * - `list-adapters` — list-adapters-request → list-adapters-response; other frames → error.
  * - `list-adapters-then-happy` — list-adapters succeeds; quiz flow also works.
- * - `probe-bad-credentials` — list-adapters succeeds; ping → ErrorFrame bad-credentials.
+ * - `probe-missing-credentials` — list-adapters succeeds; ping → ErrorFrame missing-credentials.
+ *   ADR-29: `probe-bad-credentials` removed; replaced by `probe-missing-credentials`.
  */
 export type StubScenario =
   | {
@@ -76,7 +78,7 @@ export type StubScenario =
       readonly correctAnswers: CannedCorrectAnswers;
     }
   | {
-      readonly kind: "probe-bad-credentials";
+      readonly kind: "probe-missing-credentials";
       readonly llm: readonly string[];
       readonly vcs: readonly string[];
     };
@@ -299,7 +301,7 @@ export const buildSwStubScript = (scenario: StubScenario): string => {
       `);
     }
 
-    case "probe-bad-credentials": {
+    case "probe-missing-credentials": {
       const llmJson = JSON.stringify(scenario.llm);
       const vcsJson = JSON.stringify(scenario.vcs);
       return makeStubScript(scenario.kind, PROTOCOL_VERSION, `
@@ -316,7 +318,7 @@ export const buildSwStubScript = (scenario: StubScenario): string => {
               return { v: PROTOCOL_VERSION, kind: 'list-adapters-response', correlationId: cid,
                 payload: { llm: LLM_ADAPTERS, vcs: VCS_ADAPTERS } };
             case 'ping':
-              return makeErrorFrame(cid, 'bad-credentials', 'Credentials rejected by the adapter');
+              return makeErrorFrame(cid, 'missing-credentials', 'Run gh auth login');
             default:
               return makeErrorFrame(cid, 'internal', 'SW stub: scenario does not handle this kind');
           }

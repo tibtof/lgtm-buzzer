@@ -155,6 +155,33 @@ describe("createPinoLogger", () => {
       expect(out).not.toContain("APIKEY_SECRET_VALUE");
       expect(out).toContain("[Redacted]");
     });
+
+    // ADR-29: resolver output — *.secret and secret paths are redacted.
+    it("5h. { resolved: { secret: 'SECRET_xxx' } } — secret redacted (ADR-29)", async () => {
+      const { stream, output } = makeCapture();
+      const logger = createPinoLogger({ destination: stream });
+
+      logger.info("resolver output", { resolved: { secret: "SECRET_RESOLVER_VALUE", detail: "via gh CLI" } });
+      await flush();
+
+      const out = output();
+      expect(out).not.toContain("SECRET_RESOLVER_VALUE");
+      expect(out).toContain("[Redacted]");
+    });
+
+    it("5i. detail field in resolver output is NOT redacted (only secret is)", async () => {
+      const { stream, output } = makeCapture();
+      const logger = createPinoLogger({ destination: stream });
+
+      logger.info("resolver detail visible", { resolved: { secret: "SECRET_X", detail: "via gh CLI" } });
+      await flush();
+
+      const out = output();
+      // detail should be visible (it's a step label, not a secret)
+      expect(out).toContain("via gh CLI");
+      // but secret must be redacted
+      expect(out).not.toContain("SECRET_X");
+    });
   });
 
   describe("4. level resolution from env", () => {

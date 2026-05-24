@@ -8,20 +8,19 @@ const BASE = {
 };
 
 describe("ErrorFrameSchema", () => {
-  const reasons = [
+  // ADR-29: "bad-credentials" is REMOVED from the enum.
+  const validReasons = [
     "schema-violation",
     "unknown-message",
     "version-mismatch",
     "internal",
     "unknown-quiz-id",
-    // ADR-22: adapter registry errors
     "unsupported-llm-adapter",
     "unsupported-vcs-adapter",
-    "bad-credentials",
     "missing-credentials",
   ] as const;
 
-  for (const reason of reasons) {
+  for (const reason of validReasons) {
     it(`parses a well-formed error frame with reason "${reason}"`, () => {
       const result = ErrorFrameSchema.safeParse({
         ...BASE,
@@ -33,6 +32,14 @@ describe("ErrorFrameSchema", () => {
       }
     });
   }
+
+  it("rejects an error frame with reason 'bad-credentials' (removed in ADR-29)", () => {
+    const result = ErrorFrameSchema.safeParse({
+      ...BASE,
+      payload: { reason: "bad-credentials", message: "bad creds" },
+    });
+    expect(result.success).toBe(false);
+  });
 
   it("rejects an error frame with an unknown reason", () => {
     const result = ErrorFrameSchema.safeParse({

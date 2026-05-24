@@ -1,17 +1,26 @@
 import { z } from "zod";
 import { EnvelopeBase } from "../base.js";
 
-/** Zod schema for the structured error reason enum. */
+/**
+ * Zod schema for the structured error reason enum.
+ *
+ * @remarks
+ * `"bad-credentials"` was removed in ADR-29. The host no longer validates
+ * per-adapter credential bags from the wire — credentials are resolved
+ * host-side. The `"missing-credentials"` reason remains for the case where
+ * the host's `CredentialResolver` cannot obtain a credential (e.g., env var
+ * absent and CLI not authenticated).
+ */
 export const ErrorReasonSchema = z.enum([
   "schema-violation",
   "unknown-message",
   "version-mismatch",
   "internal",
   "unknown-quiz-id",
-  // new in ADR-22: adapter registry errors
+  // adapter registry errors
   "unsupported-llm-adapter",
   "unsupported-vcs-adapter",
-  "bad-credentials",
+  // REMOVED (ADR-29): "bad-credentials" — no wire credential bag to validate.
   "missing-credentials",
 ]);
 
