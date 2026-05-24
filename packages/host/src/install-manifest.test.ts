@@ -2,7 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildManifest, pickHostBinaryPath, renderManifestTemplate } from "./install-manifest.js";
+import {
+  buildManifest,
+  pickHostBinaryPath,
+  renderManifestTemplate,
+  renderNodeWrapper,
+} from "./install-manifest.js";
 import type { BuildManifestInput } from "./install-manifest.js";
 
 const baseInput: BuildManifestInput = {
@@ -200,5 +205,44 @@ describe("pickHostBinaryPath dual-layout", () => {
     // pass to fs/exec which will surface the real error. Verifies the empty
     // tmpdir path is the bundled fallback (predictable).
     expect(pickHostBinaryPath(tmpDir)).toBe(path.join(tmpDir, "index.js"));
+  });
+});
+
+describe("renderNodeWrapper", () => {
+  it("emits a POSIX shell script with shebang, exec, and absolute paths", () => {
+    const script = renderNodeWrapper({
+      nodePath: "/Users/test/.nvm/versions/node/v22.22.0/bin/node",
+      jsEntryPath: "/Users/test/workspace/host/dist/cli.js",
+    });
+    expect(script.startsWith("#!/bin/sh\n")).toBe(true);
+    expect(script).toContain("NODE='/Users/test/.nvm/versions/node/v22.22.0/bin/node'");
+    expect(script).toContain("exec \"$NODE\" '/Users/test/workspace/host/dist/cli.js' \"$@\"");
+  });
+
+  it("falls back to PATH discovery when the captured node is gone", () => {
+    const script = renderNodeWrapper({
+      nodePath: "/missing/node",
+      jsEntryPath: "/abs/cli.js",
+    });
+    expect(script).toContain('if [ ! -x "$NODE" ]; then');
+    expect(script).toContain("command -v node");
+    expect(script).toContain('exit 127');
+  });
+
+  it("escapes paths containing single quotes", () => {
+    const script = renderNodeWrapper({
+      nodePath: "/weird/node",
+      jsEntryPath: "/has'quote/cli.js",
+    });
+    // The shell `'\''` idiom: close quote, escaped quote, re-open quote.
+    expect(script).toContain("/has'\\''quote/cli.js");
+  });
+
+  it("escapes paths containing spaces (macOS Application Support path)", () => {
+    const script = renderNodeWrapper({
+      nodePath: "/usr/local/bin/node",
+      jsEntryPath: "/Users/test/Application Support/host/cli.js",
+    });
+    expect(script).toContain("'/Users/test/Application Support/host/cli.js'");
   });
 });
