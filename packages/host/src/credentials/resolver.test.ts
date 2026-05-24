@@ -273,6 +273,78 @@ describe("resolver — CLI-managed adapters", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Wall-clock timeout regression tests
+// ---------------------------------------------------------------------------
+
+describe("resolver — wall-clock timeout (regression: graceMs is not a wall-clock budget)", () => {
+  /**
+   * Builds a spawnIO fake that returns an IO that NEVER resolves, simulating
+   * a hung CLI invocation (e.g. `gh auth token` waiting for SSO or keychain).
+   *
+   * The IO is constructed with IO.cancellable so that when io.timeout() fires
+   * the AbortSignal it can resolve immediately on abort — but for this test
+   * the point is that without IO.timeout the resolver would block indefinitely.
+   */
+  const makeHungSpawnIO = (): ResolverDeps["spawnIO"] => {
+    return (): IO<SpawnError, SpawnOutput> =>
+      IO.cancellable<SpawnError, SpawnOutput>(
+        () => new Promise<SpawnOutput>(() => {}),
+        (): SpawnError => ({ kind: "spawn-failed", reason: "never" }),
+      );
+  };
+
+  it("github: hung gh CLI resolves within wall-clock budget (5s timeout + slop)", async () => {
+    // Use a short timeout so the test runs fast, but long enough to distinguish
+    // from an immediate failure. With IO.timeout wired, the resolver must
+    // resolve within timeoutMs + CLI_GRACE_MS (500ms) + test slop (200ms).
+    const timeoutMs = 200;
+    const slop = 700; // > CLI_GRACE_MS (500) + executor overhead
+    const resolver = createDefaultCredentialResolver({
+      env: {},
+      spawnIO: makeHungSpawnIO(),
+      subprocessTimeoutMs: timeoutMs,
+    });
+
+    const start = Date.now();
+    const result = await resolver.resolve("github").unsafeRun();
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeLessThan(timeoutMs + slop);
+    expect(result.type).toBe("Err");
+    if (result.type === "Err") {
+      expect(result.error.kind).toBe("missing-credential");
+      expect(result.error.adapterId).toBe("github");
+      // The hint must mention the timeout, not the generic "gh auth login" message.
+      expect(result.error.hint).toContain("timed out after");
+      expect(result.error.hint).toContain(`${timeoutMs}ms`);
+    }
+  });
+
+  it("ado: hung az CLI resolves within wall-clock budget (5s timeout + slop)", async () => {
+    const timeoutMs = 200;
+    const slop = 700;
+    const resolver = createDefaultCredentialResolver({
+      env: {},
+      spawnIO: makeHungSpawnIO(),
+      subprocessTimeoutMs: timeoutMs,
+    });
+
+    const start = Date.now();
+    const result = await resolver.resolve("ado").unsafeRun();
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeLessThan(timeoutMs + slop);
+    expect(result.type).toBe("Err");
+    if (result.type === "Err") {
+      expect(result.error.kind).toBe("missing-credential");
+      expect(result.error.adapterId).toBe("ado");
+      expect(result.error.hint).toContain("timed out after");
+      expect(result.error.hint).toContain(`${timeoutMs}ms`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Unknown adapter
 // ---------------------------------------------------------------------------
 

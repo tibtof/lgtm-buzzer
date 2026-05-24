@@ -75,34 +75,64 @@ const tryEnv = (
 };
 
 /**
- * Run an external CLI via spawnIO with a bounded timeout.
+ * Run an external CLI via spawnIO with a bounded wall-clock timeout.
  *
  * Returns `Right<{hit, via}>` when the process exits 0 and stdout is non-empty
  * after trimming. Returns `Left<undefined>` on any failure (non-zero exit,
- * spawn error, timeout, empty stdout) — the caller advances the chain.
+ * spawn error, empty stdout) or `Left<{timedOut: true; timeoutMs: number}>`
+ * when the wall-clock budget expires so the caller can surface a diagnostic hint.
  *
  * BINDING: the returned `hit` is the raw secret; it MUST NOT appear in
  * `via`, `attempted`, or `hint`. Only the step label appears in those fields.
+ *
+ * Implementation note: `graceMs` (500 ms) governs SIGTERM → SIGKILL; `timeoutMs`
+ * is the independent wall-clock budget enforced via `io.timeout()`. When
+ * `io.timeout()` fires it cancels the inner IO, which triggers the SIGTERM →
+ * SIGKILL sequence in `spawnIO`. Total worst-case elapsed time is therefore
+ * `timeoutMs + graceMs` (≈ 5.5 s by default), well under the 60 s host watchdog.
  */
+const CLI_GRACE_MS = 500;
+
+type CliTimedOut = { readonly timedOut: true; readonly timeoutMs: number };
+type CliMiss = undefined | CliTimedOut;
+
+/** Narrow `SpawnError | CliMiss` down to `CliMiss` for the foldM error branch. */
+const toCliMiss = (err: unknown): CliMiss => {
+  if (
+    err !== null &&
+    typeof err === "object" &&
+    (err as { timedOut?: unknown }).timedOut === true
+  ) {
+    return err as CliTimedOut;
+  }
+  // Any SpawnError variant → treat as normal miss (undefined).
+  return undefined;
+};
+
 const tryCli = (
   spawnIO: ResolverDeps["spawnIO"],
   bin: string,
   args: ReadonlyArray<string>,
   timeoutMs: number,
   via: string,
-): IO<undefined, { hit: string; via: string }> => {
-  const runSpawn = spawnIO(bin, args, undefined, { graceMs: timeoutMs });
+): IO<CliMiss, { hit: string; via: string }> => {
+  const runSpawn = spawnIO(bin, args, undefined, { graceMs: CLI_GRACE_MS });
 
-  // We race the spawn against a timeout using IO.lift wrapping the result.
-  // spawnIO already supports timeout/cancellation via its graceMs option.
-  return runSpawn.foldM(
-    // Any spawn error → miss
-    (): IO<undefined, { hit: string; via: string }> =>
-      IO.fail<undefined, { hit: string; via: string }>(undefined),
-    (output): IO<undefined, { hit: string; via: string }> => {
+  // Apply wall-clock budget via io.timeout(). When the budget expires, the
+  // inner IO is cancelled — spawnIO's AbortSignal fires (SIGTERM → SIGKILL
+  // after CLI_GRACE_MS). The timeout error propagates as Left<CliTimedOut> so
+  // callers can distinguish a hung CLI from a normal miss and emit a
+  // diagnostic hint instead of a generic "not found" message.
+  const withTimeout = runSpawn.timeout(timeoutMs, (): CliTimedOut => ({ timedOut: true, timeoutMs }));
+
+  return withTimeout.foldM(
+    // SpawnError OR CliTimedOut → narrow to CliMiss and propagate
+    (err): IO<CliMiss, { hit: string; via: string }> =>
+      IO.fail<CliMiss, { hit: string; via: string }>(toCliMiss(err)),
+    (output): IO<CliMiss, { hit: string; via: string }> => {
       const trimmed = output.stdout.trim();
       if (output.exitCode !== 0 || trimmed.length === 0) {
-        return IO.fail<undefined, { hit: string; via: string }>(undefined);
+        return IO.fail<CliMiss, { hit: string; via: string }>(undefined);
       }
       return IO.pure({ hit: trimmed, via });
     },
@@ -136,13 +166,18 @@ const resolveGitHub = (
 
   // Step 2: gh auth token CLI
   return tryCli(spawnIO, "gh", ["auth", "token"], timeoutMs, "gh CLI").foldM(
-    (): IO<ResolverError, ResolvedCredential> =>
-      IO.fail<ResolverError, ResolvedCredential>({
+    (err): IO<ResolverError, ResolvedCredential> => {
+      const hint =
+        err !== undefined && err.timedOut
+          ? `\`gh auth token\` timed out after ${err.timeoutMs}ms — is the CLI hanging?`
+          : "Run `gh auth login` or export GITHUB_TOKEN";
+      return IO.fail<ResolverError, ResolvedCredential>({
         kind: "missing-credential",
         adapterId: "github",
         attempted,
-        hint: "Run `gh auth login` or export GITHUB_TOKEN",
-      }),
+        hint,
+      });
+    },
     (result): IO<ResolverError, ResolvedCredential> =>
       IO.pure<ResolvedCredential>({ secret: result.hit, detail: `via ${result.via}` }),
   );
@@ -178,13 +213,18 @@ const resolveAdo = (
   ] as const;
 
   return tryCli(spawnIO, "az", azArgs, timeoutMs, "az CLI").foldM(
-    (): IO<ResolverError, ResolvedCredential> =>
-      IO.fail<ResolverError, ResolvedCredential>({
+    (err): IO<ResolverError, ResolvedCredential> => {
+      const hint =
+        err !== undefined && err.timedOut
+          ? `\`az account get-access-token\` timed out after ${err.timeoutMs}ms — is the CLI hanging?`
+          : "Run `az login` or export AZURE_DEVOPS_EXT_PAT";
+      return IO.fail<ResolverError, ResolvedCredential>({
         kind: "missing-credential",
         adapterId: "ado",
         attempted,
-        hint: "Run `az login` or export AZURE_DEVOPS_EXT_PAT",
-      }),
+        hint,
+      });
+    },
     (result): IO<ResolverError, ResolvedCredential> =>
       IO.pure<ResolvedCredential>({ secret: result.hit, detail: `via ${result.via}` }),
   );
