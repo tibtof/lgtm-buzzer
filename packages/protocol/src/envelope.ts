@@ -4,6 +4,7 @@ import { PongFrameSchema } from "./messages/pong.js";
 import { ErrorFrameSchema } from "./messages/error.js";
 import { QuizRequestFrameSchema } from "./messages/quiz-request.js";
 import { QuizResponseFrameSchema } from "./messages/quiz-response.js";
+import { QuizResampleRequestFrameSchema } from "./messages/quiz-resample-request.js";
 import { QuizSubmitFrameSchema } from "./messages/quiz-submit.js";
 import { QuizResultFrameSchema } from "./messages/quiz-result.js";
 import { ListAdaptersRequestFrameSchema } from "./messages/list-adapters-request.js";
@@ -20,6 +21,7 @@ export const FrameSchema = z.discriminatedUnion("kind", [
   ErrorFrameSchema,
   QuizRequestFrameSchema,
   QuizResponseFrameSchema,
+  QuizResampleRequestFrameSchema,
   QuizSubmitFrameSchema,
   QuizResultFrameSchema,
   ListAdaptersRequestFrameSchema,

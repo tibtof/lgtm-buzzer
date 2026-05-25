@@ -1,4 +1,5 @@
 import type { Frame } from "@lgtm-buzzer/protocol";
+import { RESAMPLE_FAILED_PREFIX } from "@lgtm-buzzer/protocol";
 import type { PRIdentifier } from "@lgtm-buzzer/core";
 import {
   DOM_EVENTS,
@@ -7,6 +8,7 @@ import {
   QuizRetryEventDetailSchema,
   emitDOMEvent,
   addDOMEventListener,
+  type QuizRetryEventDetail,
 } from "./dom-events.js";
 import type { StatsStore } from "../stats/store.js";
 
@@ -248,16 +250,32 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   };
 
   /**
-   * Handles the SW response to a `quiz-request` frame.
+   * Handles the SW response to a `quiz-request` or `quiz-resample-request` frame.
+   *
+   * @param requestId - The request identifier for the pending approve.
+   * @param reply - The frame received from the SW.
+   * @param viaResample - When `true`, the reply came from a `quiz-resample-request`.
+   *   In that case, `stats.recordGeneration` is NOT called because no LLM invocation
+   *   occurred — recording a near-zero resample duration would skew the rolling median.
+   *   ADR-30 §Stats interaction.
    */
-  const handleQuizRequestReply = (requestId: string, reply: Frame): void => {
+  const handleQuizRequestReply = (
+    requestId: string,
+    reply: Frame,
+    viaResample = false,
+  ): void => {
     if (reply.kind === "quiz-response") {
-      // Record generation duration for stats.
-      const startMs = generationStartTimes.get(requestId);
-      generationStartTimes.delete(requestId);
-      if (stats !== undefined && startMs !== undefined) {
-        const durationMs = Date.now() - startMs;
-        void stats.recordGeneration(adapterId, durationMs);
+      // Record generation duration for stats — only for real LLM calls (not resamples).
+      if (!viaResample) {
+        const startMs = generationStartTimes.get(requestId);
+        generationStartTimes.delete(requestId);
+        if (stats !== undefined && startMs !== undefined) {
+          const durationMs = Date.now() - startMs;
+          void stats.recordGeneration(adapterId, durationMs);
+        }
+      } else {
+        // Clean up the start-time entry even for resamples (it was set for timing).
+        generationStartTimes.delete(requestId);
       }
 
       emitResult(requestId, { kind: "quiz-ready", quiz: reply.payload.quiz });
@@ -385,6 +403,10 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
           ? { kind: "github", owner: p.pr.owner, repo: p.pr.repo, number: p.pr.number }
           : { kind: "ado", org: p.pr.org, project: p.pr.project, repo: p.pr.repo, pullRequestId: p.pr.pullRequestId },
         questionCount: 5,
+        // ADR-30: request a pool of 20 questions; host samples 5 from cache on hits.
+        // Old hosts ignore this unknown optional field (zod passthrough). New extension +
+        // old host → host returns a normal single quiz; resample falls back to fresh request.
+        questionPoolSize: 20,
       },
     };
 
@@ -479,6 +501,106 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   };
 
   // ---------------------------------------------------------------------------
+  // quiz-resample helper (ADR-30)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Sends a `quiz-resample-request` frame to the SW and routes the reply.
+   *
+   * If the host rejects the frame with `unknown-message` (old host) or returns
+   * an error message starting with `RESAMPLE_FAILED_PREFIX` (pool evicted /
+   * unknown quiz), falls back to a fresh `sendQuizRequest`. Any other error is
+   * propagated to the modal.
+   *
+   * `stats.recordGeneration` is NOT called for resample replies (ADR-30 §7).
+   *
+   * @param requestId - The request ID for the current pending approve.
+   * @param p - The pending approve state.
+   * @param correlationId - Fresh correlation ID for the resample frame.
+   * @param failedQuizId - The quizId from the failed/errored quiz-response.
+   */
+  const sendQuizResampleRequest = async (
+    requestId: string,
+    p: PendingApprove,
+    correlationId: string,
+    failedQuizId: string,
+  ): Promise<void> => {
+    // Record a start time (for potential timing diagnostics); NOT counted in stats.
+    generationStartTimes.set(requestId, Date.now());
+
+    const frame: Frame = {
+      v: 1,
+      kind: "quiz-resample-request",
+      correlationId,
+      payload: { quizId: failedQuizId, questionCount: 5 },
+    };
+
+    let reply: Frame;
+    try {
+      reply = await sendFrame(frame);
+    } catch (err) {
+      reply = makeSyntheticErrorFrame(correlationId, `sendFrame threw: ${String(err)}`);
+    }
+
+    // Validate SW reply shape.
+    const csResponse = CSResponseSchema.safeParse({ kind: "frame", frame: reply });
+    if (!csResponse.success) {
+      handleQuizRequestReply(
+        requestId,
+        makeSyntheticErrorFrame(correlationId, "invalid SW response"),
+        true,
+      );
+      return;
+    }
+
+    // Check if pending was dropped while awaiting.
+    if (!pending.has(requestId)) {
+      logger?.warn("[lgtm-buzzer:cs] quiz-resample-request reply arrived after cancel — dropped", {
+        requestId,
+        kind: reply.kind,
+      });
+      return;
+    }
+
+    // Happy path: got a quiz-response from the resample.
+    if (reply.kind === "quiz-response") {
+      handleQuizRequestReply(requestId, reply, true /* viaResample — do not count in stats */);
+      return;
+    }
+
+    // Fallback detection: old host returns unknown-message; pool-evicted / unknown-quiz
+    // returns internal error with RESAMPLE_FAILED_PREFIX.
+    if (reply.kind === "error") {
+      const isUnknownMessage = reply.payload.reason === "unknown-message";
+      const isResampleFailed =
+        reply.payload.reason === "internal" &&
+        reply.payload.message.startsWith(RESAMPLE_FAILED_PREFIX);
+
+      if (isUnknownMessage || isResampleFailed) {
+        // Fallback: send a fresh quiz-request. The user sees one generating spinner.
+        logger?.warn("[lgtm-buzzer:cs] quiz-resample-request fell back to fresh quiz-request", {
+          reason: reply.payload.reason,
+          message: reply.payload.message,
+        });
+        const freshCorrelationId = newCorrelationId();
+        await sendQuizRequest(requestId, p, freshCorrelationId);
+        return;
+      }
+
+      // Any other error — propagate to the modal as usual.
+      handleQuizRequestReply(requestId, reply, true);
+      return;
+    }
+
+    // Unexpected frame kind.
+    handleQuizRequestReply(
+      requestId,
+      makeSyntheticErrorFrame(correlationId, `Unexpected reply kind: ${reply.kind}`),
+      true,
+    );
+  };
+
+  // ---------------------------------------------------------------------------
   // Quiz-cancel handler (modal → CS)
   // ---------------------------------------------------------------------------
 
@@ -504,8 +626,8 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
    * A new `requestId` and `correlationId` are allocated in all cases so the
    * modal and correlation map stay consistent.
    */
-  const onQuizRetry = (detail: { requestId: string }): void => {
-    const { requestId: oldRequestId } = detail;
+  const onQuizRetry = (detail: QuizRetryEventDetail): void => {
+    const { requestId: oldRequestId, quizId: failedQuizId } = detail;
 
     // The old pending entry is usually already dropped by the error handler.
     // If somehow it is still alive, preserve the blocked event.
@@ -560,7 +682,12 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     });
 
     // Kick off the async frame round-trip.
-    void sendQuizRequest(freshRequestId, freshPending, correlationId);
+    // ADR-30: if we have the quizId of the failed quiz, try resample first.
+    if (failedQuizId !== undefined) {
+      void sendQuizResampleRequest(freshRequestId, freshPending, correlationId, failedQuizId);
+    } else {
+      void sendQuizRequest(freshRequestId, freshPending, correlationId);
+    }
   };
 
   // ---------------------------------------------------------------------------

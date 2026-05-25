@@ -36,6 +36,14 @@ export const QuizRequestPayloadSchema = z.object({
    * Minimum length 1 to reject empty strings.
    */
   vcsAdapterId: z.string().min(1).optional(),
+  /**
+   * Optional question pool size. When present, the host generates a pool of
+   * this many questions on cache miss and samples `questionCount` from it for
+   * the reply. When absent, the host runs legacy single-quiz behaviour: no
+   * pool, no cache, no resample support. Must be >= questionCount.
+   * Capped at 50 to bound per-pool LLM cost. ADR-30.
+   */
+  questionPoolSize: z.number().int().min(1).max(50).optional(),
   // REMOVED (ADR-29): credentials field. Credentials are resolved host-side.
   // Stale extensions that still send credentials have them silently ignored
   // (zod passthrough). The host dispatcher never reads payload.credentials.

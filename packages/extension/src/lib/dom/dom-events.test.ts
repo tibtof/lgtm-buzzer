@@ -262,9 +262,23 @@ describe("QuizCancelEventDetailSchema", () => {
 });
 
 describe("QuizRetryEventDetailSchema", () => {
-  it("accepts a valid retry detail", () => {
+  it("accepts a valid retry detail without quizId (legacy path)", () => {
     const result = QuizRetryEventDetailSchema.safeParse({ requestId: "req-retry-1" });
     expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.quizId).toBeUndefined();
+    }
+  });
+
+  it("accepts a valid retry detail with quizId (resample path, ADR-30)", () => {
+    const result = QuizRetryEventDetailSchema.safeParse({
+      requestId: "req-retry-2",
+      quizId: "quiz-abc-123",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.quizId).toBe("quiz-abc-123");
+    }
   });
 
   it("rejects missing requestId", () => {
@@ -274,6 +288,11 @@ describe("QuizRetryEventDetailSchema", () => {
 
   it("rejects empty requestId", () => {
     const result = QuizRetryEventDetailSchema.safeParse({ requestId: "" });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects empty quizId when provided", () => {
+    const result = QuizRetryEventDetailSchema.safeParse({ requestId: "req-retry-3", quizId: "" });
     expect(result.success).toBe(false);
   });
 });

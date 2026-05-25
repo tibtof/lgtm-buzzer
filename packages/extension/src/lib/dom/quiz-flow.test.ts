@@ -13,6 +13,7 @@ import {
   type QuizResultEventDetail,
   type QuizRequestEventDetail,
 } from "./dom-events.js";
+import type { StatsStore } from "../stats/store.js";
 
 // ---------------------------------------------------------------------------
 // Helpers / fakes
@@ -1172,5 +1173,217 @@ describe("createQuizFlowController", () => {
     expect(sendFrame).not.toHaveBeenCalled();
 
     disposeResult();
+  });
+
+  // -------------------------------------------------------------------------
+  // ADR-30: questionPoolSize included in initial quiz-request
+  // -------------------------------------------------------------------------
+
+  it("ADR-30: initial quiz-request includes questionPoolSize: 20", async () => {
+    const sentFrames: Frame[] = [];
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      sentFrames.push(frame);
+      return makeQuizResponseFrame(frame.correlationId ?? "c");
+    });
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    fireSubmit(form);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+
+    const quizRequests = sentFrames.filter((f) => f.kind === "quiz-request");
+    expect(quizRequests).toHaveLength(1);
+    const req = quizRequests[0]!;
+    if (req.kind === "quiz-request") {
+      expect(req.payload.questionPoolSize).toBe(20);
+      expect(req.payload.questionCount).toBe(5);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // ADR-30: retry sends quiz-resample-request when quizId is known
+  // -------------------------------------------------------------------------
+
+  it("ADR-30: retry sends quiz-resample-request when quizId is present in event", async () => {
+    const sentFrames: Frame[] = [];
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      sentFrames.push(frame);
+      const cid = frame.correlationId ?? "c";
+      if (frame.kind === "quiz-request") {
+        return makeQuizResponseFrame(cid, "quiz-original");
+      }
+      if (frame.kind === "quiz-resample-request") {
+        return makeQuizResponseFrame(cid, "quiz-resampled");
+      }
+      return makeErrorFrame(cid);
+    });
+
+    const { events: resultEvents, dispose: disposeResult } = collectResultEvents();
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    // 1. Trigger initial approve.
+    fireSubmit(form);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+
+    // 2. Simulate the modal failing (result events drive the retry flow).
+    // Emit quiz-retry with a quizId to simulate the modal emitting after a failure.
+    const reqEvent = document.createEvent("CustomEvent") as CustomEvent;
+    (reqEvent as unknown as { initCustomEvent: (...args: unknown[]) => void }).initCustomEvent(
+      DOM_EVENTS.quizRetry,
+      false,
+      false,
+      { requestId: "req-1", quizId: "quiz-original" },
+    );
+    document.dispatchEvent(reqEvent);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+
+    // 3. Verify a quiz-resample-request was sent.
+    const resamples = sentFrames.filter((f) => f.kind === "quiz-resample-request");
+    expect(resamples.length).toBeGreaterThanOrEqual(1);
+    const resample = resamples[0]!;
+    if (resample.kind === "quiz-resample-request") {
+      expect(resample.payload.quizId).toBe("quiz-original");
+      expect(resample.payload.questionCount).toBe(5);
+    }
+
+    // 4. Verify a quiz-ready result was emitted (from the resample response).
+    const readyEvents = resultEvents.filter((e) => e.outcome.kind === "quiz-ready");
+    expect(readyEvents.length).toBeGreaterThanOrEqual(1);
+
+    disposeResult();
+  });
+
+  // -------------------------------------------------------------------------
+  // ADR-30: retry falls back to fresh quiz-request on unknown-message
+  // -------------------------------------------------------------------------
+
+  it("ADR-30: retry falls back to fresh quiz-request when resample returns unknown-message", async () => {
+    const sentFrames: Frame[] = [];
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      sentFrames.push(frame);
+      const cid = frame.correlationId ?? "c";
+      if (frame.kind === "quiz-request") {
+        return makeQuizResponseFrame(cid, "quiz-fresh");
+      }
+      if (frame.kind === "quiz-resample-request") {
+        // Simulate old host that returns unknown-message.
+        return {
+          v: 1,
+          kind: "error",
+          correlationId: cid,
+          payload: { reason: "unknown-message", message: "quiz-resample-request not supported" },
+        };
+      }
+      return makeErrorFrame(cid);
+    });
+
+    const { events: resultEvents, dispose: disposeResult } = collectResultEvents();
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    // Fire quiz-retry with quizId (triggers resample attempt).
+    const reqEvent = document.createEvent("CustomEvent") as CustomEvent;
+    (reqEvent as unknown as { initCustomEvent: (...args: unknown[]) => void }).initCustomEvent(
+      DOM_EVENTS.quizRetry,
+      false,
+      false,
+      { requestId: "req-999", quizId: "quiz-old" },
+    );
+    document.dispatchEvent(reqEvent);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 30); });
+
+    // Should have fallen back to quiz-request.
+    const quizRequests = sentFrames.filter((f) => f.kind === "quiz-request");
+    expect(quizRequests.length).toBeGreaterThanOrEqual(1);
+
+    // Should have gotten a quiz-ready result via the fallback.
+    const readyEvents = resultEvents.filter((e) => e.outcome.kind === "quiz-ready");
+    expect(readyEvents.length).toBeGreaterThanOrEqual(1);
+
+    disposeResult();
+  });
+
+  // -------------------------------------------------------------------------
+  // ADR-30: stats.recordGeneration is NOT called for resample replies
+  // -------------------------------------------------------------------------
+
+  it("ADR-30: stats.recordGeneration not called when resample succeeds", async () => {
+    const generationCalls: Array<{ adapterId: string; durationMs: number }> = [];
+    const mockStats: StatsStore = {
+      recordGeneration: async (id, ms) => { generationCalls.push({ adapterId: id, durationMs: ms }); },
+      recordQuiz: async () => {},
+      getMedianGenerationMs: async () => null,
+      getRecentPassRate: async () => null,
+    };
+
+    const sentFrames: Frame[] = [];
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      sentFrames.push(frame);
+      const cid = frame.correlationId ?? "c";
+      if (frame.kind === "quiz-request") {
+        return makeQuizResponseFrame(cid, "quiz-init");
+      }
+      if (frame.kind === "quiz-resample-request") {
+        return makeQuizResponseFrame(cid, "quiz-resampled");
+      }
+      return makeErrorFrame(cid);
+    });
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
+      stats: mockStats,
+    });
+    controller.start();
+
+    // Initial approve → should record generation.
+    fireSubmit(form);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+    expect(generationCalls).toHaveLength(1);
+
+    const prevCount = generationCalls.length;
+
+    // Retry with quizId → resample → should NOT record generation.
+    const retryEvent = document.createEvent("CustomEvent") as CustomEvent;
+    (retryEvent as unknown as { initCustomEvent: (...args: unknown[]) => void }).initCustomEvent(
+      DOM_EVENTS.quizRetry,
+      false,
+      false,
+      { requestId: "req-1", quizId: "quiz-init" },
+    );
+    document.dispatchEvent(retryEvent);
+    await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+
+    // No new generation recorded.
+    expect(generationCalls).toHaveLength(prevCount);
   });
 });

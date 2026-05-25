@@ -10499,3 +10499,877 @@ feature); ≥85% on the rewritten `dom.ts`; ≥85% on the rewritten
   `v2` reader).
 
 ---
+
+## ADR-30 (2026-05-25): Question pool with diff-hash cache and silent resample-on-retry
+**Date**: 2026-05-25
+**Issue**: #117
+**Status**: Accepted
+
+### Context
+
+Today every `quiz-request` triggers a fresh LLM call. A user who fails a
+quiz and clicks "Try Again" pays the full ~20s generation cost again, and
+either gets the same questions back (when the LLM is deterministic) or a
+near-identical set (when it is not). User feedback: "we shouldn't rerun
+the quiz generation unless there were serious changes on the PR."
+
+The fix is two cooperating changes:
+
+1. **Pool, not single quiz.** On a cache miss the host asks the LLM for a
+   larger pool of 20 questions, samples 5 for the live quiz, and keeps
+   the remaining 15 in memory for follow-up resamples.
+2. **Diff-hash cache.** The pool is keyed by the SHA-256 of the diff
+   bytes (plus PR identity as a guard). A new push to the PR changes the
+   diff, which changes the hash, which invalidates the cache and forces
+   a fresh pool — exactly the "serious changes on the PR" invalidation
+   the user described.
+
+Five forces shape the design:
+
+- **Diff-only invariant (binding).** The hash MUST be over diff bytes
+  ONLY. Hashing PR title / description / comments would smuggle non-diff
+  text into the cache key and, by extension, into the gate-integrity
+  threat model — a teammate could write a "fancy" PR description to
+  flip the cache without producing any diff change. Same posture as the
+  prompt path in ADR-11/ADR-14: diff in, nothing else in.
+- **Long-lived host (verified).** ADR-17 §1 establishes lazy port
+  lifecycle: the SW calls `chrome.runtime.connectNative` once and the
+  host process stays alive until `port.onDisconnect` or SW termination.
+  An in-process Map in the host therefore survives across multiple
+  `quiz-request` / `quiz-resample-request` frames in the same SW
+  session. Confirmed by inspecting
+  `packages/host/src/cli.ts` (the `for await` loop over framed stdin
+  never exits between frames). This makes the in-process cache useful;
+  without ADR-17's lifecycle the cache would be no-op.
+- **Silent UX.** The user signed off on no "pool size N / N remaining"
+  indicator. The modal shows the same `Try Again` button; what changed
+  is invisible to the user except that the second attempt is fast.
+- **Wire additive.** Envelope `v: 1` stays. We add ONE new frame
+  kind (`quiz-resample-request`) and ONE optional field
+  (`questionPoolSize`) on `quiz-request`. Old extension ↔ new host
+  works (legacy mode, no caching). New extension ↔ old host works via
+  a frame-kind fallback documented below.
+- **Stats truth.** The stats footer (ADR-26 / store.ts) currently
+  records `recordGeneration` on every `quiz-response`. After this ADR
+  a resample reply MUST NOT count as a "generation" because no LLM
+  call happened. Otherwise the footer's "generated in 17s" median
+  would be polluted by `~0ms` rows.
+
+### Decision
+
+A diff-hash-keyed question pool lives in a new host-side
+`QuestionPoolCache` (in-process LRU Map, cap 10). On `quiz-request` the
+host computes `sha256(diff)`, looks up the pool by composite key, and
+either reuses the cached pool (sample 5 fresh) or generates a 20-question
+pool (LLM call) and caches it. A new `quiz-resample-request { quizId }`
+frame asks the host to resample 5 from the pool the given sample-quizId
+came from; the host returns a normal `quiz-response` with a NEW
+sample-quizId. The extension's quiz-retry path sends
+`quiz-resample-request` instead of a fresh `quiz-request`, falling back
+to `quiz-request` if the host rejects the new frame kind (forward-compat
+with old hosts).
+
+#### 1. Wire format (protocol changes)
+
+**`quiz-request` payload — additive field.**
+
+```ts
+// packages/protocol/src/messages/quiz-request.ts (modified)
+export const QuizRequestPayloadSchema = z.object({
+  pr: PRIdentifierSchema,
+  questionCount: z.number().int().min(1).max(10),
+  /**
+   * Optional. When present, the host generates a pool of this many
+   * questions on cache miss and samples `questionCount` from it for the
+   * reply. When absent, the host runs legacy single-quiz behaviour: no
+   * pool, no cache, no resample support. Must be >= questionCount.
+   * Capped at 50 to bound per-pool LLM cost. ADR-30.
+   */
+  questionPoolSize: z.number().int().min(1).max(50).optional(),
+  llmAdapterId: z.string().min(1).optional(),
+  vcsAdapterId: z.string().min(1).optional(),
+});
+```
+
+Cross-field check (in `handleQuizRequest`, not in zod — keep schema
+shallow): if `questionPoolSize !== undefined && questionPoolSize <
+questionCount`, the host replies with an `internal` error
+("questionPoolSize must be >= questionCount"). Schema does not enforce
+because zod's cross-field refinement doesn't compose with the
+discriminated union cleanly and the host already validates the pair at
+handler entry.
+
+**New `quiz-resample-request` frame.**
+
+```ts
+// packages/protocol/src/messages/quiz-resample-request.ts (NEW)
+export const QuizResampleRequestPayloadSchema = z.object({
+  /** The sample quizId returned in a prior quiz-response. */
+  quizId: z.string().min(1),
+  /** How many questions to return in the new sample. */
+  questionCount: z.number().int().min(1).max(10),
+});
+
+export const QuizResampleRequestFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("quiz-resample-request"),
+  payload: QuizResampleRequestPayloadSchema,
+});
+```
+
+The reply is the existing `quiz-response` frame — same shape, new
+`quiz.id` (new sample-quizId for a fresh answer-key entry). No
+`cacheHit` field on the response: user explicitly chose silent.
+
+**Errors.** Unknown `quizId` in a `quiz-resample-request` → existing
+`internal` ErrorReason with message `"resample failed: unknown quiz id"`
+and `details: { quizId }`. No new `ErrorReason` variant. (Rationale:
+adding `unknown-resample-quiz-id` would force a protocol-version think
+about backward compat in another month; the extension only needs to
+distinguish "host rejected this resample" from "frame kind not
+supported by host," which we get from message text being attached to a
+known reason.)
+
+**Old extension → new host.** Payload lacks `questionPoolSize`. Host
+treats as legacy: no pool, no cache, identical to today (`generateQuiz`
+with `questionCount`, store, respond). Zod `.passthrough()` is NOT
+needed; absent optional fields parse fine.
+
+**New extension → old host.** Old host does not know
+`quiz-resample-request`. Existing dispatcher falls through to the
+`error` frame `{ reason: "unknown-message" }` path (see `dispatcher.ts`
+default case for unexpected kinds). Extension detects this and
+re-sends as `quiz-request` (see §5).
+
+`FrameSchema` in `packages/protocol/src/envelope.ts` adds
+`QuizResampleRequestFrameSchema` to the discriminated union.
+`PROTOCOL_VERSION` stays `1` — purely additive.
+
+#### 2. Host cache design
+
+**Module:** `packages/host/src/question-pool-cache.ts` (NEW).
+
+```ts
+import type { ChoiceId, QuestionId } from "@lgtm-buzzer/core";
+
+/**
+ * A question fully reconstructed from the LLM pool, including the correct
+ * choice id. Identical shape to the `MultipleChoiceQuestion` in core but
+ * held by the host outside of any wire-format projection.
+ */
+export type PoolQuestion = {
+  readonly type: "multiple-choice";
+  readonly id: QuestionId;
+  readonly prompt: string;
+  readonly choices: ReadonlyArray<{ readonly id: ChoiceId; readonly label: string }>;
+  readonly correctChoiceId: ChoiceId;
+  readonly explanation?: string;
+};
+
+/** A cached pool — N questions for a given (adapter, pr, diff) tuple. */
+export type Pool = {
+  readonly key: string;            // composite cache key (see §2 binding)
+  readonly questions: ReadonlyArray<PoolQuestion>;
+  readonly llmAdapterId: string;   // for telemetry / logs only
+  readonly createdAt: number;
+};
+
+/** A live sample mapping: which pool produced this sample? */
+export type SampleMapping = {
+  readonly sampleQuizId: string;   // the QuizId returned to the extension
+  readonly poolKey: string;        // points back into the pool map
+  readonly sampledQuestionIds: ReadonlyArray<QuestionId>; // for "don't repeat" logging if desired (v2)
+};
+
+export type QuestionPoolCache = {
+  /** Look up a pool by composite key. */
+  readonly get: (key: string) => Pool | undefined;
+  /** Insert a pool. Trims to LRU cap on insert. */
+  readonly put: (pool: Pool) => void;
+  /** Look up which pool a sample-quizId came from. */
+  readonly getSampleMapping: (sampleQuizId: string) => SampleMapping | undefined;
+  /** Record a sample-quizId → pool mapping. */
+  readonly putSampleMapping: (mapping: SampleMapping) => void;
+  /** Drop a sample mapping (called on quiz-submit, after scoring). */
+  readonly deleteSampleMapping: (sampleQuizId: string) => void;
+  /** Build the composite cache key. */
+  readonly buildKey: (input: BuildKeyInput) => string;
+  /** Number of pools currently cached (for tests + logging). */
+  readonly size: () => number;
+};
+
+export type BuildKeyInput = {
+  readonly prKind: "github" | "ado";
+  readonly llmAdapterId: string;
+  readonly prCanonical: string;  // canonical PR identifier string (see binding below)
+  readonly diffHash: string;     // hex-encoded sha256 of diff bytes
+};
+```
+
+**Cache key composition (binding).**
+
+```
+key = `${prKind}|${llmAdapterId}|${prCanonical}|${diffHash}`
+```
+
+- `prCanonical` for GitHub: `"github:" + owner + "/" + repo + "#" + number`.
+- `prCanonical` for ADO: `"ado:" + org + "/" + project + "/" + repo + "#" + pullRequestId`.
+- `diffHash`: `crypto.createHash("sha256").update(diff, "utf8").digest("hex")`.
+- `llmAdapterId` is included because two adapters can return materially
+  different question pools for the same diff (Claude vs Codex tone /
+  difficulty). Switching adapter mid-session SHOULD invalidate.
+
+**LRU policy.** Map preserves insertion order. On `put`:
+1. If key already present, delete then set (refresh LRU).
+2. If size > 10, delete the oldest entry (first iter of `map.keys()`).
+Eviction on `put` only — `get` does not promote (simpler, and the next
+`put` already refreshes). No TTL.
+
+**Sample mapping store.** A separate `Map<string, SampleMapping>` lives
+alongside. It is bounded by the same LRU cap times pool questions (worst
+case 10 pools × ~K live samples). On `quiz-submit` (existing flow) the
+host calls `cache.deleteSampleMapping(quizId)` AFTER scoring, mirroring
+the existing `store.delete` no-replay invariant.
+
+**No disk persistence.** Cache lives in-process. Host restart → cold
+cache. Documented in TSDoc; consistent with the existing `SessionStore`
+posture.
+
+**Diff hash computation (boundary).** A small helper:
+
+```ts
+// packages/host/src/diff-hash.ts (NEW)
+import { createHash } from "node:crypto";
+import type { Diff } from "@lgtm-buzzer/core";
+
+/**
+ * Hash a diff for use as a cache key. The hash MUST cover the diff
+ * bytes verbatim — no normalisation, no whitespace folding (that would
+ * make "small whitespace tweak" collide with a real change). PR title /
+ * description / comments MUST NOT be passed to this function. ADR-30
+ * §Diff-only invariant.
+ */
+export const hashDiff = (diff: Diff): string =>
+  createHash("sha256").update(diff, "utf8").digest("hex");
+```
+
+#### 3. LLM-call avoidance + prompt change
+
+The LLM port (`packages/core/src/ports/llm-provider.ts`) is unchanged.
+`GenerateQuizInput` already carries `{ diff, questionCount }`. On a
+cache miss the host calls `generateQuiz({ diff, questionCount: poolSize })`
+— the same call site, just a larger N. No port change required.
+
+The shared system prompt
+(`packages/adapters/_shared/src/prompt.ts`) currently says "Generate
+exactly N multiple-choice questions where N is provided in the USER
+message." That language already parameterises N. No system-prompt edit
+is needed — the value placed in `buildUserMessage(diff, N)` becomes the
+pool size when caching is on, and the existing `questionCount` when it
+is off. The eval suite (issue #52 / ADR-26) is calibrated against
+N ∈ {1..10}; bumping to 20 stays in the same "small-integer" regime and
+does not invalidate fixtures. Eval guard: a follow-up workspace_dispatch
+run on the evals workflow with `questionCount=20` should be triggered
+before flipping the extension default — non-gating per ADR-27, just a
+sanity check the prompt still produces well-structured output at the
+larger N.
+
+#### 4. Quiz-request handler — updated sequence
+
+In `packages/host/src/dispatcher.ts`, `handleQuizRequest` gains a new
+branch:
+
+1. Resolve adapter IDs (defaults applied when absent) — unchanged.
+2. Build VCS + LLM providers via registry — unchanged.
+3. Fetch diff from VCS adapter — unchanged.
+4. **New:** If `questionPoolSize === undefined` → legacy path (steps 5L–7L).
+   Else → pool path (steps 5P–7P).
+5L. (Legacy) `llm.generateQuiz({ diff, questionCount })`. Store answer
+    key under returned `quiz.id`. Write `quiz-response`.
+5P. (Pool) Compute `diffHash = hashDiff(diff)`, build composite
+    `poolKey`, call `cache.get(poolKey)`.
+    - **Hit:** Skip LLM call. Use cached `Pool.questions`.
+    - **Miss:** `llm.generateQuiz({ diff, questionCount: poolSize })`.
+      Reify the LLM's returned `Quiz` into a `Pool` (mapping
+      `Question.correctChoiceId` into `PoolQuestion.correctChoiceId`).
+      `cache.put(pool)`.
+6P. Sample `questionCount` questions from `pool.questions` using
+    `Fisher–Yates` over `crypto.randomUUID()`-derived randomness
+    (see §5). Generate a fresh `sampleQuizId` (`crypto.randomUUID()` →
+    `QuizId`). Build an `AnswerKey` for the sample. Call
+    `store.set(sampleQuizId, answerKey)` (existing API, no change).
+    Call `cache.putSampleMapping({ sampleQuizId, poolKey,
+    sampledQuestionIds })`.
+7P. Build `quiz-response` frame with `quiz.id = sampleQuizId` and the
+    5 sampled questions (no `correctChoiceId` on the wire — same
+    gate-integrity invariant as today). Write frame.
+
+Cache-hit vs cache-miss are indistinguishable on the wire (silent UX).
+The host logs `cacheHit: true | false` at `info` for debugging only.
+
+#### 5. New `handleQuizResampleRequest` handler
+
+```
+1. cache.getSampleMapping(quizId) → SampleMapping | undefined
+   - undefined → write ErrorFrame
+     { reason: "internal", message: "resample failed: unknown quiz id",
+       details: { quizId } } and return.
+2. cache.get(mapping.poolKey) → Pool | undefined
+   - undefined (LRU evicted between sample and resample) → write
+     ErrorFrame { reason: "internal",
+       message: "resample failed: pool evicted",
+       details: { quizId } } and return. Extension's fallback (see §6)
+     can recover by sending a fresh quiz-request.
+3. Sample `questionCount` questions from pool.questions (Fisher-Yates
+   again — independent of previous sample; deliberate so the user gets
+   genuinely new questions on retry).
+4. Generate a fresh sampleQuizId (UUID).
+5. Build AnswerKey for the new sample. store.set(newSampleQuizId, key).
+6. cache.putSampleMapping({ sampleQuizId: newSampleQuizId, poolKey,
+   sampledQuestionIds }).
+7. (Optional) cache.deleteSampleMapping(oldSampleQuizId). Skip for v1
+   so a stale modal that submits the OLD sampleQuizId concurrently still
+   scores (instead of erroring). The host's existing per-quiz delete on
+   submit cleans up either way.
+8. Build quiz-response frame with quiz.id = newSampleQuizId. Write.
+```
+
+The handler is wrapped in `work.fork()` just like the quiz-request path,
+and errors travel through the same `safeWrite` of an ErrorFrame. The
+outer IO is `IO<never, void>`. No new RegistryError, no new
+VCSProviderError, no new LLMProviderError — resample never goes to VCS
+or LLM, only to the cache.
+
+**Sampling.** Fisher-Yates shuffle with `Math.random()`. Rationale:
+silent UX, no replay attack surface (the wire never exposes the pool,
+and the answer key is built fresh per sample). Switching to
+`crypto.getRandomValues`-seeded shuffles is a measurable-zero security
+benefit at much higher code weight. `Math.random()` it is, documented.
+
+#### 6. Extension quiz-flow — retry path
+
+In `packages/extension/src/lib/dom/quiz-flow.ts`:
+
+**Sending `questionPoolSize`.** The `sendQuizRequest` builds the
+`quiz-request` payload with both fields:
+
+```ts
+payload: {
+  pr: ...,
+  questionCount: 5,
+  questionPoolSize: 20,
+}
+```
+
+These are constants for v1 (deferred: making them configurable in the
+options page).
+
+**Retry sends a resample.** `onQuizRetry` allocates fresh
+`requestId`/`correlationId` as today, then takes one of two branches:
+
+- **Has a `quizId` in scope?** The modal currently passes the
+  `requestId` (intercept-side) on the `quiz-retry` event detail; it
+  does NOT currently include the `quizId` of the quiz the user just
+  failed. We need it: extend `QuizRetryEventDetailSchema` with an
+  optional `quizId: z.string().min(1).optional()` and have the modal
+  emit it when the failed/error state has one in scope. When present,
+  `onQuizRetry` calls a new `sendQuizResampleRequest(requestId,
+  freshPending, correlationId, quizId)` which sends the new frame
+  kind.
+- **No `quizId`?** (Initial-request error before a quiz arrived, or
+  unknown state.) Fall through to the existing `sendQuizRequest`
+  path. Behaviour is identical to today.
+
+**Fallback on unknown-frame-kind / pool-evicted / unknown-quiz-id.**
+The `quiz-resample-request` reply is one of:
+
+- `quiz-response` — happy path, route as today via
+  `handleQuizRequestReply`.
+- `error { reason: "unknown-message" }` — old host. Retry the
+  retry: kick off a fresh `sendQuizRequest` with the same fresh
+  `requestId`/`pending`. The user sees one generating-state spinner;
+  no extra UX surface.
+- `error { reason: "internal", message: starts with "resample failed:" }`
+  — host knows the frame kind but the pool/quiz is gone. Same
+  fallback: send a fresh `sendQuizRequest`. Detection is by message
+  prefix; ugly but lets us avoid a new ErrorReason variant. (The
+  reviewer will accept this provided the prefix matches the constant
+  defined in `dispatcher.ts` — both sides import a shared string
+  constant from `protocol`'s new message module so the prefix never
+  drifts.)
+- Any other `error` — propagate to the modal as today.
+
+The fallback is centralised in a new helper:
+
+```ts
+const sendQuizResampleRequest = async (
+  requestId: string,
+  p: PendingApprove,
+  correlationId: string,
+  failedQuizId: string,
+): Promise<void> => {
+  generationStartTimes.set(requestId, Date.now()); // measure regardless;
+                                                   // see §7 for why this
+                                                   // is NOT recorded.
+  const frame: Frame = {
+    v: 1,
+    kind: "quiz-resample-request",
+    correlationId,
+    payload: { quizId: failedQuizId, questionCount: 5 },
+  };
+  // ... send via sendFrame ...
+  // If reply is error & reason=="unknown-message" OR message starts with
+  // RESAMPLE_FAILED_PREFIX (imported from protocol) → fall back to
+  // sendQuizRequest(requestId, p, newCorrelationId()).
+  // Else route via handleQuizRequestReply, BUT with a
+  // `viaResample: true` flag so stats are NOT recorded (see §7).
+};
+```
+
+#### 7. Stats interaction
+
+`recordGeneration` measures LLM-call cost; a cache hit / resample has
+zero LLM cost and MUST NOT be counted. Two changes in `quiz-flow.ts`:
+
+- Track a per-request `viaResample: boolean` flag (private to the
+  flow). Default `false`. Set `true` when the request originated from
+  `sendQuizResampleRequest`.
+- In `handleQuizRequestReply`, when `reply.kind === "quiz-response"`:
+  ```
+  if (!viaResample && stats !== undefined && startMs !== undefined) {
+    void stats.recordGeneration(adapterId, Date.now() - startMs);
+  }
+  ```
+
+`recordQuiz` continues to fire on every `quiz-result` — passes / fails
+do count regardless of where the questions came from.
+
+No change to `StatsStore` API. The footer's "generated in 17s" reading
+stays accurate because resample replies never enter the rolling window.
+
+#### 8. Backward / forward compat matrix
+
+| Extension | Host | Behaviour |
+|---|---|---|
+| old | old | Today's behaviour — single quiz per request. |
+| old | new | Payload lacks `questionPoolSize` → host legacy path, no cache. No resample frame is ever sent. Identical to today. |
+| new | old | Initial `quiz-request` includes `questionPoolSize` (old host ignores unknown optional field via zod-default behaviour — verified: existing `QuizRequestPayloadSchema.parse` already strips unknown keys unless `.strict()`, which it is NOT). Host returns a normal single quiz. On retry, the new extension sends `quiz-resample-request`; old host responds `error { reason: "unknown-message" }`. Extension falls back to `quiz-request`. Net: feature is gracefully off. |
+| new | new | Full pool + cache + resample. |
+
+#### 9. Diff-only invariant — test gate
+
+A canary test in `packages/host/src/diff-hash.test.ts`:
+
+```ts
+const diff = "diff --git a/foo b/foo\n..." as Diff;
+const baseHash = hashDiff(diff);
+const tampered = diff + " // SECRET_PR_TITLE_CANARY_v1";
+// Sanity: appending bytes changes the hash. Pass.
+expect(hashDiff(tampered)).not.toBe(baseHash);
+// And the PR-side cache key composition (in question-pool-cache.test.ts)
+// MUST refuse to admit PR title / description / comments — those are
+// not parameters of `buildKey`. Type-level: `BuildKeyInput` has exactly
+// four fields, none of them title/description/comments. Reviewer
+// asserts via a TS compile-error test that adding `prTitle` to
+// `BuildKeyInput` fails type-check.
+```
+
+The cache-key call site (in `dispatcher.ts`) takes only `pr` (already
+diff-only — `PRIdentifier` has no title/desc fields) and `diff` and
+passes them through `hashDiff` + canonicaliser. There is no plausible
+path from PR title to the hash.
+
+### Affected workspaces
+
+| Workspace | Change |
+|---|---|
+| `protocol` | New `quiz-resample-request` message + optional `questionPoolSize` on `quiz-request`. Schemas only — zero runtime deps. Stays on `zod`. |
+| `core` | UNCHANGED. The pool is host concern; the LLM port still receives `{ diff, questionCount }`. No new ports. |
+| `adapters/*` | UNCHANGED. Adapters still implement `generateQuiz` as today. The host calls them with a larger `questionCount` on pool generation. |
+| `host` | New `question-pool-cache.ts`, new `diff-hash.ts`, updated `dispatcher.ts` for the new branch + new handler. New runtime dep: none (`node:crypto` is built-in). |
+| `extension` | Updated `quiz-flow.ts` retry path + new `sendQuizResampleRequest` helper. Updated `dom-events.ts` to extend `QuizRetryEventDetailSchema`. Updated `modal.ts` to pass the failed `quizId` on retry. No new runtime deps. |
+
+Dependency direction stays clean: `protocol ← core ← adapters ← host`
+and `protocol ← core ← extension`. The cache lives in `host` only; it
+imports `core` types (`QuestionId`, `ChoiceId`, `QuizId`, `Diff`) and
+`protocol` schemas — both downstream.
+
+### Types (per workspace)
+
+**`protocol`:**
+
+```ts
+// packages/protocol/src/messages/quiz-resample-request.ts (NEW)
+export const QuizResampleRequestPayloadSchema = z.object({
+  quizId: z.string().min(1),
+  questionCount: z.number().int().min(1).max(10),
+});
+export type QuizResampleRequestPayload = z.infer<typeof QuizResampleRequestPayloadSchema>;
+export const QuizResampleRequestFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("quiz-resample-request"),
+  payload: QuizResampleRequestPayloadSchema,
+});
+export type QuizResampleRequestFrame = z.infer<typeof QuizResampleRequestFrameSchema>;
+
+// Shared constant so extension + host agree on the fallback-detection prefix.
+export const RESAMPLE_FAILED_PREFIX = "resample failed:" as const;
+```
+
+`quiz-request.ts` adds the optional `questionPoolSize` field.
+`envelope.ts` adds `QuizResampleRequestFrameSchema` to the
+discriminated union.
+
+**`host`:**
+
+```ts
+// packages/host/src/question-pool-cache.ts (NEW)
+export type PoolQuestion = { ... };  // §2
+export type Pool = { ... };
+export type SampleMapping = { ... };
+export type BuildKeyInput = { ... };
+export type QuestionPoolCache = { ... };
+export const createQuestionPoolCache = (opts?: { capacity?: number }): QuestionPoolCache;
+
+// packages/host/src/diff-hash.ts (NEW)
+export const hashDiff = (diff: Diff): string;
+```
+
+**`extension`:**
+
+```ts
+// packages/extension/src/lib/dom/dom-events.ts (modified)
+export const QuizRetryEventDetailSchema = z.object({
+  requestId: z.string().min(1),
+  // NEW: optional sample-quizId of the quiz the user just failed.
+  // When present, retry uses quiz-resample-request; when absent,
+  // retry uses quiz-request.
+  quizId: z.string().min(1).optional(),
+});
+```
+
+### Functions and methods
+
+**`protocol`:** purely schemas + zod-inferred types. No functions.
+
+**`host`:**
+
+```ts
+// packages/host/src/diff-hash.ts
+export const hashDiff = (diff: Diff): string;
+
+// packages/host/src/question-pool-cache.ts
+export const createQuestionPoolCache = (
+  opts?: { readonly capacity?: number },
+): QuestionPoolCache;
+
+// packages/host/src/dispatcher.ts (modified)
+// - existing handleQuizRequest gets a pool branch
+// - new handleQuizResampleRequest
+const handleQuizResampleRequest = (
+  quizId: string,
+  questionCount: number,
+  correlationId: string | null,
+  deps: DispatcherDeps & { readonly cache: QuestionPoolCache },
+): IO<never, void>;
+// DispatcherDeps gains a readonly `cache: QuestionPoolCache` field.
+// cli.ts constructs it once at startup, threads it into createDispatcher.
+```
+
+**`extension`:**
+
+```ts
+// packages/extension/src/lib/dom/quiz-flow.ts (modified)
+const sendQuizResampleRequest = async (
+  requestId: string,
+  p: PendingApprove,
+  correlationId: string,
+  failedQuizId: string,
+): Promise<void>;
+// onQuizRetry updated to call sendQuizResampleRequest when detail.quizId
+// is present, else sendQuizRequest as today.
+// handleQuizRequestReply gains an optional `viaResample` parameter that
+// gates the stats.recordGeneration call.
+```
+
+No new `Either`/`IO` types — all new code in `host` plugs into the
+existing `IO<never, void>` dispatcher contract; all new code in
+`extension` plugs into the existing Promise-based flow controller.
+
+### File layout
+
+**New files:**
+
+- `packages/protocol/src/messages/quiz-resample-request.ts`
+- `packages/protocol/src/messages/quiz-resample-request.test.ts`
+- `packages/host/src/diff-hash.ts`
+- `packages/host/src/diff-hash.test.ts`
+- `packages/host/src/question-pool-cache.ts`
+- `packages/host/src/question-pool-cache.test.ts`
+
+**Modified files:**
+
+- `packages/protocol/src/messages/quiz-request.ts` — add
+  `questionPoolSize`.
+- `packages/protocol/src/messages/quiz-request.test.ts` — new cases:
+  absent field accepted (legacy), present + valid accepted, present <
+  questionCount accepted by schema (handler will reject), present > 50
+  rejected.
+- `packages/protocol/src/envelope.ts` — add
+  `QuizResampleRequestFrameSchema` to the discriminated union.
+- `packages/protocol/src/envelope.test.ts` — assert
+  `quiz-resample-request` round-trips through `FrameSchema`.
+- `packages/protocol/src/index.ts` — re-export new types +
+  `RESAMPLE_FAILED_PREFIX`.
+- `packages/host/src/dispatcher.ts` — new handler + pool branch in
+  existing handler; `DispatcherDeps.cache` field.
+- `packages/host/src/dispatcher.test.ts` — new cases (see test plan
+  below).
+- `packages/host/src/cli.ts` — construct `createQuestionPoolCache`
+  once at startup; thread into `createDispatcher`.
+- `packages/extension/src/lib/dom/dom-events.ts` — extend
+  `QuizRetryEventDetailSchema`.
+- `packages/extension/src/lib/dom/dom-events.test.ts` — case for
+  optional `quizId`.
+- `packages/extension/src/lib/dom/quiz-flow.ts` — retry path
+  branches; `viaResample` flag; fallback on `unknown-message` /
+  `RESAMPLE_FAILED_PREFIX`.
+- `packages/extension/src/lib/dom/quiz-flow.test.ts` — new cases
+  (see test plan).
+- `packages/extension/src/lib/dom/modal.ts` — emit `quizId` on the
+  `quiz-retry` DOM event when in `failed` or `error-after-quiz-arrived`
+  state.
+
+**E2E:**
+
+- `packages/extension/e2e/specs/quiz-retry-uses-pool.spec.ts` (NEW) —
+  stub host returns 20-question pool on first generate, second
+  generate is never called; assertion is that the retry's
+  generating-state transition is < 50 ms (no LLM round-trip).
+
+### Sequence (cache-hit on retry)
+
+1. User clicks Approve on a PR. Content script intercepts, emits
+   `quiz-request` DOM event, sends `quiz-request` frame with
+   `questionCount: 5, questionPoolSize: 20`.
+2. SW routes to host. Host fetches diff, computes
+   `diffHash = sha256(diff)`, builds composite key. Cache miss.
+3. Host calls `llm.generateQuiz({ diff, questionCount: 20 })`. LLM
+   returns a `Quiz` with 20 questions. Host reifies into `Pool`,
+   inserts into cache.
+4. Host samples 5 questions. Allocates `sampleQuizId`. Stores
+   `AnswerKey` (via existing `SessionStore`). Records
+   `SampleMapping(sampleQuizId, poolKey)` in the cache. Writes
+   `quiz-response` with 5 questions and `quiz.id = sampleQuizId`.
+5. Extension renders modal. User answers. User fails. Modal transitions
+   to `failed`, "Try Again" button is enabled.
+6. User clicks "Try Again". Modal emits `quiz-retry` DOM event with
+   `{ requestId, quizId: sampleQuizId }`.
+7. Extension's `onQuizRetry` calls `sendQuizResampleRequest` (because
+   `quizId` is present). Frame: `{ kind: "quiz-resample-request",
+   payload: { quizId: sampleQuizId, questionCount: 5 } }`.
+8. Host's `handleQuizResampleRequest` looks up the sample mapping,
+   then the pool. Both present. Samples 5 fresh questions (independent
+   of previous sample). New `sampleQuizId'`. Stores new `AnswerKey`.
+   Writes `quiz-response`. No LLM call. Total latency ~5 ms.
+9. Extension routes via `handleQuizRequestReply` with
+   `viaResample=true`. Stats `recordGeneration` is NOT called.
+10. Modal renders the fresh 5 questions. User answers. Submission
+    flows through the existing `quiz-submit` path unchanged.
+
+### Error cases
+
+| Error | Where | Behaviour |
+|---|---|---|
+| `questionPoolSize < questionCount` | host handler | Write `ErrorFrame { reason: "internal", message: "questionPoolSize must be >= questionCount" }`. Extension surfaces as generic error. |
+| Cache miss + LLM call fails | host (existing path) | Existing `LLMProviderError` mapping in dispatcher applies. Cache is NOT mutated (we never `put` an empty / failed pool). Extension surfaces as today. |
+| Resample for unknown quizId | host new handler | `ErrorFrame { reason: "internal", message: "resample failed: unknown quiz id" }`. Extension falls back to fresh `quiz-request`. |
+| Resample but pool LRU-evicted between sample and resample | host new handler | `ErrorFrame { reason: "internal", message: "resample failed: pool evicted" }`. Extension falls back to fresh `quiz-request`. |
+| Old host receives `quiz-resample-request` | host (existing default branch) | Today's `unknown-message` ErrorFrame path. Extension falls back to fresh `quiz-request`. |
+| `crypto.createHash` unavailable | invariant violation | `node:crypto` is always present in Node ≥ 14. If absent, the host has bigger problems; let it throw (`throw` is reserved for invariant violations per CLAUDE.md). |
+| Diff is empty string | host pool path | `hashDiff("")` is well-defined (`sha256("")`). Still cached. The downstream `LLMProvider` already returns `malformed-response` on empty-diff guard in the adapter; that error flows through unchanged and the cache stays empty for that key (we never `put` on adapter error). |
+
+All expected failures travel through the existing IO `Err` channel or
+the wire ErrorFrame path. No `throw` introduced.
+
+### Test strategy
+
+**`protocol` unit tests** (`packages/protocol/src/messages/`):
+- `quiz-resample-request.test.ts` — payload accepts valid input;
+  rejects missing `quizId`; rejects `questionCount` out of `[1, 10]`.
+- `quiz-resample-request.test.ts` — full frame round-trips through
+  `FrameSchema`.
+- `quiz-request.test.ts` — accepts payload without
+  `questionPoolSize` (legacy); accepts with `questionPoolSize: 20`;
+  rejects `questionPoolSize: 0` and `questionPoolSize: 51`.
+
+**`host` unit tests** (`packages/host/src/`):
+- `diff-hash.test.ts`:
+  - Deterministic: same diff → same hash across calls.
+  - Single-byte change → different hash.
+  - Empty diff → well-defined hash.
+  - "Diff-only canary": title/description/comments are NOT passed to
+    `hashDiff` (type-level — `hashDiff` accepts `Diff`, not unknown).
+- `question-pool-cache.test.ts`:
+  - `put` + `get` round-trip.
+  - LRU eviction at capacity 10 — the oldest entry is dropped on the
+    11th insert.
+  - `buildKey` produces stable keys for stable inputs.
+  - `buildKey` produces different keys when `prKind` / `llmAdapterId`
+    / `prCanonical` / `diffHash` differs.
+  - `putSampleMapping` / `getSampleMapping` / `deleteSampleMapping`
+    round-trip.
+- `dispatcher.test.ts`:
+  - Legacy path: `quiz-request` without `questionPoolSize` calls
+    `llm.generateQuiz` with `questionCount: 5` and does NOT touch the
+    cache.
+  - Pool miss: `quiz-request` with `questionPoolSize: 20` calls
+    `llm.generateQuiz` with `questionCount: 20`, samples 5,
+    inserts into cache, writes `quiz-response` with 5 questions.
+  - Pool hit: second identical `quiz-request` does NOT call
+    `llm.generateQuiz`, samples 5 from the cached pool, writes
+    `quiz-response` with 5 questions (possibly different from the
+    first sample — assert the question IDs are a 5-of-20 subset, not
+    equality).
+  - Diff change → pool miss: same PR, different diff → new
+    `llm.generateQuiz` call.
+  - PR change → pool miss: same diff hash, different PR → new
+    `llm.generateQuiz` call (defensive — the diff hash dominates, but
+    we include PR identity as a guard so identical diffs in two
+    repos do not cross-contaminate).
+  - Adapter change → pool miss: same PR + diff, different
+    `llmAdapterId` → new `llm.generateQuiz` call.
+  - `questionPoolSize < questionCount` → ErrorFrame with `internal`
+    reason.
+  - Resample happy path: after a pool-miss `quiz-request`, a
+    `quiz-resample-request` with the returned sample-quizId returns
+    a fresh `quiz-response` with a new `quiz.id` and 5 questions
+    drawn from the same pool. `llm.generateQuiz` is called ONCE
+    across the two frames.
+  - Resample unknown quizId → ErrorFrame with `internal` reason and
+    message starting `"resample failed:"`.
+  - Resample after pool eviction → ErrorFrame with `internal` reason
+    and message starting `"resample failed:"`.
+
+**`extension` unit tests** (`packages/extension/src/lib/dom/`):
+- `quiz-flow.test.ts`:
+  - Retry with `quizId` in scope sends a `quiz-resample-request`
+    frame (not a `quiz-request`).
+  - Retry without `quizId` sends a `quiz-request` frame (today's
+    behaviour).
+  - Resample reply with `error { reason: "unknown-message" }`
+    triggers a fallback `quiz-request` to the same SW.
+  - Resample reply with `error { reason: "internal", message:
+    "resample failed: ..." }` triggers a fallback `quiz-request`.
+  - Resample reply with `quiz-response` does NOT call
+    `stats.recordGeneration` (assert via stats spy).
+  - Initial `quiz-request` includes `questionPoolSize: 20` in the
+    payload.
+
+**Contract tests** (`packages/adapters/*/src/contract.test.ts`):
+- No change required. The port still receives
+  `{ diff, questionCount }`; passing `20` instead of `5` is a normal
+  parameter range. The eval suite (#52) is invoked separately.
+
+**E2E tests** (`packages/extension/e2e/specs/`):
+- `quiz-retry-uses-pool.spec.ts` (NEW): stub-SW scenario where
+  - First `quiz-request` returns a 5-question quiz (sampled from a
+    pool of 20 the stub holds internally).
+  - User submits wrong answers — quiz fails — clicks "Try Again".
+  - Modal sends `quiz-resample-request`; stub samples a new 5 and
+    returns instantly.
+  - Assertion: the modal's `generating` state on retry lasts < 100 ms
+    (no real LLM wait); the question prompts differ from the first
+    set (verify at least one ID-level difference).
+
+**Manual verification (gaps):**
+- Real Claude CLI / Codex CLI / Copilot CLI returning ≥20
+  well-structured questions for a real diff. Promptfoo evals (issue
+  #52) at N=20 covers this; non-gating per ADR-27. Operator runs the
+  manual `workflow_dispatch` after merge.
+- Cross-session host restart: confirm that restarting the host
+  (e.g., `chrome://extensions` reload) cleanly drops the cache and the
+  next request regenerates. Covered by the in-process Map's lifetime
+  by construction; no automated test.
+
+### Consequences
+
+**Trade-offs:**
+
+- **Memory.** Cap 10 pools × 20 questions × ~1 KB per question ≈
+  200 KB worst case. Acceptable for a long-lived host process.
+- **Sampling repeats are possible.** With 20 questions and 5 sampled,
+  there is no guarantee resample produces a fully-disjoint set from
+  the first sample. Acceptable for v1; user explicitly chose silent
+  UX. A future ADR could track `sampledQuestionIds` per pool and
+  bias the shuffle toward unseen questions.
+- **Adapter-keyed cache forfeits cross-adapter reuse.** Switching
+  from Claude to Codex mid-session regenerates the pool. Deliberate
+  — adapters produce qualitatively different quizzes — and the user
+  signed off.
+- **Pool size 20 vs 5 increases first-request LLM cost ~4×.** Net
+  win on any session with ≥1 retry; break-even at exactly one
+  retry. We expect retries to be common in the "the buzz is buzzing"
+  use case, so this is a clear win on average.
+- **No disk persistence.** A host restart re-pays the 4× cost. We
+  view this as fine: host restart is rare relative to in-session
+  retries.
+
+**Security / gate integrity:**
+
+- The cache key is constructed from the diff bytes and the
+  diff-only `PRIdentifier`. There is no plausible path from PR
+  title / description / comments to the cache key. The
+  type-level invariant on `BuildKeyInput` makes adding such a
+  path a deliberate, reviewable change.
+- The wire still never carries `correctChoiceId`. The pool's
+  `PoolQuestion.correctChoiceId` is host-side state and lives next
+  to the existing `SessionStore` answer-key — same blast radius as
+  today.
+- Resample fairness: a sophisticated attacker who somehow knew the
+  pool could try to bias the answer key. They can't — the answer
+  key per sample is derived from the sampled questions only, the
+  pool is in-process, and the wire never exposes pool membership.
+
+**Future implications:**
+
+- Disk persistence (deferred) would need encryption-at-rest for
+  `correctChoiceId` to maintain the gate-integrity posture.
+- Configurable pool size in options (deferred) would touch the SW's
+  storage reader.
+- Cross-adapter pool sharing (deferred) is unlikely to be worth the
+  divergence; recommend not pursuing.
+
+**Binding for reviewer:**
+
+- (a) `quiz-request.payload.questionPoolSize` MUST be optional and
+  MUST NOT default in zod. Default behaviour (legacy) is enforced
+  at the handler entry. Reviewer asserts via the schema test.
+- (b) `quiz-resample-request` frame MUST be in `FrameSchema`'s
+  discriminated union and the host MUST handle it. Reviewer
+  asserts via the envelope round-trip test and dispatcher test.
+- (c) `hashDiff` MUST take only `Diff` (the branded type), never
+  raw `unknown` or a record that could carry PR text. Reviewer
+  asserts via a TS compile-error fixture if `BuildKeyInput` is
+  expanded.
+- (d) Cache LRU cap MUST be 10. Reviewer asserts via the eviction
+  test.
+- (e) `quiz-response` on a cache hit MUST be indistinguishable from
+  a cache miss on the wire — no `cacheHit` field. Reviewer asserts
+  via the dispatcher test (cache-hit path produces the same frame
+  shape).
+- (f) `stats.recordGeneration` MUST NOT be called on resample-reply
+  paths. Reviewer asserts via the quiz-flow test with a stats spy.
+- (g) Extension MUST fall back to a fresh `quiz-request` when the
+  resample reply is `unknown-message` or carries the
+  `RESAMPLE_FAILED_PREFIX`. Reviewer asserts via the quiz-flow
+  tests.
+- (h) The `RESAMPLE_FAILED_PREFIX` string MUST be imported from
+  `protocol` on both sides — no duplicated literals. Reviewer
+  asserts by grepping for the string outside the protocol module.
+- (i) The host MUST NOT include PR title, description, commit
+  messages, comments, labels, or any other non-diff PR content in
+  the cache key computation. Reviewer asserts by inspecting the
+  call site of `buildKey` in `dispatcher.ts`.
+
+---

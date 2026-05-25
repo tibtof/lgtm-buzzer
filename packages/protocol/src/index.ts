@@ -50,6 +50,14 @@ export {
 } from "./messages/quiz-request.js";
 
 export {
+  RESAMPLE_FAILED_PREFIX,
+  QuizResampleRequestPayloadSchema,
+  QuizResampleRequestFrameSchema,
+  type QuizResampleRequestPayload,
+  type QuizResampleRequestFrame,
+} from "./messages/quiz-resample-request.js";
+
+export {
   ChoiceDTOSchema,
   QuestionDTOSchema,
   QuizDTOSchema,

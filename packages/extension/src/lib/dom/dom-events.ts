@@ -101,9 +101,20 @@ export type QuizCancelEventDetail = z.infer<typeof QuizCancelEventDetailSchema>;
  * Fired when the user clicks Retry in `error` state or Try Again in
  * `failed` state. The CS re-emits a fresh `quiz-request` with a new
  * requestId and correlationId, so the old correlation map slot is not reused.
+ *
+ * `quizId` is the sample quizId of the quiz the user just failed or errored
+ * on. When present, the CS sends a `quiz-resample-request` first; when absent
+ * (initial error before any quiz arrived), the CS falls back to a fresh
+ * `quiz-request`. ADR-30.
  */
 export const QuizRetryEventDetailSchema = z.object({
   requestId: z.string().min(1),
+  /**
+   * Optional sample quizId of the quiz the user just failed.
+   * When present, retry uses `quiz-resample-request`; when absent,
+   * retry uses `quiz-request`. ADR-30.
+   */
+  quizId: z.string().min(1).optional(),
 });
 
 /** The detail object for a `lgtm-buzzer:quiz-retry` custom event. */

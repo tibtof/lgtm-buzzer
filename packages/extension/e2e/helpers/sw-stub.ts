@@ -123,6 +123,10 @@ export const buildSwStubScript = (scenario: StubScenario): string => {
                 payload: { nonce: (frame.payload && frame.payload.nonce) ? frame.payload.nonce : null } };
             case 'quiz-request':
               return { v: PROTOCOL_VERSION, kind: 'quiz-response', correlationId: cid, payload: { quiz: CANNED_QUIZ } };
+            case 'quiz-resample-request':
+              // ADR-30: resample returns the same canned quiz with a fresh id.
+              return { v: PROTOCOL_VERSION, kind: 'quiz-response', correlationId: cid,
+                payload: { quiz: Object.assign({}, CANNED_QUIZ, { id: 'quiz-resampled-' + Date.now() }) } };
             case 'quiz-submit':
               return scoreSubmit(frame, cid);
             default:
@@ -166,6 +170,10 @@ export const buildSwStubScript = (scenario: StubScenario): string => {
                 payload: { nonce: (frame.payload && frame.payload.nonce) ? frame.payload.nonce : null } };
             case 'quiz-request':
               return { v: PROTOCOL_VERSION, kind: 'quiz-response', correlationId: cid, payload: { quiz: CANNED_QUIZ } };
+            case 'quiz-resample-request':
+              // ADR-30: resample returns the same canned quiz with a fresh id.
+              return { v: PROTOCOL_VERSION, kind: 'quiz-response', correlationId: cid,
+                payload: { quiz: Object.assign({}, CANNED_QUIZ, { id: 'quiz-resampled-' + Date.now() }) } };
             case 'quiz-submit':
               return scoreSubmit(frame, cid);
             default:
@@ -277,6 +285,10 @@ export const buildSwStubScript = (scenario: StubScenario): string => {
                 payload: { llm: LLM_ADAPTERS, vcs: VCS_ADAPTERS } };
             case 'quiz-request':
               return { v: PROTOCOL_VERSION, kind: 'quiz-response', correlationId: cid, payload: { quiz: CANNED_QUIZ } };
+            case 'quiz-resample-request':
+              // ADR-30: resample returns the same canned quiz with a fresh id.
+              return { v: PROTOCOL_VERSION, kind: 'quiz-response', correlationId: cid,
+                payload: { quiz: Object.assign({}, CANNED_QUIZ, { id: 'quiz-resampled-' + Date.now() }) } };
             case 'quiz-submit':
               return scoreSubmit(frame, cid);
             default:
