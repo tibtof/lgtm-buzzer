@@ -10,6 +10,7 @@ import {
   createManualTriggerButton,
   detectPRPage,
 } from "../src/lib/dom/index.js";
+import { createOptionsStore } from "../src/lib/options/storage.js";
 import type {
   InterceptorFactory,
 } from "../src/lib/dom/index.js";
@@ -93,6 +94,26 @@ export default defineContentScript({
         ? createAdoNavigationWatcher(document)
         : createGitHubNavigationWatcher(document);
 
+    // Resolve the LLM adapter id for stats recording. Reads chrome.storage
+    // once at start; if the user has not picked one yet, defaults to the
+    // host-side default `"claude-cli"` (per ADR-22). Without this, every
+    // unconfigured user sees `via unknown` in the stats footer.
+    const adapterIdPromise = (async (): Promise<string> => {
+      const store = createOptionsStore({
+        area: {
+          get: (key: string) =>
+            browser.storage.local.get(key) as Promise<Record<string, unknown>>,
+          set: (items: Record<string, unknown>) => browser.storage.local.set(items),
+          remove: (key: string) => browser.storage.local.remove(key),
+        },
+      });
+      const result = await store.read();
+      return result.fold(
+        () => "claude-cli",
+        (opts) => opts.llmAdapterId ?? "claude-cli",
+      );
+    })();
+
     const controller = createQuizFlowController({
       doc: document,
       sendFrame,
@@ -101,10 +122,19 @@ export default defineContentScript({
       setupInterceptor,
       navigationWatcher,
       logger,
+      // adapterId is read async; quiz-flow accepts undefined and re-reads
+      // from the resolved promise. See createQuizFlowController in
+      // quiz-flow.ts for the deferred-resolution contract.
+      adapterIdPromise,
     });
 
     controller.start();
 
+    // Mount the modal with the default adapter id; the async storage read
+    // refreshes it before any result render. The stats footer (renders
+    // only on `passed`/`failed`) is what consumes this; the user clicks
+    // through the quiz long after storage settles, so the refresh always
+    // wins.
     const modal = createQuizModal({
       doc: document,
       logger: {
@@ -112,6 +142,7 @@ export default defineContentScript({
           console.warn(`[lgtm-buzzer:modal] ${msg}`, ctx ?? {});
         },
       },
+      adapterIdPromise,
     });
     modal.start();
 

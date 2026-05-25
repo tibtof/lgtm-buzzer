@@ -8,6 +8,7 @@ import {
   emitDOMEvent,
   addDOMEventListener,
 } from "./dom-events.js";
+import type { StatsStore } from "../stats/store.js";
 
 // ---------------------------------------------------------------------------
 // Error marker strings (exported for use in error-classes.ts — ADR-24)
@@ -94,6 +95,27 @@ export type QuizFlowDeps = {
   readonly navigationWatcher: NavigationWatcher;
   /** Optional structured logger for unexpected-state warnings. */
   readonly logger?: QuizFlowLogger;
+  /**
+   * Optional stats store. When provided, records generation duration and
+   * quiz pass/fail outcomes for use by the modal stats UI.
+   */
+  readonly stats?: StatsStore;
+  /**
+   * The LLM adapter id used for this quiz flow. Passed to stats recording.
+   * Defaults to `"claude-cli"` when absent — matches the host-side ADR-22
+   * default so the stats footer reads "via claude-cli" for unconfigured users.
+   */
+  readonly adapterId?: string;
+  /**
+   * Async-resolved adapter id. Production reads chrome.storage at SW boot
+   * (one async read) and passes the resulting promise here; while it is
+   * pending, stats recording uses `adapterId` (or its default). When the
+   * promise resolves, subsequent quiz events use the resolved id.
+   *
+   * Tests should prefer `adapterId` directly — this is plumbing for the
+   * content-script wiring.
+   */
+  readonly adapterIdPromise?: Promise<string>;
 };
 
 /**
@@ -175,7 +197,19 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     setupInterceptor,
     navigationWatcher,
     logger,
+    stats,
+    adapterIdPromise,
   } = deps;
+
+  // Mutable adapter id; starts at the synchronous default (or whatever the
+  // caller passed) and updates when `adapterIdPromise` resolves. Closed over
+  // by stats recording calls below.
+  let adapterId = deps.adapterId ?? "claude-cli";
+  if (adapterIdPromise !== undefined) {
+    void adapterIdPromise.then((resolved) => {
+      if (resolved !== "") adapterId = resolved;
+    });
+  }
 
   // ---------------------------------------------------------------------------
   // Module-scoped bypass flag (NOT on window — CS isolated world).
@@ -191,6 +225,9 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
 
   // Dispose functions for all attached listeners.
   const disposers: Array<() => void> = [];
+
+  // Per-request generation start times (set when quiz-request frame is sent).
+  const generationStartTimes = new Map<string, number>();
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -215,6 +252,14 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
    */
   const handleQuizRequestReply = (requestId: string, reply: Frame): void => {
     if (reply.kind === "quiz-response") {
+      // Record generation duration for stats.
+      const startMs = generationStartTimes.get(requestId);
+      generationStartTimes.delete(requestId);
+      if (stats !== undefined && startMs !== undefined) {
+        const durationMs = Date.now() - startMs;
+        void stats.recordGeneration(adapterId, durationMs);
+      }
+
       emitResult(requestId, { kind: "quiz-ready", quiz: reply.payload.quiz });
       return;
     }
@@ -282,6 +327,12 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
 
     if (reply.kind === "quiz-result") {
       const result = reply.payload;
+
+      // Record quiz outcome for stats.
+      if (stats !== undefined) {
+        void stats.recordQuiz(adapterId, result.passed, result.correct, result.total);
+      }
+
       if (result.passed) {
         emitResult(requestId, { kind: "quiz-passed", result });
         if (p !== undefined) {
@@ -322,6 +373,9 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     p: PendingApprove,
     correlationId: string,
   ): Promise<void> => {
+    // Record the generation start time for stats.
+    generationStartTimes.set(requestId, Date.now());
+
     const frame: Frame = {
       v: 1,
       kind: "quiz-request",
@@ -430,6 +484,7 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
 
   const onQuizCancel = (detail: { requestId: string }): void => {
     dropPending(detail.requestId);
+    generationStartTimes.delete(detail.requestId);
     // SW's 60s timeout cleans the host side (ADR-18 §Decision 5).
   };
 
@@ -580,6 +635,7 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     stop: (): void => {
       approveBypass = false;
       dropAll();
+      generationStartTimes.clear();
       for (const dispose of disposers) {
         dispose();
       }
