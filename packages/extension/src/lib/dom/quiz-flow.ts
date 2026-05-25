@@ -102,9 +102,20 @@ export type QuizFlowDeps = {
   readonly stats?: StatsStore;
   /**
    * The LLM adapter id used for this quiz flow. Passed to stats recording.
-   * Defaults to `"unknown"` when absent.
+   * Defaults to `"claude-cli"` when absent — matches the host-side ADR-22
+   * default so the stats footer reads "via claude-cli" for unconfigured users.
    */
   readonly adapterId?: string;
+  /**
+   * Async-resolved adapter id. Production reads chrome.storage at SW boot
+   * (one async read) and passes the resulting promise here; while it is
+   * pending, stats recording uses `adapterId` (or its default). When the
+   * promise resolves, subsequent quiz events use the resolved id.
+   *
+   * Tests should prefer `adapterId` directly — this is plumbing for the
+   * content-script wiring.
+   */
+  readonly adapterIdPromise?: Promise<string>;
 };
 
 /**
@@ -187,8 +198,18 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     navigationWatcher,
     logger,
     stats,
-    adapterId = "unknown",
+    adapterIdPromise,
   } = deps;
+
+  // Mutable adapter id; starts at the synchronous default (or whatever the
+  // caller passed) and updates when `adapterIdPromise` resolves. Closed over
+  // by stats recording calls below.
+  let adapterId = deps.adapterId ?? "claude-cli";
+  if (adapterIdPromise !== undefined) {
+    void adapterIdPromise.then((resolved) => {
+      if (resolved !== "") adapterId = resolved;
+    });
+  }
 
   // ---------------------------------------------------------------------------
   // Module-scoped bypass flag (NOT on window — CS isolated world).

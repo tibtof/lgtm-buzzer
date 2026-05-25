@@ -100,7 +100,10 @@ const MODAL_CSS = `
   .backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
+    /* Softer overlay so a hint of the underlying PR shows through —
+       feels less like a page takeover, more like a layered dialog. */
+    background: rgba(13, 17, 23, 0.45);
+    backdrop-filter: blur(2px);
     z-index: 2147483647;
     display: flex;
     align-items: center;
@@ -265,15 +268,16 @@ const MODAL_CSS = `
     font-family: inherit;
   }
   .btn-primary {
-    background: #1f883d;
+    /* Blue, not green — keeps ✅ green as the unique correct-answer signal. */
+    background: #1f6feb;
     color: #ffffff;
     border-color: rgba(31,35,40,0.15);
   }
   .btn-primary:hover:not(:disabled) {
-    background: #1a7f37;
+    background: #1158c7;
   }
   .btn-primary:disabled {
-    background: #94d3a2;
+    background: #a8c7fa;
     cursor: not-allowed;
   }
   .btn-secondary {
@@ -323,24 +327,19 @@ const MODAL_CSS = `
     display: flex;
     align-items: flex-start;
     gap: 8px;
-    padding: 8px 0;
+    padding: 6px 0;
     border-bottom: 1px solid #f0f0f0;
-    font-size: 13px;
-    color: #24292f;
-    line-height: 1.45;
+    font-size: 12.5px;
+    color: #57606a;
+    line-height: 1.5;
   }
   .per-question-item:last-child {
     border-bottom: none;
   }
   .pq-icon {
     flex-shrink: 0;
-    font-size: 16px;
-    line-height: 1.45;
-  }
-  .score-line {
-    font-size: 13px;
-    color: #656d76;
-    margin: 0 0 12px 0;
+    font-size: 14px;
+    line-height: 1.5;
   }
   .error-title {
     font-size: 16px;
@@ -403,9 +402,17 @@ export type QuizModalDeps = {
   readonly stats?: StatsStore;
   /**
    * The LLM adapter id used for the current quiz flow. Shown in the stats
-   * footer on result screens. Defaults to `"unknown"` when absent.
+   * footer on result screens. Defaults to `"claude-cli"` when absent —
+   * matches the host-side ADR-22 default so unconfigured users see a real
+   * adapter id rather than "unknown".
    */
   readonly adapterId?: string;
+  /**
+   * Async-resolved adapter id, mirroring the same plumbing in `quiz-flow.ts`.
+   * When provided, the modal awaits this promise and updates its internal
+   * cached adapter id; subsequent result renders reflect the resolved value.
+   */
+  readonly adapterIdPromise?: Promise<string>;
 };
 
 /**
@@ -743,9 +750,8 @@ const renderPassed = (
   banner.textContent = "✅ Quiz passed! Your approval is going through.";
   frag.appendChild(banner);
 
-  const scoreLine = el(doc, "p", { class: "score-line" });
-  scoreLine.textContent = `Score: ${result.correct} / ${result.total}`;
-  frag.appendChild(scoreLine);
+  // Score is shown in the dedicated score-header above the banner — no
+  // redundant "Score: X / Y" line here.
 
   if (result.perQuestion !== undefined && result.perQuestion.length > 0) {
     frag.appendChild(renderPerQuestion(doc, result.perQuestion, quiz.questions));
@@ -767,10 +773,6 @@ const renderFailed = (
   const banner = el(doc, "div", { class: "result-banner result-fail" });
   banner.textContent = "❌ Quiz failed. Review the diff and try again.";
   frag.appendChild(banner);
-
-  const scoreLine = el(doc, "p", { class: "score-line" });
-  scoreLine.textContent = `Score: ${result.correct} / ${result.total}`;
-  frag.appendChild(scoreLine);
 
   if (result.perQuestion !== undefined && result.perQuestion.length > 0) {
     frag.appendChild(renderPerQuestion(doc, result.perQuestion, quiz.questions));
@@ -795,7 +797,14 @@ const renderFailed = (
  * @param deps - Injected dependencies: `doc` and optional `logger`.
  */
 export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
-  const { doc, logger, stats, adapterId = "unknown" } = deps;
+  const { doc, logger, stats, adapterIdPromise } = deps;
+  // Mutable so the async storage read can refresh it before the next render.
+  let adapterId = deps.adapterId ?? "claude-cli";
+  if (adapterIdPromise !== undefined) {
+    void adapterIdPromise.then((resolved) => {
+      if (resolved !== "") adapterId = resolved;
+    });
+  }
 
   // Modal host element + shadow root (created once; never re-mounted).
   let host: HTMLDivElement | null = null;
@@ -848,17 +857,17 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
       class: "stats-footer",
     });
 
-    const parts: string[] = [];
-
-    parts.push(`via ${adapterId}`);
+    const parts: string[] = [adapterId];
 
     if (lastGenerationDurationMs !== null) {
       const seconds = Math.round(lastGenerationDurationMs / 1000);
-      parts.push(`generated in ${seconds}s`);
+      parts.push(`${seconds}s`);
     }
 
     if (cachedPassRate !== null) {
-      parts.push(`Last ${cachedPassRate.total}: ${cachedPassRate.passed} passed`);
+      parts.push(
+        `${cachedPassRate.passed}/${cachedPassRate.total} passed`,
+      );
     }
 
     footer.textContent = parts.join(" · ");

@@ -1351,7 +1351,7 @@ describe("createQuizModal — stats UI", () => {
   });
 
   // 36. Stats footer contains adapter badge
-  it("36. stats: stats footer shows adapter badge 'via <adapter>'", () => {
+  it("36. stats: stats footer shows the adapter id", () => {
     const modal = createQuizModal({
       doc: document,
       stats: makeStatsStore(),
@@ -1365,7 +1365,7 @@ describe("createQuizModal — stats UI", () => {
     const shadow = getShadow(document)!;
     const footer = shadow.querySelector("[data-testid='lgtm-buzzer-stats-footer']");
     expect(footer).not.toBeNull();
-    expect(footer!.textContent).toContain("via claude-cli");
+    expect(footer!.textContent).toContain("claude-cli");
   });
 
   // 37. Stats footer shows pass rate when available
@@ -1386,7 +1386,7 @@ describe("createQuizModal — stats UI", () => {
     const shadow = getShadow(document)!;
     const footer = shadow.querySelector("[data-testid='lgtm-buzzer-stats-footer']");
     expect(footer).not.toBeNull();
-    expect(footer!.textContent).toContain("7 passed");
+    expect(footer!.textContent).toContain("7/10 passed");
   });
 
   // 38. Stats footer also renders on quiz-failed
@@ -1404,7 +1404,7 @@ describe("createQuizModal — stats UI", () => {
     const shadow = getShadow(document)!;
     const footer = shadow.querySelector("[data-testid='lgtm-buzzer-stats-footer']");
     expect(footer).not.toBeNull();
-    expect(footer!.textContent).toContain("via claude-cli");
+    expect(footer!.textContent).toContain("claude-cli");
   });
 
   // 39. Modal without stats dep still renders result states correctly
@@ -1420,10 +1420,11 @@ describe("createQuizModal — stats UI", () => {
     // Score header still renders (it only depends on result payload, not stats).
     const header = shadow.querySelector("[data-testid='lgtm-buzzer-score-header']");
     expect(header).not.toBeNull();
-    // Stats footer still renders (it shows at minimum "via unknown").
+    // Stats footer still renders even without an explicit adapter id — it
+    // falls back to the host-side default "claude-cli" per ADR-22.
     const footer = shadow.querySelector("[data-testid='lgtm-buzzer-stats-footer']");
     expect(footer).not.toBeNull();
-    expect(footer!.textContent).toContain("via unknown");
+    expect(footer!.textContent).toContain("claude-cli");
   });
 
   // 40. Timer is cleared when transitioning out of generating state
