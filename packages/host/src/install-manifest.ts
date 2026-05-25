@@ -218,6 +218,19 @@ export const renderNodeWrapper = (input: {
    * for ADR-29 subprocess invocations under Chrome's minimal-PATH spawn.
    */
   readonly capturedPath: string;
+  /**
+   * Captured `process.env.USER` (or LOGNAME). Some user CLIs (notably the
+   * Claude Code CLI's keyring lookup) refuse to load credentials when USER
+   * is unset, even if HOME is set. Chrome only forwards HOME — not USER —
+   * so the wrapper must restore it explicitly.
+   */
+  readonly capturedUser: string;
+  /**
+   * Captured `process.env.SHELL`. Same reasoning as USER — required by the
+   * Claude Code CLI's keyring path on macOS. Chrome's host spawn does not
+   * include it.
+   */
+  readonly capturedShell: string;
 }): string => {
   const escape = (p: string): string => `'${p.replace(/'/g, `'\\''`)}'`;
   // Strategy: bake the user's install-time PATH into the wrapper verbatim.
@@ -230,9 +243,14 @@ export const renderNodeWrapper = (input: {
 # Wraps the host so Chrome's minimal-PATH spawn finds node and any CLIs
 # (gh, az, claude, codex, …) that ADR-29 resolvers shell out to.
 
-# Inherit the PATH captured from the user's shell at install time.
+# Inherit the PATH and identity env vars captured from the user's shell at
+# install time. Chrome forwards HOME but NOT PATH/USER/SHELL — claude-cli's
+# keyring lookup needs USER + SHELL to resolve stored credentials on macOS.
 PATH=${escape(input.capturedPath)}
-export PATH
+USER=${escape(input.capturedUser)}
+LOGNAME=${escape(input.capturedUser)}
+SHELL=${escape(input.capturedShell)}
+export PATH USER LOGNAME SHELL
 
 NODE=${escape(input.nodePath)}
 if [ ! -x "$NODE" ]; then
@@ -289,6 +307,9 @@ export const main = (): void => {
   // user has set up — `~/.local/bin/claude`, `~/.cargo/bin/...`, etc. — not a
   // guessed-static list. Re-running install-manifest refreshes the PATH.
   const capturedPath = process.env["PATH"] ?? "/usr/bin:/bin";
+  const capturedUser =
+    process.env["USER"] ?? process.env["LOGNAME"] ?? "";
+  const capturedShell = process.env["SHELL"] ?? "/bin/sh";
   const distDir = path.dirname(hostBinaryPath);
   const wrapperPath = path.join(distDir, "host-wrapper.sh");
   fs.writeFileSync(
@@ -297,6 +318,8 @@ export const main = (): void => {
       nodePath: process.execPath,
       jsEntryPath: hostBinaryPath,
       capturedPath,
+      capturedUser,
+      capturedShell,
     }),
     { mode: 0o755 },
   );

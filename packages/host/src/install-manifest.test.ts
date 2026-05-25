@@ -209,6 +209,8 @@ describe("renderNodeWrapper", () => {
       nodePath: "/Users/test/.nvm/versions/node/v22.22.0/bin/node",
       jsEntryPath: "/Users/test/workspace/host/dist/cli.js",
       capturedPath: PATH_FIXTURE,
+      capturedUser: "test",
+      capturedShell: "/bin/zsh",
     });
     expect(script.startsWith("#!/bin/sh\n")).toBe(true);
     expect(script).toContain("NODE='/Users/test/.nvm/versions/node/v22.22.0/bin/node'");
@@ -220,6 +222,8 @@ describe("renderNodeWrapper", () => {
       nodePath: "/missing/node",
       jsEntryPath: "/abs/cli.js",
       capturedPath: PATH_FIXTURE,
+      capturedUser: "test",
+      capturedShell: "/bin/zsh",
     });
     expect(script).toContain('if [ ! -x "$NODE" ]; then');
     expect(script).toContain("command -v node");
@@ -231,6 +235,8 @@ describe("renderNodeWrapper", () => {
       nodePath: "/weird/node",
       jsEntryPath: "/has'quote/cli.js",
       capturedPath: PATH_FIXTURE,
+      capturedUser: "test",
+      capturedShell: "/bin/zsh",
     });
     expect(script).toContain("/has'\\''quote/cli.js");
   });
@@ -240,6 +246,8 @@ describe("renderNodeWrapper", () => {
       nodePath: "/usr/local/bin/node",
       jsEntryPath: "/Users/test/Application Support/host/cli.js",
       capturedPath: PATH_FIXTURE,
+      capturedUser: "test",
+      capturedShell: "/bin/zsh",
     });
     expect(script).toContain("'/Users/test/Application Support/host/cli.js'");
   });
@@ -256,6 +264,8 @@ describe("renderNodeWrapper", () => {
       nodePath: "/abs/node",
       jsEntryPath: "/abs/cli.js",
       capturedPath: userPath,
+      capturedUser: "tibtof",
+      capturedShell: "/bin/zsh",
     });
     // PATH must appear verbatim, single-quoted, BEFORE the NODE= line so the
     // fallback discovery (command -v node) also benefits.
@@ -273,7 +283,27 @@ describe("renderNodeWrapper", () => {
       nodePath: "/abs/node",
       jsEntryPath: "/abs/cli.js",
       capturedPath: weirdPath,
+      capturedUser: "test",
+      capturedShell: "/bin/zsh",
     });
     expect(script).toContain("/abs/with'\\''apostrophe/bin:/usr/bin");
+  });
+
+  it("bakes USER, LOGNAME and SHELL into the wrapper (claude-cli auth needs them)", () => {
+    // Regression for the fourth Chrome-spawn env bug: claude-cli's keyring
+    // lookup returns "Not logged in" when USER is unset, even if HOME and
+    // PATH resolve. Chrome forwards HOME but not USER/SHELL. The wrapper
+    // restores both explicitly.
+    const script = renderNodeWrapper({
+      nodePath: "/abs/node",
+      jsEntryPath: "/abs/cli.js",
+      capturedPath: "/usr/bin:/bin",
+      capturedUser: "tibtof",
+      capturedShell: "/bin/zsh",
+    });
+    expect(script).toContain("USER='tibtof'");
+    expect(script).toContain("LOGNAME='tibtof'");
+    expect(script).toContain("SHELL='/bin/zsh'");
+    expect(script).toMatch(/export PATH USER LOGNAME SHELL/);
   });
 });

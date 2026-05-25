@@ -397,10 +397,40 @@ const handleQuizRequest = (
             const errFrame = buildRegistryErrorFrame(e as RegistryError, correlationId);
             await safeWrite(write, errFrame, log).unsafeRun();
           } else {
-            log.error("quiz-request failed", { kind: e.kind });
+            // Best-effort detail extraction so the modal can show something
+            // more useful than \"quiz-request failed: subprocess\". For LLM
+            // subprocess errors we surface the trimmed stderr tail; for VCS
+            // we surface status + detail. Tokens are not present in any of
+            // these fields by construction (REDACT_PATHS in logger.ts covers
+            // *.token/*.pat/*.apiKey paths for log output; wire fields stay
+            // tokenless because adapters never embed creds in errors).
+            const eAny = e as unknown as {
+              kind?: string;
+              reason?: string;
+              detail?: string;
+              stderr?: string;
+              exitCode?: number;
+              status?: number;
+            };
+            const tail = (s: string, max = 240): string =>
+              s.length <= max ? s : `…${s.slice(s.length - max)}`;
+            const subDetail =
+              eAny.stderr !== undefined && eAny.stderr.trim() !== ""
+                ? tail(eAny.stderr.trim())
+                : eAny.detail;
+            const reason = eAny.reason ? `[${eAny.reason}] ` : "";
+            const exitInfo =
+              eAny.exitCode !== undefined ? ` (exit ${eAny.exitCode})` : "";
+            const detail = subDetail ? `: ${reason}${subDetail}${exitInfo}` : "";
+            log.error("quiz-request failed", {
+              kind: e.kind,
+              reason: eAny.reason,
+              exitCode: eAny.exitCode,
+              detail: subDetail,
+            });
             const errFrame = buildErrorFrame(
               "internal",
-              `quiz-request failed: ${e.kind}`,
+              `quiz-request failed: ${e.kind}${detail}`,
               correlationId,
             );
             await safeWrite(write, errFrame, log).unsafeRun();
