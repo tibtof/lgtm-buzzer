@@ -191,28 +191,24 @@ describe("pickHostBinaryPath dual-layout", () => {
   });
 
   it("BUGFIX: returns cli.js when BOTH are present (the dev tsc -b case)", () => {
-    // This is the case install-manifest.ts previously got wrong, producing a
-    // manifest pointing at the non-executable library entry index.js. Real
-    // dev `dist/` always has both — tsc -b emits cli.js (the @lgtm-buzzer-host
-    // bin entry) alongside index.js (the library entry).
     fs.writeFileSync(path.join(tmpDir, "cli.js"), "#!/usr/bin/env node\n");
     fs.writeFileSync(path.join(tmpDir, "index.js"), "// library entry\n");
     expect(pickHostBinaryPath(tmpDir)).toBe(path.join(tmpDir, "cli.js"));
   });
 
   it("falls back to index.js path even when neither file exists (caller can fs.stat)", () => {
-    // resolveHostBinaryPath never errors — it returns a path the caller can
-    // pass to fs/exec which will surface the real error. Verifies the empty
-    // tmpdir path is the bundled fallback (predictable).
     expect(pickHostBinaryPath(tmpDir)).toBe(path.join(tmpDir, "index.js"));
   });
 });
 
 describe("renderNodeWrapper", () => {
+  const PATH_FIXTURE = "/Users/test/.local/bin:/opt/homebrew/bin:/usr/bin:/bin";
+
   it("emits a POSIX shell script with shebang, exec, and absolute paths", () => {
     const script = renderNodeWrapper({
       nodePath: "/Users/test/.nvm/versions/node/v22.22.0/bin/node",
       jsEntryPath: "/Users/test/workspace/host/dist/cli.js",
+      capturedPath: PATH_FIXTURE,
     });
     expect(script.startsWith("#!/bin/sh\n")).toBe(true);
     expect(script).toContain("NODE='/Users/test/.nvm/versions/node/v22.22.0/bin/node'");
@@ -223,6 +219,7 @@ describe("renderNodeWrapper", () => {
     const script = renderNodeWrapper({
       nodePath: "/missing/node",
       jsEntryPath: "/abs/cli.js",
+      capturedPath: PATH_FIXTURE,
     });
     expect(script).toContain('if [ ! -x "$NODE" ]; then');
     expect(script).toContain("command -v node");
@@ -233,8 +230,8 @@ describe("renderNodeWrapper", () => {
     const script = renderNodeWrapper({
       nodePath: "/weird/node",
       jsEntryPath: "/has'quote/cli.js",
+      capturedPath: PATH_FIXTURE,
     });
-    // The shell `'\''` idiom: close quote, escaped quote, re-open quote.
     expect(script).toContain("/has'\\''quote/cli.js");
   });
 
@@ -242,32 +239,41 @@ describe("renderNodeWrapper", () => {
     const script = renderNodeWrapper({
       nodePath: "/usr/local/bin/node",
       jsEntryPath: "/Users/test/Application Support/host/cli.js",
+      capturedPath: PATH_FIXTURE,
     });
     expect(script).toContain("'/Users/test/Application Support/host/cli.js'");
   });
 
-  it("augments PATH with common CLI dirs unconditionally (ADR-29 resolvers need gh/az)", () => {
-    // Chrome spawns native-messaging hosts with a minimal PATH (typically
-    // /usr/bin:/bin), which is missing the dirs where gh, az, and other
-    // CLIs live. The wrapper MUST extend PATH unconditionally so the host's
-    // resolver subprocess invocations resolve. Regression for the second
-    // bug surfaced after #113 shipped: github resolver returning missing-
-    // credentials because `gh` was not on Chrome's PATH.
+  it("bakes the captured PATH into the wrapper (preserves user-specific dirs)", () => {
+    // The wrapper inherits whatever PATH the user had at install time —
+    // this is how `~/.local/bin/claude`, `~/.cargo/bin/foo`, and other
+    // user-specific CLIs reach the host's subprocess invocations under
+    // Chrome's minimal-PATH spawn. Regression for the third PATH bug
+    // (claude not found) after ADR-29 + the first PATH attempt shipped.
+    const userPath =
+      "/Users/tibtof/.local/bin:/Users/tibtof/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin";
     const script = renderNodeWrapper({
       nodePath: "/abs/node",
       jsEntryPath: "/abs/cli.js",
+      capturedPath: userPath,
     });
-    expect(script).toMatch(/export PATH/);
-    expect(script).toContain("/opt/homebrew/bin");
-    expect(script).toContain("/usr/local/bin");
-    expect(script).toContain("/opt/local/bin");
-    expect(script).toContain("/home/linuxbrew/.linuxbrew/bin");
-    // The augmentation must happen BEFORE we try to use NODE so the fallback
-    // discovery path also benefits.
-    const pathLine = script.search(/^PATH="/m);
+    // PATH must appear verbatim, single-quoted, BEFORE the NODE= line so the
+    // fallback discovery (command -v node) also benefits.
+    expect(script).toContain(`PATH='${userPath}'`);
+    const pathLine = script.search(/^PATH=/m);
     const nodeLine = script.search(/^NODE=/m);
     expect(pathLine).toBeGreaterThan(-1);
     expect(nodeLine).toBeGreaterThan(-1);
     expect(pathLine).toBeLessThan(nodeLine);
+  });
+
+  it("escapes single quotes in the captured PATH (defensive — unusual but valid)", () => {
+    const weirdPath = "/abs/with'apostrophe/bin:/usr/bin";
+    const script = renderNodeWrapper({
+      nodePath: "/abs/node",
+      jsEntryPath: "/abs/cli.js",
+      capturedPath: weirdPath,
+    });
+    expect(script).toContain("/abs/with'\\''apostrophe/bin:/usr/bin");
   });
 });
