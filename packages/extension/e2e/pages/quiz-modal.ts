@@ -87,12 +87,14 @@ export class QuizModal {
     // Wait for the host to be attached first.
     await this.page.waitForSelector(MODAL_HOST, { state: "attached" });
 
-    // Check for submit button → ready state.
-    const submitVisible = await this.page
-      .locator(`${SHADOW}css=[data-testid='lgtm-buzzer-quiz-submit']`)
+    // Check for progress indicator → ready state (stepper). The progress
+    // element is present for the whole ready lifecycle; the Submit button
+    // is only visible on the last step.
+    const progressVisible = await this.page
+      .locator(`${SHADOW}css=[data-testid='lgtm-buzzer-quiz-progress']`)
       .isVisible()
       .catch(() => false);
-    if (submitVisible) return "ready";
+    if (progressVisible) return "ready";
 
     // Check for retry button in the panel (failed or error).
     const retryVisible = await this.page
@@ -153,22 +155,89 @@ export class QuizModal {
   /**
    * Selects a choice within a question by id.
    *
+   * If the target fieldset is currently hidden (we're on an earlier step in
+   * the stepper), automatically clicks Next until the target is visible.
+   * Each Next click requires the currently-visible question to already have
+   * a selected answer — call `answerQuestion` in the natural question order
+   * for the canned quiz and the helper walks forward correctly.
+   *
    * @param questionId - The `data-question` attribute value.
    * @param choiceId - The `data-choice` attribute value (radio input).
    */
   async answerQuestion(questionId: string, choiceId: string): Promise<void> {
+    const target = this.page.locator(
+      `${SHADOW}css=fieldset[data-question='${questionId}']`,
+    );
+    // Walk forward until the target is visible. Cap at 10 to avoid
+    // infinite loops on a misconfigured stub.
+    for (let i = 0; i < 10; i++) {
+      const visible = await target.isVisible().catch(() => false);
+      if (visible) break;
+      const next = this.page.locator(
+        `${SHADOW}css=[data-testid='lgtm-buzzer-quiz-next']`,
+      );
+      const nextVisible = await next.isVisible().catch(() => false);
+      if (!nextVisible) {
+        throw new Error(
+          `answerQuestion('${questionId}'): target fieldset is not visible and Next is not present`,
+        );
+      }
+      await next.click();
+    }
     await this.page.click(
       `${SHADOW}css=[data-question='${questionId}'] [data-choice='${choiceId}']`,
     );
   }
 
   /**
-   * Clicks the Submit button. The button must be enabled (all questions answered).
+   * Clicks Next. Caller is expected to have answered the current question
+   * (Next is otherwise disabled).
+   */
+  async next(): Promise<void> {
+    await this.page.click(
+      `${SHADOW}css=[data-testid='lgtm-buzzer-quiz-next']`,
+    );
+  }
+
+  /**
+   * Clicks Prev (goes back one question; the prior answer remains locked).
+   */
+  async prev(): Promise<void> {
+    await this.page.click(
+      `${SHADOW}css=[data-testid='lgtm-buzzer-quiz-prev']`,
+    );
+  }
+
+  /**
+   * Walks through the stepper and submits the quiz.
+   *
+   * For each question that has at least one selected radio, clicks Next.
+   * On the last question Submit replaces Next; this method clicks whichever
+   * is visible. Caller must have already answered the necessary questions
+   * via `answerQuestion(...)`.
    */
   async submit(): Promise<void> {
-    await this.page.click(
-      `${SHADOW}css=[data-testid='lgtm-buzzer-quiz-submit']`,
-    );
+    // Loop until Submit becomes visible (last step) or we run out of steps.
+    // Guard the loop with a hard cap to avoid spinning if the modal mis-renders.
+    for (let i = 0; i < 10; i++) {
+      const submit = this.page.locator(
+        `${SHADOW}css=[data-testid='lgtm-buzzer-quiz-submit']`,
+      );
+      const submitVisible = await submit.isVisible().catch(() => false);
+      if (submitVisible) {
+        await submit.click();
+        return;
+      }
+      const next = this.page.locator(
+        `${SHADOW}css=[data-testid='lgtm-buzzer-quiz-next']`,
+      );
+      const nextVisible = await next.isVisible().catch(() => false);
+      if (!nextVisible) {
+        throw new Error("submit(): neither Next nor Submit is visible");
+      }
+      await next.click();
+    }
+    throw new Error("submit(): exceeded 10-step stepper walk");
   }
 
   /**

@@ -56,7 +56,7 @@ test("happy path: approve gates on quiz, passes on correct answers, form goes th
 
     // Step 2: Wait for the quiz to be ready (submit button appears).
     await page.waitForSelector(
-      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-submit']",
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-progress']",
     );
 
     const readyState = await modal.getState();

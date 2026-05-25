@@ -73,7 +73,7 @@ test("ADO vote: correct answers → quiz passes → vote click replayed", async 
 
     // 2. Wait for ready state.
     await page.waitForSelector(
-      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-submit']",
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-progress']",
     );
 
     // 3. Answer correctly.

@@ -116,6 +116,29 @@ const selectFirstChoice = (shadow: ShadowRoot, questionIndex = 0): void => {
   }
 };
 
+/** Clicks the Next button if visible. */
+const clickNext = (shadow: ShadowRoot): void => {
+  const next = shadow.querySelector<HTMLButtonElement>(
+    "[data-testid='lgtm-buzzer-quiz-next']",
+  );
+  if (next !== null && !next.hidden) next.click();
+};
+
+/**
+ * Walks the stepper to the last question by selecting the first choice on
+ * each step except the last. Caller still needs to selectFirstChoice on the
+ * last question and click Submit.
+ */
+const advanceToLastQuestion = (
+  shadow: ShadowRoot,
+  totalQuestions: number,
+): void => {
+  for (let i = 0; i < totalQuestions - 1; i++) {
+    selectFirstChoice(shadow, i);
+    clickNext(shadow);
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Tests — Original backward-compat suite (ADR-18, ADR-19, ADR-23)
 // ---------------------------------------------------------------------------
@@ -207,11 +230,16 @@ describe("createQuizModal", () => {
 
     const shadow = getShadow(document)!;
 
-    selectFirstChoice(shadow, 0);
+    // Step through the 2-question quiz: answer + Next on Q1, answer on Q2,
+    // then Submit appears.
+    advanceToLastQuestion(shadow, 2);
     selectFirstChoice(shadow, 1);
 
-    const submitBtn = shadow.querySelector<HTMLButtonElement>(".btn-primary");
+    const submitBtn = shadow.querySelector<HTMLButtonElement>(
+      "[data-testid='lgtm-buzzer-quiz-submit']",
+    );
     expect(submitBtn).not.toBeNull();
+    expect(submitBtn!.hidden).toBe(false);
     expect(submitBtn!.disabled).toBe(false);
     submitBtn!.click();
 
@@ -225,8 +253,9 @@ describe("createQuizModal", () => {
     document.removeEventListener(DOM_EVENTS.quizSubmit, cleanup as unknown as EventListener);
   });
 
-  // 6. Submit disabled when not all questions answered
-  it("submit button is disabled when not all questions are answered", () => {
+  // 6. Stepper: Next disabled until current question answered;
+  //    Submit hidden until last question reached.
+  it("Next/Submit are gated on the current question's answer (stepper)", () => {
     const modal = createQuizModal({ doc: document });
     dispose = modal.start();
 
@@ -234,11 +263,29 @@ describe("createQuizModal", () => {
     fireQuizReady(document);
 
     const shadow = getShadow(document)!;
-    const submitBtn = shadow.querySelector<HTMLButtonElement>(".btn-primary");
+    const nextBtn = shadow.querySelector<HTMLButtonElement>(
+      "[data-testid='lgtm-buzzer-quiz-next']",
+    );
+    const submitBtn = shadow.querySelector<HTMLButtonElement>(
+      "[data-testid='lgtm-buzzer-quiz-submit']",
+    );
+    expect(nextBtn).not.toBeNull();
     expect(submitBtn).not.toBeNull();
-    expect(submitBtn!.disabled).toBe(true);
 
+    // Initial state: on Q1 of 2. Next visible but disabled; Submit hidden.
+    expect(nextBtn!.hidden).toBe(false);
+    expect(nextBtn!.disabled).toBe(true);
+    expect(submitBtn!.hidden).toBe(true);
+
+    // Answer Q1: Next enables, Submit still hidden.
     selectFirstChoice(shadow, 0);
+    expect(nextBtn!.disabled).toBe(false);
+    expect(submitBtn!.hidden).toBe(true);
+
+    // Advance to Q2 — Next swaps for Submit; Submit gated on Q2 answer.
+    nextBtn!.click();
+    expect(nextBtn!.hidden).toBe(true);
+    expect(submitBtn!.hidden).toBe(false);
     expect(submitBtn!.disabled).toBe(true);
 
     selectFirstChoice(shadow, 1);
@@ -254,9 +301,11 @@ describe("createQuizModal", () => {
     fireQuizReady(document);
 
     const shadow = getShadow(document)!;
-    selectFirstChoice(shadow, 0);
+    advanceToLastQuestion(shadow, 2);
     selectFirstChoice(shadow, 1);
-    shadow.querySelector<HTMLButtonElement>(".btn-primary")!.click();
+    shadow.querySelector<HTMLButtonElement>(
+      "[data-testid='lgtm-buzzer-quiz-submit']",
+    )!.click();
 
     fireQuizPassed(document);
 
@@ -293,9 +342,11 @@ describe("createQuizModal", () => {
     fireQuizReady(document);
 
     const shadow = getShadow(document)!;
-    selectFirstChoice(shadow, 0);
+    advanceToLastQuestion(shadow, 2);
     selectFirstChoice(shadow, 1);
-    shadow.querySelector<HTMLButtonElement>(".btn-primary")!.click();
+    shadow.querySelector<HTMLButtonElement>(
+      "[data-testid='lgtm-buzzer-quiz-submit']",
+    )!.click();
 
     fireQuizFailed(document, "req-1", /* withPerQuestion */ true);
 
@@ -1005,5 +1056,100 @@ describe("createQuizModal — ADR-24 state machine", () => {
     expect(installLink).not.toBeNull();
     expect(installLink!.tagName.toLowerCase()).toBe("a");
     expect(installLink!.getAttribute("href")).toContain("github.com/tibtof/lgtm-buzzer");
+  });
+
+  // ---- Stepper behaviour (new) -----------------------------------------
+
+  // 24. Only the current question is visible
+  it("24. stepper: only the current question fieldset is visible", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    const fieldsets = shadow.querySelectorAll<HTMLFieldSetElement>("fieldset");
+    expect(fieldsets.length).toBe(2);
+    expect(fieldsets[0]!.hidden).toBe(false);
+    expect(fieldsets[1]!.hidden).toBe(true);
+
+    selectFirstChoice(shadow, 0);
+    clickNext(shadow);
+
+    expect(fieldsets[0]!.hidden).toBe(true);
+    expect(fieldsets[1]!.hidden).toBe(false);
+  });
+
+  // 25. Progress indicator updates
+  it("25. stepper: progress indicator shows 'Question i of n'", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    const progress = shadow.querySelector("[data-testid='lgtm-buzzer-quiz-progress']");
+    expect(progress).not.toBeNull();
+    expect(progress!.textContent).toBe("Question 1 of 2");
+
+    selectFirstChoice(shadow, 0);
+    clickNext(shadow);
+    expect(progress!.textContent).toBe("Question 2 of 2");
+  });
+
+  // 26. Answers lock on advance
+  it("26. stepper: an answered question's radios lock when you click Next", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    selectFirstChoice(shadow, 0);
+    clickNext(shadow);
+
+    const q0Radios = shadow.querySelectorAll<HTMLInputElement>(
+      "input[name='lgtm-q-0']",
+    );
+    for (const r of q0Radios) {
+      expect(r.disabled).toBe(true);
+    }
+    const q0Fieldset = shadow.querySelector<HTMLFieldSetElement>(
+      "fieldset[data-question-index='0']",
+    );
+    expect(q0Fieldset?.getAttribute("data-locked")).toBe("true");
+  });
+
+  // 27. Prev navigates back without unlocking
+  it("27. stepper: Prev navigates back; previous answer is preserved and read-only", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    const shadow = getShadow(document)!;
+    selectFirstChoice(shadow, 0);
+    clickNext(shadow);
+
+    // On Q2; click Prev.
+    const prev = shadow.querySelector<HTMLButtonElement>(
+      "[data-testid='lgtm-buzzer-quiz-prev']",
+    );
+    expect(prev).not.toBeNull();
+    expect(prev!.disabled).toBe(false);
+    prev!.click();
+
+    // Q1 visible again; first radio still checked AND still disabled.
+    const q0First = shadow.querySelector<HTMLInputElement>("input[name='lgtm-q-0']");
+    expect(q0First).not.toBeNull();
+    expect(q0First!.checked).toBe(true);
+    expect(q0First!.disabled).toBe(true);
+
+    // Prev disabled on Q1.
+    expect(prev!.disabled).toBe(true);
   });
 });
