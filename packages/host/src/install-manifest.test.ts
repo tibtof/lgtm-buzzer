@@ -245,4 +245,29 @@ describe("renderNodeWrapper", () => {
     });
     expect(script).toContain("'/Users/test/Application Support/host/cli.js'");
   });
+
+  it("augments PATH with common CLI dirs unconditionally (ADR-29 resolvers need gh/az)", () => {
+    // Chrome spawns native-messaging hosts with a minimal PATH (typically
+    // /usr/bin:/bin), which is missing the dirs where gh, az, and other
+    // CLIs live. The wrapper MUST extend PATH unconditionally so the host's
+    // resolver subprocess invocations resolve. Regression for the second
+    // bug surfaced after #113 shipped: github resolver returning missing-
+    // credentials because `gh` was not on Chrome's PATH.
+    const script = renderNodeWrapper({
+      nodePath: "/abs/node",
+      jsEntryPath: "/abs/cli.js",
+    });
+    expect(script).toMatch(/export PATH/);
+    expect(script).toContain("/opt/homebrew/bin");
+    expect(script).toContain("/usr/local/bin");
+    expect(script).toContain("/opt/local/bin");
+    expect(script).toContain("/home/linuxbrew/.linuxbrew/bin");
+    // The augmentation must happen BEFORE we try to use NODE so the fallback
+    // discovery path also benefits.
+    const pathLine = script.search(/^PATH="/m);
+    const nodeLine = script.search(/^NODE=/m);
+    expect(pathLine).toBeGreaterThan(-1);
+    expect(nodeLine).toBeGreaterThan(-1);
+    expect(pathLine).toBeLessThan(nodeLine);
+  });
 });

@@ -103,6 +103,58 @@
         margin-top: 20px;
       }
       section[data-lgtm-section="adapters"] { margin-bottom: 8px; }
+      section[data-lgtm-section="auth-status"] {
+        margin-top: 16px;
+        padding-top: 12px;
+        border-top: 1px solid #d0d7de;
+      }
+      section[data-lgtm-section="auth-status"] h2 { margin-bottom: 8px; }
+      section[data-lgtm-section="auth-status"] [data-lgtm-refresh] {
+        margin-bottom: 12px;
+        padding: 4px 12px;
+        font-size: 12px;
+      }
+      [data-lgtm-auth-row] {
+        display: grid;
+        grid-template-columns: 18px minmax(120px, max-content) 1fr;
+        column-gap: 10px;
+        align-items: baseline;
+        padding: 6px 0;
+        border-top: 1px solid #eaeef2;
+        font-size: 13px;
+      }
+      [data-lgtm-auth-row]:first-of-type { border-top: none; }
+      [data-lgtm-auth-icon] {
+        font-weight: 700;
+        text-align: center;
+      }
+      [data-lgtm-auth-row][data-lgtm-auth-ok="true"] [data-lgtm-auth-icon] {
+        color: #1a7f37;
+      }
+      [data-lgtm-auth-row][data-lgtm-auth-ok="false"] [data-lgtm-auth-icon] {
+        color: #cf222e;
+      }
+      [data-lgtm-auth-adapter-id] {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      [data-lgtm-auth-detail] {
+        color: #656d76;
+        word-break: break-word;
+      }
+      [data-lgtm-auth-row][data-lgtm-auth-ok="false"] [data-lgtm-auth-detail] {
+        color: #9a6700;
+      }
+      [data-lgtm-auth-error-banner] {
+        background: #fff0f0;
+        color: #cf222e;
+        border: 1px solid #ffc1c1;
+        border-radius: 6px;
+        padding: 10px 14px;
+        font-size: 13px;
+        margin: 8px 0;
+      }
     </style>
   </head>
   <body>
