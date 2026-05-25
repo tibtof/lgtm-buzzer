@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createQuizModal } from "./modal.js";
 import {
   DOM_EVENTS,
@@ -1151,5 +1151,296 @@ describe("createQuizModal — ADR-24 state machine", () => {
 
     // Prev disabled on Q1.
     expect(prev!.disabled).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — Quiz stats UI (timer, ETA bar, score header, stats footer)
+// ---------------------------------------------------------------------------
+
+/** Fake StatsStore builder for modal tests. */
+const makeStatsStore = (overrides?: {
+  medianMs?: number | null;
+  passRate?: { passed: number; total: number } | null;
+  recordGeneration?: () => Promise<void>;
+  recordQuiz?: () => Promise<void>;
+}) => ({
+  recordGeneration: overrides?.recordGeneration ?? (() => Promise.resolve()),
+  recordQuiz: overrides?.recordQuiz ?? (() => Promise.resolve()),
+  getMedianGenerationMs: () => Promise.resolve(overrides?.medianMs ?? null),
+  getRecentPassRate: () => Promise.resolve(overrides?.passRate ?? null),
+});
+
+describe("createQuizModal — stats UI", () => {
+  let dispose: (() => void) | null = null;
+
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    dispose?.();
+    dispose = null;
+    document.querySelectorAll("[data-lgtm-modal-host]").forEach((n) => n.remove());
+  });
+
+  // 28. Timer element renders in generating state
+  it("28. stats: generation timer element is rendered in generating state", () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore(),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    const shadow = getShadow(document)!;
+    const timer = shadow.querySelector("[data-testid='lgtm-buzzer-generation-timer']");
+    expect(timer).not.toBeNull();
+    expect(timer!.tagName.toLowerCase()).toBe("time");
+  });
+
+  // 29. Timer text updates when fake time advances
+  it("29. stats: generation timer ticks every 250ms", async () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore(),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    const shadow = getShadow(document)!;
+    const timer = shadow.querySelector<HTMLElement>(
+      "[data-testid='lgtm-buzzer-generation-timer']",
+    );
+    expect(timer).not.toBeNull();
+
+    // Initial tick shows 0s.
+    expect(timer!.textContent).toBe("0s");
+
+    // Advance 1 second → timer shows 1s.
+    vi.advanceTimersByTime(1000);
+    expect(timer!.textContent).toBe("1s");
+
+    // Advance 4 more seconds → 5s.
+    vi.advanceTimersByTime(4000);
+    expect(timer!.textContent).toBe("5s");
+  });
+
+  // 30. ETA bar absent when no history (fewer than 3 samples)
+  it("30. stats: ETA bar is absent when no history (medianMs = null)", () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore({ medianMs: null }),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    const shadow = getShadow(document)!;
+    // ETA bar should not be present yet (median is fetched async, and it's null)
+    const etaBar = shadow.querySelector("[data-testid='lgtm-buzzer-generation-eta']");
+    expect(etaBar).toBeNull();
+  });
+
+  // 31. ETA bar renders when history exists
+  it("31. stats: ETA bar renders when medianMs is available", async () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore({ medianMs: 10000 }),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    // Allow the async median Promise to resolve (1ms is enough for microtasks).
+    await vi.advanceTimersByTimeAsync(1);
+
+    const shadow = getShadow(document)!;
+    const etaBar = shadow.querySelector("[data-testid='lgtm-buzzer-generation-eta']");
+    expect(etaBar).not.toBeNull();
+    expect(etaBar!.tagName.toLowerCase()).toBe("progress");
+  });
+
+  // 32. ETA bar value is capped at 95%
+  it("32. stats: ETA bar value never exceeds 95% of max", async () => {
+    const medianMs = 10000;
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore({ medianMs }),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+
+    // Resolve the async median fetch, then advance well past the median.
+    await vi.advanceTimersByTimeAsync(1);
+
+    // Advance time well past the median (20 seconds).
+    vi.advanceTimersByTime(20000);
+
+    const shadow = getShadow(document)!;
+    const etaBar = shadow.querySelector<HTMLProgressElement>(
+      "[data-testid='lgtm-buzzer-generation-eta']",
+    );
+    expect(etaBar).not.toBeNull();
+    // value should be <= 95% of max.
+    const fraction = etaBar!.value / etaBar!.max;
+    expect(fraction).toBeLessThanOrEqual(0.95);
+  });
+
+  // 33. Score header shows "X of N correct" on pass
+  it("33. stats: score header shows 'X of N correct' on quiz-passed", () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore(),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizPassed(document); // passes with correct:2, total:2
+
+    const shadow = getShadow(document)!;
+    const header = shadow.querySelector("[data-testid='lgtm-buzzer-score-header']");
+    expect(header).not.toBeNull();
+    expect(header!.textContent).toBe("2 of 2 correct");
+  });
+
+  // 34. Score header shows "X of N correct" on fail
+  it("34. stats: score header shows 'X of N correct' on quiz-failed", () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore(),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizFailed(document); // fails with correct:0, total:2
+
+    const shadow = getShadow(document)!;
+    const header = shadow.querySelector("[data-testid='lgtm-buzzer-score-header']");
+    expect(header).not.toBeNull();
+    expect(header!.textContent).toBe("0 of 2 correct");
+  });
+
+  // 35. Stats footer renders on pass result
+  it("35. stats: stats footer is rendered on quiz-passed", () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore(),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizPassed(document);
+
+    const shadow = getShadow(document)!;
+    const footer = shadow.querySelector("[data-testid='lgtm-buzzer-stats-footer']");
+    expect(footer).not.toBeNull();
+  });
+
+  // 36. Stats footer contains adapter badge
+  it("36. stats: stats footer shows adapter badge 'via <adapter>'", () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore(),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizPassed(document);
+
+    const shadow = getShadow(document)!;
+    const footer = shadow.querySelector("[data-testid='lgtm-buzzer-stats-footer']");
+    expect(footer).not.toBeNull();
+    expect(footer!.textContent).toContain("via claude-cli");
+  });
+
+  // 37. Stats footer shows pass rate when available
+  it("37. stats: stats footer shows pass rate when available", async () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore({ passRate: { passed: 7, total: 10 } }),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizPassed(document);
+
+    // Allow async pass-rate fetch to resolve (1ms is enough for microtasks).
+    await vi.advanceTimersByTimeAsync(1);
+
+    const shadow = getShadow(document)!;
+    const footer = shadow.querySelector("[data-testid='lgtm-buzzer-stats-footer']");
+    expect(footer).not.toBeNull();
+    expect(footer!.textContent).toContain("7 passed");
+  });
+
+  // 38. Stats footer also renders on quiz-failed
+  it("38. stats: stats footer is rendered on quiz-failed", () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore(),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizFailed(document);
+
+    const shadow = getShadow(document)!;
+    const footer = shadow.querySelector("[data-testid='lgtm-buzzer-stats-footer']");
+    expect(footer).not.toBeNull();
+    expect(footer!.textContent).toContain("via claude-cli");
+  });
+
+  // 39. Modal without stats dep still renders result states correctly
+  it("39. stats: modal works without stats dep (no score header / footer)", () => {
+    // No stats dep passed — backward-compat check.
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizPassed(document);
+
+    const shadow = getShadow(document)!;
+    // Score header still renders (it only depends on result payload, not stats).
+    const header = shadow.querySelector("[data-testid='lgtm-buzzer-score-header']");
+    expect(header).not.toBeNull();
+    // Stats footer still renders (it shows at minimum "via unknown").
+    const footer = shadow.querySelector("[data-testid='lgtm-buzzer-stats-footer']");
+    expect(footer).not.toBeNull();
+    expect(footer!.textContent).toContain("via unknown");
+  });
+
+  // 40. Timer is cleared when transitioning out of generating state
+  it("40. stats: timer interval is cleared on transition away from generating", async () => {
+    const modal = createQuizModal({
+      doc: document,
+      stats: makeStatsStore(),
+      adapterId: "claude-cli",
+    });
+    dispose = modal.start();
+
+    fireQuizRequest(document);
+    fireQuizReady(document);
+
+    // Timer element should be gone after transitioning to ready.
+    const shadow = getShadow(document)!;
+    const timer = shadow.querySelector("[data-testid='lgtm-buzzer-generation-timer']");
+    expect(timer).toBeNull();
   });
 });

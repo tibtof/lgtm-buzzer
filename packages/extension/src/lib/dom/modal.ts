@@ -27,6 +27,7 @@ import {
 import { classifyError, errorClassToUI } from "./error-classes.js";
 import { createFocusTrap } from "./focus-trap.js";
 import type { FocusTrap } from "./focus-trap.js";
+import type { StatsStore } from "../stats/store.js";
 
 // DOM event name for "open options page" (ADR-23).
 const OPEN_OPTIONS_EVENT = "lgtm-buzzer:open-options";
@@ -353,6 +354,32 @@ const MODAL_CSS = `
     margin: 0 0 16px 0;
     line-height: 1.5;
   }
+  .generation-timer {
+    font-variant-numeric: tabular-nums;
+    color: #57606a;
+    font-size: 13px;
+    margin-left: 4px;
+  }
+  .eta-bar {
+    margin: 8px 0 0 0;
+    width: 100%;
+    height: 4px;
+    border-radius: 2px;
+    accent-color: #0969da;
+  }
+  .score-header {
+    font-size: 14px;
+    font-weight: 600;
+    color: #24292f;
+    margin: 0 0 8px 0;
+  }
+  .stats-footer {
+    font-size: 12px;
+    color: #57606a;
+    margin: 12px 0 0 0;
+    padding-top: 8px;
+    border-top: 1px solid #f0f0f0;
+  }
 `;
 
 // ---------------------------------------------------------------------------
@@ -365,6 +392,20 @@ export type QuizModalDeps = {
   readonly doc: Document;
   /** Optional structured logger for unexpected-state warnings. */
   readonly logger?: DOMEventLogger;
+  /**
+   * Optional stats store for recording and reading generation/quiz history.
+   *
+   * When provided:
+   * - A live generation timer is shown in `generating` state.
+   * - An ETA progress bar is shown when ≥3 historical samples exist.
+   * - A score header and stats footer are rendered on `passed`/`failed` states.
+   */
+  readonly stats?: StatsStore;
+  /**
+   * The LLM adapter id used for the current quiz flow. Shown in the stats
+   * footer on result screens. Defaults to `"unknown"` when absent.
+   */
+  readonly adapterId?: string;
 };
 
 /**
@@ -754,7 +795,7 @@ const renderFailed = (
  * @param deps - Injected dependencies: `doc` and optional `logger`.
  */
 export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
-  const { doc, logger } = deps;
+  const { doc, logger, stats, adapterId = "unknown" } = deps;
 
   // Modal host element + shadow root (created once; never re-mounted).
   let host: HTMLDivElement | null = null;
@@ -776,6 +817,53 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
 
   // aria-live region — a persistent element that announces state transitions.
   let liveRegion: HTMLElement | null = null;
+
+  // Generation start time (set when entering `generating`, cleared on exit).
+  let generationStartMs: number | null = null;
+
+  // Duration of the last generation (ms), for display on result screens.
+  let lastGenerationDurationMs: number | null = null;
+
+  // setInterval id for the live timer in `generating` state.
+  let timerIntervalId: ReturnType<typeof setInterval> | null = null;
+
+  // Median generation time cached on entering `generating` state.
+  let cachedMedianMs: number | null = null;
+
+  // Recent pass rate cached on entering result states.
+  let cachedPassRate: { passed: number; total: number } | null = null;
+
+  // ---------------------------------------------------------------------------
+  // Stats footer helper (closes over factory-scope state)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Renders the stats footer line: `via <adapter> · generated in Xs · Last 10: Y passed`.
+   *
+   * Parts are omitted when the corresponding data is unavailable.
+   */
+  const renderStatsFooter = (d: Document): HTMLElement => {
+    const footer = el(d, "footer", {
+      "data-testid": "lgtm-buzzer-stats-footer",
+      class: "stats-footer",
+    });
+
+    const parts: string[] = [];
+
+    parts.push(`via ${adapterId}`);
+
+    if (lastGenerationDurationMs !== null) {
+      const seconds = Math.round(lastGenerationDurationMs / 1000);
+      parts.push(`generated in ${seconds}s`);
+    }
+
+    if (cachedPassRate !== null) {
+      parts.push(`Last ${cachedPassRate.total}: ${cachedPassRate.passed} passed`);
+    }
+
+    footer.textContent = parts.join(" · ");
+    return footer;
+  };
 
   // ---------------------------------------------------------------------------
   // Mount
@@ -899,6 +987,57 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         subtitle.textContent = "Preparing your quiz…";
         content.appendChild(renderGenerating(doc));
 
+        // Live generation timer.
+        const timerEl = el(doc, "time", {
+          "data-testid": "lgtm-buzzer-generation-timer",
+          class: "generation-timer",
+        });
+        timerEl.setAttribute("datetime", "");
+
+        // Insert timer into the loading div (first child of content).
+        const loadingDiv = content.querySelector(".loading");
+        if (loadingDiv !== null) {
+          loadingDiv.appendChild(timerEl);
+        }
+
+        // ETA progress bar — shown only when we have a cached median.
+        if (cachedMedianMs !== null) {
+          const etaBar = el(doc, "progress", {
+            "data-testid": "lgtm-buzzer-generation-eta",
+            class: "eta-bar",
+            max: String(cachedMedianMs),
+          }) as HTMLProgressElement;
+          etaBar.value = 0;
+          content.appendChild(etaBar);
+        }
+
+        // Tick function: update timer text and ETA bar.
+        const tick = (): void => {
+          if (generationStartMs === null) return;
+          const elapsed = Date.now() - generationStartMs;
+          const seconds = Math.floor(elapsed / 1000);
+          timerEl.textContent = `${seconds}s`;
+          timerEl.setAttribute("datetime", `PT${seconds}S`);
+
+          if (cachedMedianMs !== null) {
+            const etaBar = shadow?.querySelector<HTMLProgressElement>(
+              "[data-testid='lgtm-buzzer-generation-eta']",
+            );
+            if (etaBar !== null && etaBar !== undefined) {
+              const fraction = Math.min(0.95, elapsed / cachedMedianMs);
+              etaBar.value = fraction * cachedMedianMs;
+            }
+          }
+        };
+
+        // Clear any stale interval before starting a new one.
+        if (timerIntervalId !== null) {
+          clearInterval(timerIntervalId);
+          timerIntervalId = null;
+        }
+        tick(); // Immediate first tick.
+        timerIntervalId = setInterval(tick, 250);
+
         const cancelBtn = textEl(doc, "button", "Cancel", {
           class: "btn btn-secondary",
           "data-testid": "lgtm-buzzer-quiz-cancel",
@@ -948,9 +1087,18 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
 
       case "passed": {
         subtitle.textContent = "Well done!";
+
+        const scoreHeader = textEl(doc, "header", `${state.result.correct} of ${state.result.total} correct`, {
+          "data-testid": "lgtm-buzzer-score-header",
+          class: "score-header",
+        });
+        content.appendChild(scoreHeader);
+
         content.appendChild(
           renderPassed(doc, state.result, activeQuiz ?? { id: "", questions: [] }),
         );
+
+        content.appendChild(renderStatsFooter(doc));
 
         const dismissBtn = textEl(doc, "button", "Dismiss", {
           class: "btn btn-secondary",
@@ -963,9 +1111,18 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
       case "failed": {
         const { requestId } = state;
         subtitle.textContent = "Approval blocked.";
+
+        const scoreHeader = textEl(doc, "header", `${state.result.correct} of ${state.result.total} correct`, {
+          "data-testid": "lgtm-buzzer-score-header",
+          class: "score-header",
+        });
+        content.appendChild(scoreHeader);
+
         content.appendChild(
           renderFailed(doc, state.result, activeQuiz ?? { id: "", questions: [] }),
         );
+
+        content.appendChild(renderStatsFooter(doc));
 
         const dismissBtn = textEl(doc, "button", "Dismiss", {
           class: "btn btn-secondary",
@@ -1089,8 +1246,64 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
   // State transitions
   // ---------------------------------------------------------------------------
 
+  const stopTimer = (): void => {
+    if (timerIntervalId !== null) {
+      clearInterval(timerIntervalId);
+      timerIntervalId = null;
+    }
+  };
+
   const transition = (next: ModalState): void => {
     const prev = state;
+
+    // --- Stats side-effects before state change ---
+
+    // Leaving generating: stop timer, record duration.
+    if (prev.kind === "generating" && next.kind !== "generating") {
+      stopTimer();
+      if (generationStartMs !== null) {
+        lastGenerationDurationMs = Date.now() - generationStartMs;
+        generationStartMs = null;
+      }
+    }
+
+    // Entering generating: record start time, cache median, reset duration.
+    if (next.kind === "generating") {
+      generationStartMs = Date.now();
+      lastGenerationDurationMs = null;
+      // Fetch median asynchronously — re-render once we have it.
+      if (stats !== undefined) {
+        void stats.getMedianGenerationMs(adapterId).then((median) => {
+          cachedMedianMs = median;
+          // Only re-render if we're still in generating state.
+          if (state.kind === "generating") {
+            render();
+          }
+        });
+      }
+    }
+
+    // Entering a result state: fetch pass rate asynchronously.
+    if (next.kind === "passed" || next.kind === "failed") {
+      if (stats !== undefined) {
+        void stats.getRecentPassRate(10).then((rate) => {
+          cachedPassRate = rate;
+          // Only re-render if we're still in the same result state.
+          if (state.kind === next.kind) {
+            render();
+          }
+        });
+      }
+    }
+
+    // Entering idle: clear stats.
+    if (next.kind === "idle") {
+      stopTimer();
+      generationStartMs = null;
+      cachedMedianMs = null;
+      cachedPassRate = null;
+    }
+
     state = next;
 
     // Validate transition: warn on invalid but always proceed.
@@ -1106,6 +1319,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
   };
 
   const closeModal = (): void => {
+    stopTimer();
     focusTrap?.deactivate();
     focusTrap = null;
     liveRegion = null;
@@ -1272,6 +1486,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         disposeRequest();
         disposeResult();
         doc.removeEventListener("keydown", handleKeyDown);
+        stopTimer();
         focusTrap?.deactivate();
         focusTrap = null;
         host?.remove();
@@ -1281,6 +1496,10 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         activeQuiz = null;
         collectAnswers = null;
         liveRegion = null;
+        generationStartMs = null;
+        lastGenerationDurationMs = null;
+        cachedMedianMs = null;
+        cachedPassRate = null;
       };
     },
   };
