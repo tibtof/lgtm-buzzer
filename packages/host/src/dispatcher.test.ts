@@ -2,9 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { IO, NonEmptyList } from "monadyssey";
 import { createDispatcher } from "./dispatcher.js";
 import { createSessionStore } from "./session-store.js";
+import { createQuestionPoolCache } from "./question-pool-cache.js";
 import type { FrameWriter } from "./framing/writer.js";
 import type { Frame } from "@lgtm-buzzer/protocol";
-import { PROTOCOL_VERSION } from "@lgtm-buzzer/protocol";
+import { PROTOCOL_VERSION, RESAMPLE_FAILED_PREFIX } from "@lgtm-buzzer/protocol";
 import type {
   Logger,
   Quiz,
@@ -127,8 +128,9 @@ const makeTestSetup = (registry?: AdapterRegistry) => {
   const { writer, frames } = makeCapturingWriter();
   const logger = makeNoopLogger();
   const reg = registry ?? makeFakeRegistry();
-  const dispatcher = createDispatcher({ write: writer, store, logger, registry: reg });
-  return { dispatcher, store, frames, logger, registry: reg };
+  const cache = createQuestionPoolCache();
+  const dispatcher = createDispatcher({ write: writer, store, logger, registry: reg, cache });
+  return { dispatcher, store, frames, logger, registry: reg, cache };
 };
 
 // ---------------------------------------------------------------------------
@@ -192,6 +194,7 @@ describe("dispatcher — error frame from extension", () => {
       store,
       logger,
       registry: makeFakeRegistry(),
+      cache: createQuestionPoolCache(),
     });
     const errFrame: Frame = {
       v: PROTOCOL_VERSION,
@@ -363,6 +366,7 @@ describe("dispatcher — quiz-submit happy path", () => {
       store,
       logger,
       registry: makeFakeRegistry(),
+      cache: createQuestionPoolCache(),
     });
 
     const answerKey: AnswerKey = new Map([[questionId("q1"), choiceId("c1")]]);
@@ -400,6 +404,7 @@ describe("dispatcher — quiz-submit happy path", () => {
       store,
       logger,
       registry: makeFakeRegistry(),
+      cache: createQuestionPoolCache(),
     });
 
     const answerKey: AnswerKey = new Map([[questionId("q1"), choiceId("c1")]]);
@@ -436,6 +441,7 @@ describe("dispatcher — quiz-submit happy path", () => {
       store,
       logger,
       registry: makeFakeRegistry(),
+      cache: createQuestionPoolCache(),
     });
 
     const answerKey: AnswerKey = new Map([[questionId("q1"), choiceId("c1")]]);
@@ -471,6 +477,7 @@ describe("dispatcher — quiz-submit duplicate questionId", () => {
       store,
       logger,
       registry: makeFakeRegistry(),
+      cache: createQuestionPoolCache(),
     });
 
     const answerKey: AnswerKey = new Map([[questionId("q1"), choiceId("c1")]]);
@@ -508,6 +515,7 @@ describe("dispatcher — quiz-submit duplicate questionId", () => {
       store,
       logger,
       registry: makeFakeRegistry(),
+      cache: createQuestionPoolCache(),
     });
 
     // Answer key has only q1
@@ -591,7 +599,7 @@ describe("dispatcher — quiz-request with unsupported-llm-adapter", () => {
     const { writer, frames } = makeCapturingWriter();
     const logger = makeNoopLogger();
     const registry = makeFailingLlmRegistry(err);
-    const dispatcher = createDispatcher({ write: writer, store, logger, registry });
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
 
     const frame: Frame = {
       v: PROTOCOL_VERSION,
@@ -642,7 +650,7 @@ describe("dispatcher — quiz-request with unsupported-vcs-adapter", () => {
       buildVcs: () => IO.fail(err),
     };
 
-    const dispatcher = createDispatcher({ write: writer, store, logger, registry });
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
 
     const frame: Frame = {
       v: PROTOCOL_VERSION,
@@ -689,7 +697,7 @@ describe("dispatcher — quiz-request with missing-credentials", () => {
       buildVcs: () => IO.fail(err),
     };
 
-    const dispatcher = createDispatcher({ write: writer, store, logger, registry });
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
 
     const frame: Frame = {
       v: PROTOCOL_VERSION,
@@ -733,7 +741,7 @@ describe("dispatcher — quiz-request ignores stale credentials field (ADR-29)",
     const store = createSessionStore();
     const { writer, frames } = makeCapturingWriter();
     const logger = makeNoopLogger();
-    const dispatcher = createDispatcher({ write: writer, store, logger, registry });
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
 
     // Stale extension still sends credentials field — dispatcher must ignore it.
     const frame: Frame = {
@@ -762,7 +770,7 @@ describe("dispatcher — quiz-request ignores stale credentials field (ADR-29)",
     const store = createSessionStore();
     const { writer, frames } = makeCapturingWriter();
     const logger = makeNoopLogger();
-    const dispatcher = createDispatcher({ write: writer, store, logger, registry });
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
 
     const frame: Frame = {
       v: PROTOCOL_VERSION,
@@ -844,7 +852,7 @@ describe("dispatcher — check-auth-request", () => {
     const store = createSessionStore();
     const { writer, frames } = makeCapturingWriter();
     const logger = makeNoopLogger();
-    const dispatcher = createDispatcher({ write: writer, store, logger, registry });
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
 
     const frame: Frame = {
       v: PROTOCOL_VERSION,
@@ -931,7 +939,7 @@ describe("dispatcher — legacy envelope backward compat (no adapter IDs)", () =
     const store = createSessionStore();
     const { writer, frames } = makeCapturingWriter();
     const logger = makeNoopLogger();
-    const dispatcher = createDispatcher({ write: writer, store, logger, registry });
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
 
     const frame: Frame = {
       v: PROTOCOL_VERSION,
@@ -951,6 +959,226 @@ describe("dispatcher — legacy envelope backward compat (no adapter IDs)", () =
     expect(frames).toHaveLength(1);
     const reply = frames[0]!;
     expect(reply.kind).toBe("quiz-response");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: ADR-30 — question pool cache + quiz-resample-request
+// ---------------------------------------------------------------------------
+
+describe("dispatcher — quiz-request with questionPoolSize (pool path)", () => {
+  it("cache miss → LLM called once; quiz-response returned", async () => {
+    const quiz = makeQuiz("quiz-pool");
+    const llm = makeFakeLlm("claude-cli", quiz);
+    const vcs = makeFakeVcs("github", "diff --git a/foo.ts");
+    const registry = makeFakeRegistry(llm, vcs);
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const cache = createQuestionPoolCache();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache });
+
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "corr-pool-1",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 1,
+        questionPoolSize: 3,
+      },
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // LLM was called once (cache miss).
+    expect(llm.generateQuizCalls).toBe(1);
+    // Got a quiz-response back.
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.kind).toBe("quiz-response");
+    // Cache now has 1 pool.
+    expect(cache.size()).toBe(1);
+  });
+
+  it("cache hit → LLM NOT called on second request for same PR + diff", async () => {
+    const quiz = makeQuiz("quiz-pool-hit");
+    const llm = makeFakeLlm("claude-cli", quiz);
+    const vcs = makeFakeVcs("github", "diff --git a/foo.ts");
+    const registry = makeFakeRegistry(llm, vcs);
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const cache = createQuestionPoolCache();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache });
+
+    const requestFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "corr-hit-1",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 1,
+        questionPoolSize: 3,
+      },
+    };
+
+    // First request — cache miss.
+    await dispatcher.dispatch(requestFrame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(llm.generateQuizCalls).toBe(1);
+    expect(frames).toHaveLength(1);
+
+    // Second request for the same PR+diff — cache hit, LLM not called again.
+    const requestFrame2: Frame = {
+      ...requestFrame,
+      correlationId: "corr-hit-2",
+    };
+    await dispatcher.dispatch(requestFrame2).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(llm.generateQuizCalls).toBe(1); // still 1, no new LLM call
+    expect(frames).toHaveLength(2);
+    expect(frames[1]!.kind).toBe("quiz-response");
+  });
+
+  it("rejects with internal error when questionPoolSize < questionCount", async () => {
+    const { dispatcher, frames } = makeTestSetup();
+
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "corr-invalid-pool",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 5,
+        questionPoolSize: 3, // < questionCount → should be rejected
+      },
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+
+    expect(frames).toHaveLength(1);
+    const reply = frames[0]!;
+    expect(reply.kind).toBe("error");
+    if (reply.kind === "error") {
+      expect(reply.payload.reason).toBe("internal");
+      expect(reply.payload.message).toContain("questionPoolSize");
+    }
+  });
+
+  it("sample quizId is registered so quiz-submit can score it", async () => {
+    const quiz = makeQuiz("quiz-pool-submit");
+    const llm = makeFakeLlm("claude-cli", quiz);
+    const vcs = makeFakeVcs("github", "diff --git a/foo.ts");
+    const registry = makeFakeRegistry(llm, vcs);
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const cache = createQuestionPoolCache();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache });
+
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "corr-pool-submit",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 1,
+        questionPoolSize: 3,
+      },
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(frames).toHaveLength(1);
+    const response = frames[0]!;
+    expect(response.kind).toBe("quiz-response");
+
+    if (response.kind === "quiz-response") {
+      const sampleQuizId = response.payload.quiz.id;
+      // The sample quizId should be in the session store.
+      expect(store.get(sampleQuizId as QuizId)).toBeDefined();
+    }
+  });
+});
+
+describe("dispatcher — quiz-resample-request handler", () => {
+  it("returns quiz-response with fresh quizId for a known quizId", async () => {
+    const quiz = makeQuiz("quiz-resample");
+    const llm = makeFakeLlm("claude-cli", quiz);
+    const vcs = makeFakeVcs("github", "diff --git a/foo.ts");
+    const registry = makeFakeRegistry(llm, vcs);
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const cache = createQuestionPoolCache();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache });
+
+    // First: get the quiz via pool path.
+    const requestFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "corr-before-resample",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 1,
+        questionPoolSize: 3,
+      },
+    };
+    await dispatcher.dispatch(requestFrame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(frames).toHaveLength(1);
+    const firstResponse = frames[0]!;
+    expect(firstResponse.kind).toBe("quiz-response");
+    if (firstResponse.kind !== "quiz-response") return;
+
+    const oldQuizId = firstResponse.payload.quiz.id;
+
+    // Now resample.
+    const resampleFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-resample-request",
+      correlationId: "corr-resample",
+      payload: { quizId: oldQuizId, questionCount: 1 },
+    };
+    await dispatcher.dispatch(resampleFrame).unsafeRun();
+
+    expect(frames).toHaveLength(2);
+    const resampleResponse = frames[1]!;
+    expect(resampleResponse.kind).toBe("quiz-response");
+    if (resampleResponse.kind === "quiz-response") {
+      // New quizId must differ from the old one.
+      expect(resampleResponse.payload.quiz.id).not.toBe(oldQuizId);
+      // New quizId is registered in the store.
+      expect(store.get(resampleResponse.payload.quiz.id as QuizId)).toBeDefined();
+    }
+  });
+
+  it("returns internal error for unknown quizId", async () => {
+    const { dispatcher, frames } = makeTestSetup();
+
+    const resampleFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-resample-request",
+      correlationId: "corr-unknown-resample",
+      payload: { quizId: "totally-unknown-quiz", questionCount: 1 },
+    };
+
+    await dispatcher.dispatch(resampleFrame).unsafeRun();
+
+    expect(frames).toHaveLength(1);
+    const reply = frames[0]!;
+    expect(reply.kind).toBe("error");
+    if (reply.kind === "error") {
+      expect(reply.payload.reason).toBe("internal");
+      expect(reply.payload.message).toContain(RESAMPLE_FAILED_PREFIX);
+    }
   });
 });
 

@@ -9,16 +9,19 @@ import type {
   QuestionId,
   ChoiceId,
   QuizId,
+  Diff,
 } from "@lgtm-buzzer/core";
 import { pickCorrectAnswers, scoreSubmission, decidePassed } from "@lgtm-buzzer/core";
 import type { Logger } from "@lgtm-buzzer/core";
 import type { Frame } from "@lgtm-buzzer/protocol";
-import { PROTOCOL_VERSION } from "@lgtm-buzzer/protocol";
+import { PROTOCOL_VERSION, RESAMPLE_FAILED_PREFIX } from "@lgtm-buzzer/protocol";
 import type { AuthStatus } from "@lgtm-buzzer/protocol";
 import type { FrameWriter } from "./framing/writer.js";
 import type { WriteError } from "./framing/errors.js";
 import type { SessionStore } from "./session-store.js";
 import type { AdapterRegistry, RegistryError } from "./registry.js";
+import type { QuestionPoolCache, Pool, PoolQuestion } from "./question-pool-cache.js";
+import { hashDiff } from "./diff-hash.js";
 
 // ---------------------------------------------------------------------------
 // Defaults (ADR-22 §Backwards compatibility)
@@ -38,6 +41,12 @@ export type DispatcherDeps = {
   readonly logger: Logger;
   /** Adapter registry — resolves adapter IDs to provider instances per-request. */
   readonly registry: AdapterRegistry;
+  /**
+   * Question pool cache (ADR-30). Holds up to 10 pools keyed by composite
+   * (prKind, llmAdapterId, prCanonical, diffHash). Pass `createQuestionPoolCache()`
+   * from `cli.ts`. Tests may pass a custom implementation or the real one.
+   */
+  readonly cache: QuestionPoolCache;
 };
 
 // ---------------------------------------------------------------------------
@@ -337,17 +346,32 @@ const handleCheckAuthRequest = (
 const handleQuizRequest = (
   pr: PRIdentifier,
   questionCount: number,
+  questionPoolSize: number | undefined,
   llmAdapterId: string,
   vcsAdapterId: string,
   correlationId: string | null,
   deps: DispatcherDeps,
 ): IO<never, void> => {
-  const { write, store, logger, registry } = deps;
+  const { write, store, logger, registry, cache } = deps;
   const log = logger.child({ correlationId: correlationId ?? "", kind: "quiz-request" });
+
+  // Cross-field validation: poolSize must be >= questionCount when present.
+  if (questionPoolSize !== undefined && questionPoolSize < questionCount) {
+    log.warn("questionPoolSize < questionCount — rejecting", {
+      questionPoolSize,
+      questionCount,
+    });
+    const errFrame = buildErrorFrame(
+      "internal",
+      "questionPoolSize must be >= questionCount",
+      correlationId,
+    );
+    return safeWrite(write, errFrame, log);
+  }
 
   type WorkError = RegistryError | VCSProviderError | LLMProviderError | WriteError;
 
-  // Step 1–7: resolve adapters, fetch diff, generate quiz, store answer key, write response.
+  // Step 1–7: resolve adapters, fetch diff, generate or cache quiz, write response.
   const work: IO<WorkError, void> = registry
     .buildVcs(vcsAdapterId)
     .mapErr((e): WorkError => e)
@@ -359,7 +383,80 @@ const handleQuizRequest = (
           return vcs
             .fetchDiff(pr)
             .mapErr((e): WorkError => e)
-            .flatMap((diff): IO<WorkError, void> => {
+            .flatMap((diff: Diff): IO<WorkError, void> => {
+              // Pool path (ADR-30): questionPoolSize present.
+              if (questionPoolSize !== undefined) {
+                return IO.lift<WorkError, void>(async () => {
+                  const diffHash = hashDiff(diff);
+                  const prCanonical = canonicalisePR(pr);
+                  const poolKey = cache.buildKey({
+                    prKind: pr.kind,
+                    llmAdapterId: llm.id,
+                    prCanonical,
+                    diffHash,
+                  });
+
+                  const cachedPool = cache.get(poolKey);
+                  const cacheHit = cachedPool !== undefined;
+
+                  let activePool: Pool;
+                  if (!cacheHit) {
+                    // Cache miss — generate the full pool.
+                    log.info("Cache miss — generating question pool", {
+                      llmId: llm.id,
+                      poolSize: questionPoolSize,
+                    });
+                    const poolResult = await llm
+                      .generateQuiz({ diff, questionCount: questionPoolSize })
+                      .mapErr((e): WorkError => e)
+                      .unsafeRun();
+                    if (poolResult.type === "Err") {
+                      throw poolResult.error;
+                    }
+                    activePool = quizToPool(poolResult.value, poolKey, llm.id);
+                    cache.put(activePool);
+                  } else {
+                    log.info("Cache hit — reusing question pool", {
+                      poolKey,
+                      poolSize: cachedPool.questions.length,
+                    });
+                    activePool = cachedPool;
+                  }
+
+                  const sampled = sampleFromPool(activePool.questions, questionCount);
+                  const sampleQuizId = crypto.randomUUID();
+
+                  const answerKey: Map<QuestionId, ChoiceId> = new Map(
+                    sampled.map((q) => [q.id, q.correctChoiceId]),
+                  );
+                  store.set(sampleQuizId as QuizId, answerKey);
+                  cache.putSampleMapping({
+                    sampleQuizId,
+                    poolKey,
+                    sampledQuestionIds: sampled.map((q) => q.id),
+                  });
+
+                  log.info("Quiz sampled from pool — answer key stored", {
+                    sampleQuizId,
+                    questionCount: sampled.length,
+                    cacheHit,
+                  });
+
+                  const responseFrame = buildPoolQuizResponseFrame(
+                    sampled,
+                    sampleQuizId,
+                    correlationId,
+                  );
+                  const writeResult = await write(responseFrame)
+                    .mapErr((e): WorkError => e)
+                    .unsafeRun();
+                  if (writeResult.type === "Err") {
+                    throw writeResult.error;
+                  }
+                });
+              }
+
+              // Legacy path: no questionPoolSize, no pool, no cache.
               log.info("Generating quiz", { llmId: llm.id, questionCount });
               return llm
                 .generateQuiz({ diff, questionCount })
@@ -447,6 +544,215 @@ const handleQuizRequest = (
       }
     }),
   );
+};
+
+// ---------------------------------------------------------------------------
+// Pool helpers (ADR-30)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the canonical PR identifier string used as the `prCanonical` segment
+ * of the cache key.
+ *
+ * - GitHub: `"github:<owner>/<repo>#<number>"`
+ * - ADO:    `"ado:<org>/<project>/<repo>#<pullRequestId>"`
+ *
+ * BINDING: This function MUST NOT incorporate PR title / description / labels /
+ * comments — the canonical form is coordinates only. ADR-30 §Diff-only invariant.
+ *
+ * @param pr - The typed PR identifier.
+ * @returns The canonical string.
+ */
+const canonicalisePR = (pr: PRIdentifier): string => {
+  switch (pr.kind) {
+    case "github":
+      return `github:${pr.owner}/${pr.repo}#${pr.number}`;
+    case "ado":
+      return `ado:${pr.org}/${pr.project}/${pr.repo}#${pr.pullRequestId}`;
+  }
+};
+
+/**
+ * Fisher–Yates shuffle in place. Uses `Math.random()` — acceptable per
+ * ADR-30 §Sampling: silent UX, no replay attack surface. ADR-30.
+ */
+const shuffleInPlace = <T>(arr: T[]): T[] => {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j]!;
+    arr[j] = tmp!;
+  }
+  return arr;
+};
+
+/**
+ * Sample `count` questions from a pool using Fisher–Yates (ADR-30 §Sampling).
+ *
+ * If `count >= pool.length` all questions are returned in shuffled order.
+ *
+ * @param pool - Source question pool.
+ * @param count - Number of questions to sample.
+ * @returns A new array of the sampled questions.
+ */
+const sampleFromPool = (
+  pool: ReadonlyArray<PoolQuestion>,
+  count: number,
+): PoolQuestion[] => {
+  const copy = [...pool];
+  shuffleInPlace(copy);
+  return copy.slice(0, Math.min(count, copy.length));
+};
+
+/**
+ * Build a `quiz-response` Frame from a list of sampled `PoolQuestion`s and a
+ * sample quiz ID.
+ *
+ * BINDING: `correctChoiceId` is NEVER written to the wire. ADR-30.
+ *
+ * @param questions - Sampled questions (with correctChoiceId held host-side).
+ * @param sampleQuizId - Fresh UUID to use as the quiz ID on the wire.
+ * @param correlationId - Correlation ID from the original request.
+ * @returns A well-formed `quiz-response` Frame.
+ */
+const buildPoolQuizResponseFrame = (
+  questions: ReadonlyArray<PoolQuestion>,
+  sampleQuizId: string,
+  correlationId: string | null,
+): Frame => {
+  const wireDTOs = questions.map((q) => {
+    const base = {
+      type: "multiple-choice" as const,
+      id: q.id,
+      prompt: q.prompt,
+      choices: q.choices.map((c) => ({ id: c.id, label: c.label })),
+    };
+    return q.explanation !== undefined ? { ...base, explanation: q.explanation } : base;
+  });
+
+  return {
+    v: PROTOCOL_VERSION,
+    kind: "quiz-response",
+    correlationId,
+    payload: {
+      quiz: { id: sampleQuizId as QuizId, questions: wireDTOs },
+    },
+  };
+};
+
+/**
+ * Reify an LLM-generated `Quiz` into a `Pool` for caching.
+ *
+ * Extracts all questions (including `correctChoiceId`) from the domain Quiz
+ * and packages them into a `Pool` ready for the cache. The domain Quiz is
+ * discarded after this — the pool is the authority.
+ *
+ * @param quiz - The domain Quiz produced by the LLM adapter.
+ * @param poolKey - The composite cache key for this pool.
+ * @param llmAdapterId - LLM adapter id (for logs/telemetry).
+ * @returns A `Pool` ready for `cache.put`.
+ */
+const quizToPool = (quiz: Quiz, poolKey: string, llmAdapterId: string): Pool => ({
+  key: poolKey,
+  llmAdapterId,
+  createdAt: Date.now(),
+  questions: quiz.questions.toArray().map((q) => ({
+    type: "multiple-choice" as const,
+    id: q.id,
+    prompt: q.prompt,
+    choices: q.choices.toArray().map((c) => ({ id: c.id, label: c.label })),
+    correctChoiceId: q.correctChoiceId,
+    ...(q.explanation !== undefined ? { explanation: q.explanation } : {}),
+  })),
+});
+
+// ---------------------------------------------------------------------------
+// quiz-resample-request handler (ADR-30)
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle a `quiz-resample-request` frame.
+ *
+ * Sequence (ADR-30 §5):
+ * 1. Look up the sample mapping for the given quizId.
+ * 2. Look up the pool the mapping points to.
+ * 3. Sample `questionCount` questions (Fisher–Yates, independent of prior sample).
+ * 4. Generate a fresh sampleQuizId.
+ * 5. Build answer key; store in SessionStore.
+ * 6. Record new sample mapping.
+ * 7. Build and write `quiz-response`.
+ *
+ * Unknown quizId or evicted pool → `ErrorFrame { reason: "internal" }`.
+ * The extension's fallback handler detects the `RESAMPLE_FAILED_PREFIX` and
+ * retries with a fresh `quiz-request`.
+ *
+ * @param quizId - The sample quizId from the prior quiz-response.
+ * @param questionCount - How many questions to include in the new sample.
+ * @param correlationId - Frame correlation ID.
+ * @param deps - Injected dependencies (including cache).
+ * @returns `IO<never, void>` — never fails.
+ */
+const handleQuizResampleRequest = (
+  quizId: string,
+  questionCount: number,
+  correlationId: string | null,
+  deps: DispatcherDeps,
+): IO<never, void> => {
+  const { write, store, logger, cache } = deps;
+  const log = logger.child({
+    correlationId: correlationId ?? "",
+    kind: "quiz-resample-request",
+    quizId,
+  });
+
+  const mapping = cache.getSampleMapping(quizId);
+  if (mapping === undefined) {
+    log.warn("Resample failed — unknown quizId");
+    const errFrame = buildErrorFrame(
+      "internal",
+      `${RESAMPLE_FAILED_PREFIX} unknown quiz id`,
+      correlationId,
+      { quizId },
+    );
+    return safeWrite(write, errFrame, log);
+  }
+
+  const pool = cache.get(mapping.poolKey);
+  if (pool === undefined) {
+    log.warn("Resample failed — pool evicted from LRU cache", {
+      poolKey: mapping.poolKey,
+    });
+    const errFrame = buildErrorFrame(
+      "internal",
+      `${RESAMPLE_FAILED_PREFIX} pool evicted`,
+      correlationId,
+      { quizId },
+    );
+    return safeWrite(write, errFrame, log);
+  }
+
+  const sampled = sampleFromPool(pool.questions, questionCount);
+  const newSampleQuizId = crypto.randomUUID();
+
+  // Build answer key from the sampled questions.
+  const answerKey: Map<QuestionId, ChoiceId> = new Map(
+    sampled.map((q) => [q.id, q.correctChoiceId]),
+  );
+  store.set(newSampleQuizId as QuizId, answerKey);
+  cache.putSampleMapping({
+    sampleQuizId: newSampleQuizId,
+    poolKey: mapping.poolKey,
+    sampledQuestionIds: sampled.map((q) => q.id),
+  });
+
+  log.info("Quiz resampled from pool", {
+    newSampleQuizId,
+    poolKey: mapping.poolKey,
+    questionCount: sampled.length,
+  });
+
+  const responseFrame = buildPoolQuizResponseFrame(sampled, newSampleQuizId, correlationId);
+  return safeWrite(write, responseFrame, log);
 };
 
 // ---------------------------------------------------------------------------
@@ -612,12 +918,21 @@ export const createDispatcher = (deps: DispatcherDeps): DispatcherFactory => {
         return handleQuizRequest(
           frame.payload.pr as PRIdentifier,
           frame.payload.questionCount,
+          frame.payload.questionPoolSize,
           llmAdapterId,
           vcsAdapterId,
           frame.correlationId,
           deps,
         );
       }
+
+      case "quiz-resample-request":
+        return handleQuizResampleRequest(
+          frame.payload.quizId,
+          frame.payload.questionCount,
+          frame.correlationId,
+          deps,
+        );
 
       case "quiz-submit":
         return handleQuizSubmit(

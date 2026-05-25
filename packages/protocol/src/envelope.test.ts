@@ -191,6 +191,30 @@ describe("FrameSchema", () => {
     }
   });
 
+  // ADR-30: quiz-resample-request frame kind
+  it("parses a well-formed quiz-resample-request frame", () => {
+    const result = FrameSchema.safeParse({
+      v: 1,
+      kind: "quiz-resample-request",
+      correlationId: "cid-qrr",
+      payload: { quizId: "quiz-abc", questionCount: 5 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("quiz-resample-request");
+    }
+  });
+
+  it("rejects quiz-resample-request with empty quizId", () => {
+    const result = FrameSchema.safeParse({
+      v: 1,
+      kind: "quiz-resample-request",
+      correlationId: "cid-qrr",
+      payload: { quizId: "", questionCount: 5 },
+    });
+    expect(result.success).toBe(false);
+  });
+
   // ADR-29: new check-auth frame kinds
   it("parses a well-formed check-auth-request frame", () => {
     const result = FrameSchema.safeParse({

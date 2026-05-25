@@ -48,6 +48,7 @@ import { createSessionStore } from "./session-store.js";
 import { createDispatcher } from "./dispatcher.js";
 import { createDefaultAdapterRegistry } from "./registry.js";
 import { createDefaultCredentialResolver } from "./credentials/index.js";
+import { createQuestionPoolCache } from "./question-pool-cache.js";
 
 // ---------------------------------------------------------------------------
 // Decode-error helper
@@ -104,11 +105,16 @@ const main = async (): Promise<void> => {
   // itself holds no mutable state.
   const registry = createDefaultAdapterRegistry({ spawnIO, resolver });
 
+  // Construct the question pool cache once at startup (ADR-30).
+  // Cap 10 pools in-process. Cold start on host restart is acceptable.
+  const cache = createQuestionPoolCache({ capacity: 10 });
+
   const { dispatch } = createDispatcher({
     write,
     store,
     logger,
     registry,
+    cache,
   });
 
   let streamFailed = false;

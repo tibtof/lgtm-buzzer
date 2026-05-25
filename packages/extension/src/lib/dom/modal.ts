@@ -1146,7 +1146,12 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           "data-testid": "lgtm-buzzer-quiz-retry",
         });
         tryAgainBtn.addEventListener("click", () => {
-          emitDOMEvent(doc, DOM_EVENTS.quizRetry, { requestId });
+          // Emit the quiz id of the failed quiz so the CS can send a
+          // quiz-resample-request instead of a fresh quiz-request. ADR-30.
+          const detail = activeQuiz !== null
+            ? { requestId, quizId: activeQuiz.id }
+            : { requestId };
+          emitDOMEvent(doc, DOM_EVENTS.quizRetry, detail);
           // Modal transitions to generating via the quiz-request event emitted
           // by the CS's onQuizRetry handler — no direct transition here.
         });
@@ -1191,7 +1196,12 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
                 "data-testid": "lgtm-buzzer-quiz-retry",
               });
               retryBtn.addEventListener("click", () => {
-                emitDOMEvent(doc, DOM_EVENTS.quizRetry, { requestId });
+                // Include quizId if we have an active quiz (error-after-quiz-arrived).
+                // The CS uses this to send quiz-resample-request. ADR-30.
+                const detail = activeQuiz !== null
+                  ? { requestId, quizId: activeQuiz.id }
+                  : { requestId };
+                emitDOMEvent(doc, DOM_EVENTS.quizRetry, detail);
               });
               actions.appendChild(retryBtn);
               break;

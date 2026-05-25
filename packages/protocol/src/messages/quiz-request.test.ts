@@ -140,4 +140,68 @@ describe("QuizRequestFrameSchema", () => {
     });
     expect(result.success).toBe(false);
   });
+
+  // ADR-30: questionPoolSize field.
+
+  it("parses when questionPoolSize is absent (legacy mode)", () => {
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: { pr: GITHUB_PR, questionCount: 5 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.payload.questionPoolSize).toBeUndefined();
+    }
+  });
+
+  it("parses when questionPoolSize is present and valid", () => {
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: { pr: GITHUB_PR, questionCount: 5, questionPoolSize: 20 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.payload.questionPoolSize).toBe(20);
+    }
+  });
+
+  it("parses when questionPoolSize is less than questionCount (schema does not enforce cross-field — handler does)", () => {
+    // The schema intentionally does not enforce questionPoolSize >= questionCount.
+    // The dispatcher handler enforces this at runtime and returns an error frame.
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: { pr: GITHUB_PR, questionCount: 5, questionPoolSize: 3 },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects when questionPoolSize exceeds maximum (51)", () => {
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: { pr: GITHUB_PR, questionCount: 5, questionPoolSize: 51 },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects when questionPoolSize is zero", () => {
+    const result = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: { pr: GITHUB_PR, questionCount: 5, questionPoolSize: 0 },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts questionPoolSize at boundaries (1 and 50)", () => {
+    const r1 = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: { pr: GITHUB_PR, questionCount: 1, questionPoolSize: 1 },
+    });
+    expect(r1.success).toBe(true);
+
+    const r50 = QuizRequestFrameSchema.safeParse({
+      ...BASE,
+      payload: { pr: GITHUB_PR, questionCount: 5, questionPoolSize: 50 },
+    });
+    expect(r50.success).toBe(true);
+  });
 });
