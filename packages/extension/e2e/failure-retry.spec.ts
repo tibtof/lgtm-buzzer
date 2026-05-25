@@ -40,7 +40,7 @@ test("wrong answers → failed state → Try Again → correct answers → pass"
 
     // 2. Wait for ready state.
     await page.waitForSelector(
-      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-submit']",
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-progress']",
     );
 
     // 3. Answer with wrong choices (c2 for both — correct is c1 for q1, c2 for q2).
@@ -65,7 +65,7 @@ test("wrong answers → failed state → Try Again → correct answers → pass"
 
     // Wait for ready state again (new quiz-response from stub).
     await page.waitForSelector(
-      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-submit']",
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-progress']",
     );
     const stateAfterRetry = await modal.getState();
     expect(stateAfterRetry).toBe("ready");
@@ -96,7 +96,7 @@ test("wrong answers → failed state → Try Again → correct answers → pass"
   }
 });
 
-test("partial answers: Submit button stays disabled", async () => {
+test("partial answers (stepper): Next disabled until current question answered, Submit hidden until last step", async () => {
   const { context, cleanup } = await launchExtensionContext({
     scenario: { kind: "happy", quiz: CANONICAL_QUIZ, correctAnswers: CANONICAL_CORRECT },
   });
@@ -119,18 +119,26 @@ test("partial answers: Submit button stays disabled", async () => {
 
     // 2. Wait for ready state.
     await page.waitForSelector(
-      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-submit']",
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-progress']",
     );
 
-    // 3. Answer only q1 — q2 not answered.
-    await modal.answerQuestion("q1", "c1");
+    // 3. On Q1, before answering: Next is disabled, Submit is hidden.
+    const nextBtn = page.locator(
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-next']",
+    );
+    const submitBtn = page.locator(
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-submit']",
+    );
+    await expect(nextBtn).toBeDisabled();
+    await expect(submitBtn).toBeHidden();
 
-    // 4. Submit button must be disabled (q2 unanswered).
-    await modal.expectSubmitDisabled();
+    // 4. Answer Q1; Next enables, Submit still hidden.
+    await modal.answerQuestion("q1", "c1");
+    await expect(nextBtn).toBeEnabled();
+    await expect(submitBtn).toBeHidden();
 
     // 5. Modal must still be in ready state (no submit was sent).
-    const currentState = await modal.getState();
-    expect(currentState).toBe("ready");
+    expect(await modal.getState()).toBe("ready");
 
     // 6. Form is still blocked.
     await pr.expectBlocked();

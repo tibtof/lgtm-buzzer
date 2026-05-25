@@ -204,6 +204,21 @@ const MODAL_CSS = `
     border-radius: 6px;
     padding: 14px;
   }
+  fieldset[hidden] {
+    display: none;
+  }
+  fieldset[data-locked="true"] {
+    background: #f6f8fa;
+  }
+  fieldset[data-locked="true"] .choice-label {
+    cursor: default;
+  }
+  [data-lgtm-progress] {
+    text-align: center;
+    font-size: 12px;
+    color: #57606a;
+    margin: -4px 0 12px 0;
+  }
   legend {
     font-size: 14px;
     font-weight: 600;
@@ -485,35 +500,135 @@ const renderQuestion = (
 };
 
 /**
- * Renders the `ready` (quiz-active) panel body.
- * Returns the fragment and a getter for collected answers.
+ * Renders the `ready` (quiz-active) panel body as a one-question-at-a-time
+ * stepper with Prev / Next / Submit + a "i/n" progress indicator.
+ *
+ * UX contract (locked-on-advance):
+ *   - Only one fieldset is visible at a time (index i).
+ *   - Next is disabled until the current question has an answer.
+ *   - Clicking Next moves to i+1 AND locks question i's radios (read-only on
+ *     revisit via Prev). This prevents the user from skim-then-revise after
+ *     seeing all questions.
+ *   - Prev is disabled at index 0.
+ *   - At the last question, the primary button becomes Submit (still gated on
+ *     having selected an answer for that question).
+ *
+ * Submit is wired by the caller; this function returns it (and the panel
+ * fragment + answer collector) so the caller can keep its existing wire-up.
  */
 const renderReady = (
   doc: Document,
   quiz: QuizDTO,
-  submitBtn: HTMLButtonElement,
 ): {
   fragment: DocumentFragment;
   collectAnswers: () => ReadonlyArray<{ questionId: string; chosenChoiceId: string }>;
+  prevBtn: HTMLButtonElement;
+  nextBtn: HTMLButtonElement;
+  submitBtn: HTMLButtonElement;
+  progress: HTMLElement;
 } => {
   const frag = doc.createDocumentFragment();
-  const selectors: Array<{ questionId: string; getSelected: () => string | null }> = [];
+  const selectors: Array<{
+    questionId: string;
+    fieldset: HTMLFieldSetElement;
+    getSelected: () => string | null;
+    locked: boolean;
+  }> = [];
 
+  // Render all fieldsets up-front; we just toggle visibility per step. This
+  // keeps state (which radio is checked) without recreating DOM on navigate.
   for (const [idx, question] of quiz.questions.entries()) {
     const groupName = `lgtm-q-${idx}`;
     const { fieldset, getSelected } = renderQuestion(doc, question, groupName);
-    selectors.push({ questionId: question.id, getSelected });
+    fieldset.setAttribute("data-question-index", String(idx));
+    fieldset.hidden = idx !== 0;
+    selectors.push({ questionId: question.id, fieldset, getSelected, locked: false });
     frag.appendChild(fieldset);
+  }
 
-    // Update submit button enabled state on any radio change.
-    fieldset.addEventListener("change", () => {
-      const allAnswered = selectors.every((s) => s.getSelected() !== null);
-      submitBtn.disabled = !allAnswered;
+  const progress = el(doc, "div", {
+    "data-testid": "lgtm-buzzer-quiz-progress",
+    "data-lgtm-progress": "",
+  });
+  frag.appendChild(progress);
+
+  const prevBtn = textEl(doc, "button", "Prev", {
+    class: "btn btn-secondary",
+    "data-testid": "lgtm-buzzer-quiz-prev",
+  }) as HTMLButtonElement;
+  prevBtn.type = "button";
+
+  const nextBtn = textEl(doc, "button", "Next", {
+    class: "btn btn-primary",
+    "data-testid": "lgtm-buzzer-quiz-next",
+  }) as HTMLButtonElement;
+  nextBtn.type = "button";
+
+  const submitBtn = textEl(doc, "button", "Submit answers", {
+    class: "btn btn-primary",
+    "data-testid": "lgtm-buzzer-quiz-submit",
+  }) as HTMLButtonElement;
+  submitBtn.type = "submit";
+  submitBtn.hidden = true;
+
+  // Internal index — index of the currently-visible question (0-based).
+  let i = 0;
+
+  const lockFieldset = (entry: (typeof selectors)[number]): void => {
+    if (entry.locked) return;
+    entry.locked = true;
+    const inputs = entry.fieldset.querySelectorAll<HTMLInputElement>(
+      "input[type=\"radio\"]",
+    );
+    for (const r of inputs) {
+      r.disabled = true;
+    }
+    entry.fieldset.setAttribute("data-locked", "true");
+  };
+
+  const refresh = (): void => {
+    const total = selectors.length;
+    progress.textContent = `Question ${i + 1} of ${total}`;
+
+    for (const [j, entry] of selectors.entries()) {
+      entry.fieldset.hidden = j !== i;
+    }
+
+    prevBtn.disabled = i === 0;
+    const currentAnswered = selectors[i]?.getSelected() !== null;
+    const isLast = i === total - 1;
+    nextBtn.hidden = isLast;
+    submitBtn.hidden = !isLast;
+    nextBtn.disabled = !currentAnswered;
+    submitBtn.disabled = !currentAnswered;
+  };
+
+  // Wire each fieldset's change event to re-evaluate the current button state.
+  for (const entry of selectors) {
+    entry.fieldset.addEventListener("change", () => {
+      refresh();
     });
   }
 
-  // Initially disabled until all questions answered.
-  submitBtn.disabled = true;
+  prevBtn.addEventListener("click", () => {
+    if (i > 0) {
+      i -= 1;
+      refresh();
+    }
+  });
+
+  nextBtn.addEventListener("click", () => {
+    const currentEntry = selectors[i];
+    if (currentEntry === undefined || currentEntry.getSelected() === null) return;
+    lockFieldset(currentEntry);
+    if (i < selectors.length - 1) {
+      i += 1;
+      refresh();
+    }
+  });
+
+  // Initial render: show first question, both nav buttons sized for n>1.
+  refresh();
 
   const collectAnswers = (): ReadonlyArray<{
     questionId: string;
@@ -528,7 +643,14 @@ const renderReady = (
       })
       .filter((a): a is { questionId: string; chosenChoiceId: string } => a !== null);
 
-  return { fragment: frag, collectAnswers };
+  return {
+    fragment: frag,
+    collectAnswers,
+    prevBtn,
+    nextBtn,
+    submitBtn,
+    progress,
+  };
 };
 
 /**
@@ -788,15 +910,10 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
 
       case "ready": {
         const { requestId, quiz } = state;
-        subtitle.textContent = `${quiz.questions.length} question${quiz.questions.length === 1 ? "" : "s"} — answer all to submit.`;
+        subtitle.textContent = `${quiz.questions.length} question${quiz.questions.length === 1 ? "" : "s"} — one at a time.`;
 
-        const submitBtn = textEl(doc, "button", "Submit answers", {
-          class: "btn btn-primary",
-          "data-testid": "lgtm-buzzer-quiz-submit",
-        }) as HTMLButtonElement;
-        submitBtn.type = "submit";
-
-        const { fragment, collectAnswers: ca } = renderReady(doc, quiz, submitBtn);
+        const { fragment, collectAnswers: ca, prevBtn, nextBtn, submitBtn } =
+          renderReady(doc, quiz);
         collectAnswers = ca;
         content.appendChild(fragment);
 
@@ -809,6 +926,8 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         cancelBtn.addEventListener("click", () => { handleCancel(requestId); });
 
         actions.appendChild(cancelBtn);
+        actions.appendChild(prevBtn);
+        actions.appendChild(nextBtn);
         actions.appendChild(submitBtn);
         break;
       }

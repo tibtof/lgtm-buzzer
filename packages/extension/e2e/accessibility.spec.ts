@@ -34,7 +34,7 @@ test("focus trap: Tab wraps through focusable elements in the panel", async () =
     await pr.clickApprove();
     await modal.waitForOpen();
     await page.waitForSelector(
-      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-submit']",
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-progress']",
     );
 
     // Focus the panel by clicking the Cancel button (a known focusable element).
@@ -87,7 +87,7 @@ test("Esc dismisses modal (cancel semantics) and does not pass the form", async 
 
     // Wait for ready state.
     await page.waitForSelector(
-      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-submit']",
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-progress']",
     );
 
     // 2. Press Escape in ready state → modal dismisses with quiz-cancel.
@@ -132,7 +132,7 @@ test("ARIA contract: aria-modal, aria-labelledby, aria-live present on open moda
 
     // 4. Wait for ready state — aria-live should update.
     await page.waitForSelector(
-      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-submit']",
+      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-progress']",
     );
 
     const readyText = await modal.getAriaLive();
