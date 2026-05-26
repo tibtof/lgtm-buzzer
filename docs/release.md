@@ -13,6 +13,14 @@ publishing a GitHub Release.
 - `tar` on PATH (macOS and Linux ship it in the baseline)
 - A clean working tree (uncommitted changes block the release script)
 
+**Note on evals (ADR-31):** The `packages/evals` workspace now uses a local
+LLM CLI as the rubric judge instead of a hard-pinned Anthropic API call. This
+means contributors no longer need `ANTHROPIC_API_KEY` purely for running evals
+— any of the four supported tools (`claude` CLI, `codex` CLI, `gh copilot`,
+or `ANTHROPIC_API_KEY` for the direct API path) is sufficient. Set
+`LGTM_EVAL_JUDGE=claude|codex|copilot|claude-api` to pin a specific judge.
+The `host` and `extension` packages are unchanged by this release.
+
 ---
 
 ## Bump-version flow

@@ -26,9 +26,9 @@ The negative-control fixture (`docs-readme-update`) runs separately via
 
 ### Prerequisites
 
-All four adapters require their respective tools:
+The four test-subject adapters each require their own tool:
 
-| Adapter | Required |
+| Adapter | Required (for test-subject) |
 |---|---|
 | `claude-cli` | `claude` CLI on PATH |
 | `claude-api` | `ANTHROPIC_API_KEY` environment variable |
@@ -37,6 +37,12 @@ All four adapters require their respective tools:
 
 Missing tools or keys → that adapter's cells are reported as `SKIP` (not
 fail). A clean run of all four requires all four tools.
+
+The **judge** (used by the LLM-rubric assertion) is auto-detected from the
+same tools. Resolution order: `claude` → `codex` → `copilot` → `claude-api`.
+Override with `LGTM_EVAL_JUDGE=claude|codex|copilot|claude-api`. You need at
+least ONE of these for the rubric to score; otherwise the rubric assertion
+fails with a clear error but the run completes.
 
 ### Full suite
 
@@ -81,6 +87,11 @@ Results are written to `results/latest.json` (HTML report at
 
 The LLM-rubric assertion is advisory in v1 (threshold 0) — a fail here
 surfaces in the report but does not count as a hard FAIL.
+
+The resolved judge is logged to stderr at run start:
+`[lgtm-evals] judge: claude (auto-detected)`. If you see `judge error` in
+rubric results, check `LGTM_EVAL_JUDGE` and ensure at least one LLM tool is
+available.
 
 ## Updating the baseline
 
