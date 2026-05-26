@@ -189,7 +189,147 @@ Any change that adds non-diff PR text to any of these layers is treated as a sec
 
 ## Architecture
 
-LGTM-Buzzer uses hexagonal architecture enforced by npm workspace boundaries:
+LGTM-Buzzer uses hexagonal architecture enforced by npm workspace boundaries.
+
+### System diagram
+
+The extension lives in the browser; everything that touches an LLM or a VCS
+API lives in a Node host process on the user's machine. The two sides only
+ever talk over Chrome's native-messaging stdio bridge, and every frame is
+validated by a Zod schema from `packages/protocol`.
+
+```mermaid
+flowchart TB
+    subgraph Browser["Browser (Chrome MV3) — packages/extension"]
+        direction TB
+        CS["Content Script<br/>intercepts Approve click<br/>mounts Quiz Modal"]
+        SW["Service Worker<br/>owns native-messaging port<br/>zod-validates host replies"]
+        CS <--> SW
+    end
+
+    subgraph Machine["User's machine — Node host process"]
+        direction TB
+        Host["Native Host (packages/host)<br/>stdin read-loop · zod-validate · dispatch"]
+
+        subgraph Core["Core domain (packages/core) — pure, zero I/O"]
+            direction TB
+            Domain["QuizSession · ReviewGate"]
+            Ports["Ports<br/>LLMProvider · VCSProvider · QuizPolicy"]
+            Domain --- Ports
+        end
+
+        subgraph Adapters["Adapters (packages/adapters)"]
+            direction LR
+            subgraph VCSGroup["VCS"]
+                direction TB
+                GH["github"]
+                ADO["ado"]
+            end
+            subgraph LLMGroup["LLM"]
+                direction TB
+                CLAUDE["claude-cli"]
+                CODEX["codex-cli"]
+                COPILOT["copilot-cli"]
+                API["claude-api"]
+            end
+        end
+
+        Host -->|"drives"| Core
+        Ports -.->|"implemented by"| Adapters
+    end
+
+    subgraph External["External services and processes"]
+        direction TB
+        GHAPI["GitHub REST API"]
+        ADOAPI["Azure DevOps API"]
+        LocalLLMs["Local LLM CLIs<br/>claude · codex · gh copilot"]
+        Anthropic["Anthropic API"]
+    end
+
+    SW <==>|"Native Messaging stdio<br/>uint32 length-prefixed JSON · schemas in packages/protocol"| Host
+
+    GH --> GHAPI
+    ADO --> ADOAPI
+    CLAUDE --> LocalLLMs
+    CODEX --> LocalLLMs
+    COPILOT --> LocalLLMs
+    API --> Anthropic
+```
+
+**In one breath:** the content script and service worker are the only pieces
+that run in the browser. The service worker speaks a length-prefixed JSON
+protocol over stdio to the native host. Inside the host, the core domain is
+pure and exposes ports (`LLMProvider`, `VCSProvider`, `QuizPolicy`); adapters
+implement those ports and are the only place that touches the network, a
+subprocess, or any other external service. The extension cannot reach an
+LLM directly — there is no arrow from the browser box to any external
+service. Adapter availability is tracked in the
+[LLM + VCS adapter matrix](#llm--vcs-adapter-matrix) below; this diagram
+shows architectural structure, not per-adapter shipping status.
+
+### Request flow — one approval attempt
+
+This sequence walks one Approve click from the moment the content script
+intercepts it through quiz generation, scoring, and the eventual pass-or-
+keep-the-modal decision. Wire-frame names (`quiz-request`, `quiz-response`,
+`quiz-submit`, `quiz-result`) match the schemas in `packages/protocol` per
+ADR-13.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant CS as Content Script
+    participant SW as Service Worker
+    participant Host as Native Host
+    participant Core as Core (QuizSession / ReviewGate)
+    participant VCS as VCS Adapter
+    participant LLM as LLM Adapter
+    participant Ext as External (Git provider / LLM)
+
+    User->>CS: clicks Approve
+    CS->>SW: quiz-request { pr, questionCount }
+    SW->>Host: stdio frame
+    Note over Host: zod-validates every<br/>incoming frame
+    Host->>Core: QuizSession.start
+    Core->>VCS: getDiff(pr)
+    VCS->>Ext: HTTPS diff fetch (provider-specific)
+    Ext-->>VCS: raw diff bytes
+    VCS-->>Core: diff
+    Note over VCS,LLM: Only the raw diff crosses this boundary.<br/>No PR title, description, or comments.
+    Core->>LLM: generateQuiz(diff)
+    Note right of LLM: CLI adapters: spawnIO,<br/>stdin = diff.<br/>API adapter: HTTPS.
+    LLM->>Ext: spawn CLI or HTTPS
+    Ext-->>LLM: questions JSON
+    LLM-->>Core: Quiz
+    Core-->>Host: Quiz
+    Host-->>SW: quiz-response { quiz }
+    SW-->>CS: Quiz
+    CS->>User: render Quiz Modal
+    User->>CS: submit answers
+    CS->>SW: quiz-submit { quizId, answers }
+    SW->>Host: stdio frame
+    Host->>Core: ReviewGate.grade(answers)
+    Core-->>Host: pass / fail
+    Host-->>SW: quiz-result { passed, perQuestion? }
+    SW-->>CS: result
+    alt pass
+        CS->>CS: re-fire original Approve click
+    else fail
+        CS->>User: modal stays, Approve remains gated
+    end
+```
+
+**In one breath:** Approve clicks never go straight through. The extension
+asks the host for a quiz over a `quiz-request` frame; the host's core asks
+the VCS adapter for the diff, hands that diff (and only the diff) to the
+LLM adapter, and returns the questions as `quiz-response`. The user
+answers in the modal; the extension forwards a `quiz-submit` frame; the
+host's `ReviewGate` scores it and replies with `quiz-result`. On pass, the
+content script re-fires the original Approve click; on fail, the modal
+stays put and the gate holds.
+
+### Workspaces
 
 ```
 packages/
