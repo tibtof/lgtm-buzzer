@@ -189,7 +189,120 @@ Any change that adds non-diff PR text to any of these layers is treated as a sec
 
 ## Architecture
 
-LGTM-Buzzer uses hexagonal architecture enforced by npm workspace boundaries:
+LGTM-Buzzer uses hexagonal architecture enforced by npm workspace boundaries.
+
+### System diagram
+
+The extension lives in the browser; everything that touches an LLM or a VCS
+API lives in a Node host process on the user's machine. The two sides only
+ever talk over Chrome's native-messaging stdio bridge, and every frame is
+validated by a Zod schema from `packages/protocol`.
+
+```mermaid
+flowchart TB
+    subgraph Browser["Browser (Chrome MV3) — packages/extension"]
+        direction TB
+        CS["Content Script<br/>intercepts Approve click<br/>mounts Quiz Modal"]
+        SW["Service Worker<br/>owns native-messaging port<br/>zod-validates host replies"]
+        CS <--> SW
+    end
+
+    subgraph Machine["User's machine — Node host process"]
+        direction TB
+        Host["Native Host (packages/host)<br/>stdin read-loop · zod-validate · dispatch"]
+
+        subgraph Core["Core domain (packages/core) — pure, zero I/O"]
+            direction TB
+            Domain["QuizSession · ReviewGate"]
+            Ports["Ports<br/>LLMProvider · VCSProvider · QuizPolicy"]
+            Domain --- Ports
+        end
+
+        subgraph Adapters["Adapters (packages/adapters)"]
+            direction LR
+            subgraph VCSGroup["VCS"]
+                direction TB
+                GH["github"]
+                ADO["ado (v0.2)"]
+            end
+            subgraph LLMGroup["LLM"]
+                direction TB
+                CLAUDE["claude-cli"]
+                CODEX["codex-cli"]
+                COPILOT["copilot-cli"]
+                API["claude-api"]
+            end
+        end
+
+        Host -->|"IO&lt;E,A&gt;"| Core
+        Ports -.->|"implemented by"| Adapters
+    end
+
+    subgraph External["External services and processes"]
+        direction TB
+        GHAPI["GitHub REST API"]
+        ADOAPI["Azure DevOps API"]
+        LocalLLMs["Local LLM CLIs<br/>claude · codex · gh copilot"]
+        Anthropic["Anthropic API"]
+    end
+
+    SW <==>|"Native Messaging stdio<br/>JSON frames · schemas in packages/protocol"| Host
+
+    GH --> GHAPI
+    ADO --> ADOAPI
+    CLAUDE --> LocalLLMs
+    CODEX --> LocalLLMs
+    COPILOT --> LocalLLMs
+    API --> Anthropic
+```
+
+### Request flow — one approval attempt
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant CS as Content Script
+    participant SW as Service Worker
+    participant Host as Native Host
+    participant Core as Core (QuizSession / ReviewGate)
+    participant VCS as VCS Adapter
+    participant LLM as LLM Adapter
+    participant Ext as External (Git provider / LLM)
+
+    User->>CS: clicks Approve
+    CS->>SW: QuizRequest { prId, repo }
+    SW->>Host: stdio JSON frame
+    Note over Host: zod-validates every<br/>incoming frame
+    Host->>Core: QuizSession.start
+    Core->>VCS: getDiff(prId)
+    VCS->>Ext: HTTPS (diff media type)
+    Ext-->>VCS: raw diff bytes
+    VCS-->>Core: diff
+    Core->>LLM: generateQuiz(diff)
+    Note right of LLM: CLI adapters: spawnIO,<br/>stdin = diff.<br/>API adapter: HTTPS.
+    LLM->>Ext: spawn CLI or HTTPS
+    Ext-->>LLM: questions JSON
+    LLM-->>Core: Quiz
+    Core-->>Host: Quiz
+    Host-->>SW: stdio JSON frame
+    SW-->>CS: Quiz
+    CS->>User: render Quiz Modal
+    User->>CS: submit answers
+    CS->>SW: GradeRequest { answers }
+    SW->>Host: stdio JSON frame
+    Host->>Core: ReviewGate.grade(answers)
+    Core-->>Host: pass / fail
+    Host-->>SW: result
+    SW-->>CS: result
+    alt pass
+        CS->>CS: re-fire original Approve click
+    else fail
+        CS->>User: modal stays, Approve remains gated
+    end
+```
+
+### Workspaces
 
 ```
 packages/
