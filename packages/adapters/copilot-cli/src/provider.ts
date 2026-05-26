@@ -138,7 +138,8 @@ const mapSpawnError = (e: SpawnError): LLMProviderError => {
  */
 export const createCopilotCliProvider = (deps: CopilotCliDeps): LLMProvider => {
   const binary = deps.config?.binary ?? "gh";
-  const timeoutMs = deps.config?.timeoutMs ?? 60_000;
+  // 180s default to match the ADR-30 20-question pool generation time.
+  const timeoutMs = deps.config?.timeoutMs ?? 180_000;
   const graceMs = deps.config?.graceMs ?? 5_000;
   const ids = deps.ids ?? defaultIdGenerator();
 
