@@ -13492,3 +13492,973 @@ Coverage: 80% on the adapter; ≥95% on `unified-diff.ts`.
   isolated to `changes.ts` so a live-validation fix is a one-file change.
 
 ---
+
+---
+
+<!-- ADR-31 placed out of numerical order: PR #122 was authored before ADR-32/33/34 but merged after. Number is canonical; physical position reflects merge order. -->
+
+## ADR-31 (2026-05-26): Conceptual quiz prompt (supersedes ADR-14 §Decision 2) + auto-detect local judge in evals
+**Date**: 2026-05-26
+**Issue**: #121
+**Status**: Accepted
+
+### Context
+
+Two distinct problems are resolved in a single ADR because they share a
+single root cause — the v1 `SYSTEM_PROMPT` doesn't define quality
+narrowly enough for either the production LLM or the eval judge to
+behave well.
+
+**Problem 1 — Trivia-style quizzes (production).** Dogfooding M3
+revealed that the locked `SYSTEM_PROMPT` (ADR-14 §Decision 2, embedded
+in `packages/adapters/_shared/src/prompt.ts`) reliably produces
+shallow, low-value questions. Observed failure modes on real PRs from
+this repo:
+
+- "What does `getState()` now inspect to determine the modal has
+  reached the `ready` state?" — rewards skimming the diff for the name
+  `ready`; no concept tested.
+- "On line 47, the new regex character class is now `[A-Za-z0-9_-]`.
+  Which characters does it accept?" — line-number trivia.
+- "What is the new name of the function `foo`?" — rename trivia,
+  short-circuited by name matching, not understanding.
+- "What does the unchanged helper `parseHeader` do?" — questions about
+  unchanged context the reviewer doesn't need to engage with.
+
+The current `Each question MUST: Reference a concrete change in the
+diff` bullet is satisfied by "name the new identifier" — the model
+interprets "concrete" as "lexically present", not "semantically
+distinctive". The reviewer earns a pass by greping, not by
+understanding what changed.
+
+User wants questions that probe whether the reviewer understands:
+1. **Why** the change was needed (motivation / bug being fixed).
+2. **What behaviour changes** for callers or end-users (observable
+   delta).
+3. **What invariants** the new code relies on (preconditions, ordering
+   assumptions, lifecycle).
+4. **What edge cases** the change explicitly handles (defensive
+   branches, error paths).
+5. **What breaking-change risk** exists if a caller depended on the
+   old behaviour.
+6. **What alternative designs** the author was NOT taking (forces
+   engagement with tradeoffs).
+
+This is a prompt rewrite, not a model change — same Claude / Codex /
+Copilot adapters, same JSON schema for the response, same
+`buildUserMessage`. Only the SYSTEM body changes.
+
+**Problem 2 — Anthropic-API-only judge in evals.** ADR-26 §6 wires
+`llm-rubric` to `provider: anthropic:messages:claude-sonnet-4-6`. This
+means:
+
+- Running the evals locally requires `ANTHROPIC_API_KEY` purely for
+  judging — even if the contributor only wants to evaluate `claude-cli`
+  / `codex-cli` / `copilot-cli` cells. A contributor with `claude` CLI
+  installed but no Anthropic API key gets zero rubric signal.
+- The judge is hard-pinned to one model from one vendor. We have three
+  more LLM CLIs already wired as test subjects; using one of them as
+  the judge is essentially free and removes the API-key prerequisite.
+- ADR-26 §7 already classifies evals as a developer tool, not gating
+  CI. The judge being a local CLI fits that posture better than
+  baking-in a vendor API call.
+
+User signed off on:
+- Replace the Anthropic-API judge with an auto-detected local CLI
+  (precedence `claude` → `codex` → `copilot` → `claude-api`).
+- One judge per run, the same judge across every cell. NOT a
+  per-cell-matched judge (where each cell would be graded by its own
+  adapter), because the "tool grades its own output" bias is exactly
+  what we want to avoid; a single neutral judge across the whole run
+  is the correct comparison.
+- `LGTM_EVAL_JUDGE=claude|codex|copilot|claude-api` env-var override.
+- The four test-subject providers (`claude-cli`, `codex-cli`,
+  `copilot-cli`, `claude-api`) under `packages/evals/src/providers/`
+  stay unchanged. They generate quizzes; the judge grades them.
+
+**Why one ADR for both.** The eval rubric (`rubric.md`) and the
+production SYSTEM_PROMPT must drift in lockstep — otherwise the judge
+penalises trivia we just told the production prompt to produce. If
+they shipped in two separate ADRs the prompt PR would land first, fail
+the existing rubric, and look like a regression. Coupling them in one
+decision ensures the rubric and prompt agree on what "conceptual
+depth" means.
+
+### Decision
+
+#### Part 1 — Production SYSTEM_PROMPT rewrite
+
+**File:** `packages/adapters/_shared/src/prompt.ts` — the `SYSTEM_PROMPT`
+constant is rewritten end-to-end. `buildUserMessage` is unchanged
+(2-parameter signature: `diff`, `questionCount`; diff between `<DIFF>`
+markers).
+
+The new prompt has five sections in order, the order is binding:
+
+1. **Role + scope statement** (~3 lines) — unchanged in spirit from
+   v1.
+2. **DO list** — 6 bullets enumerating the concept categories the
+   model should target.
+3. **DO NOT list (ban list)** — 5 bullets enumerating trivia patterns
+   the model must avoid. This is the new authoritative content.
+4. **Few-shot examples** — 1 BAD + 1 GOOD pair on the same tiny
+   TypeScript diff, marked `// BAD:` / `// GOOD:` so the model picks
+   up the contrast.
+5. **Response schema** — unchanged from v1.
+
+##### Binding prompt body (verbatim — to be embedded as the `SYSTEM_PROMPT` constant)
+
+```
+SYSTEM:
+You generate multiple-choice quizzes that test whether a code reviewer
+has actually understood a pull-request diff — not whether they can
+spot-check a name or a line number.
+
+You will receive a unified diff between <DIFF> and </DIFF> markers in
+the USER message. Use ONLY the diff content. Do not invent, infer, or
+reference any context that is not present in the diff (no commit
+messages, no PR description, no external file content).
+
+Generate exactly N multiple-choice questions where N is provided in
+the USER message. Each question MUST test understanding of the change,
+not surface recognition of its tokens.
+
+DO ask about:
+- Behaviour changes visible to callers or end-users of the modified
+  code.
+- Invariants the new code relies on (preconditions, ordering
+  assumptions, lifecycle expectations).
+- Edge cases the change explicitly handles (defensive branches, error
+  paths, boundary inputs).
+- What would break if a caller depended on the OLD behaviour.
+- Alternative designs the author was NOT taking, and why one path was
+  chosen over another (forces engagement with the tradeoff).
+- The motivation for the change — what bug, gap, or constraint it
+  addresses, as inferable from the diff itself.
+
+DO NOT ask about:
+- Specific line numbers ("on line 47, what...").
+- The exact new name of a function, variable, type, or file ("what
+  is the new name of X" or its inverse "what was X renamed from").
+- Exact literal values (numeric constants, string literals, regex
+  patterns) UNLESS the question is genuinely about the change's
+  meaning. Asking "this regex matches which kind of input?" is OK;
+  asking "the regex character class is now X" is not.
+- File paths or directory structure.
+- What an unchanged function, type, or block of context code does —
+  questions must target the CHANGE, not the surrounding code that
+  appears in the diff context window.
+
+Each question should pass this test: "Could a teammate who has read
+the diff write this question without scrolling back to the diff?" If
+YES, the question is too generic. If NO, the question is too trivial.
+The sweet spot is "answerable only if you actually understood the
+change."
+
+Each question MUST:
+- Have between 2 and 6 plausible answer choices.
+- Have exactly one correct choice.
+- Have distractors that are semantically plausible — a teammate who
+  half-read the diff should find at least two choices defensible.
+
+Examples (illustrative — do NOT copy these into your output):
+
+Given this diff:
+<DIFF>
+diff --git a/cache.ts b/cache.ts
+--- a/cache.ts
++++ b/cache.ts
+@@ -10,7 +10,11 @@ export const get = (key: string): Value | undefined => {
+-  return store.get(key);
++  const entry = store.get(key);
++  if (entry === undefined) return undefined;
++  if (entry.expiresAt < Date.now()) {
++    store.delete(key);
++    return undefined;
++  }
++  return entry.value;
+ };
+</DIFF>
+
+// BAD (trivia — rejects this style):
+{
+  "prompt": "What is the new name of the variable assigned from store.get(key)?",
+  "choices": ["entry", "value", "item", "cached"],
+  "correctChoiceIndex": 0
+}
+
+// GOOD (conceptual — accept this style):
+{
+  "prompt": "What behaviour does a caller of get() observe AFTER this change that they would NOT have observed before, given the same store contents?",
+  "choices": [
+    "An expired entry is now returned as undefined instead of as a stale value.",
+    "An expired entry is now returned as null instead of undefined.",
+    "Concurrent callers can no longer race on the same key.",
+    "Calling get on a missing key now throws instead of returning undefined."
+  ],
+  "correctChoiceIndex": 0,
+  "explanation": "The new branch checks expiresAt against Date.now() and treats expired entries as misses, deleting them from the store. Callers previously saw the stale value; they now see undefined."
+}
+
+Respond with a JSON object ONLY (no markdown fences, no commentary).
+Schema:
+
+{
+  "questions": [
+    {
+      "prompt": "<question text>",
+      "choices": ["<choice 1>", "<choice 2>", ...],
+      "correctChoiceIndex": <0-based integer>,
+      "explanation": "<short post-submit explanation, optional>"
+    }
+  ]
+}
+
+If the diff is empty, or contains only formatting / whitespace /
+docs-only changes with no semantic code delta, respond with:
+{ "questions": [] }
+(The adapter surfaces this as malformed-response.)
+```
+
+**Binding constraints on the text above:**
+
+- **Order is fixed.** Rules ABOVE diff (USER message comes after
+  SYSTEM and contains the diff). The model sees instructions before
+  payload. This is the same prompt-injection-hardening posture
+  ADR-14 §Decision 2 already takes; the few-shot examples'
+  `<DIFF>` / `</DIFF>` markers appear ONLY inside the example block,
+  not as a second top-level user message, so they cannot be
+  confused with the real diff.
+- **The few-shot diff is a synthetic, non-LGTM-Buzzer example.** The
+  cache TTL pattern is generic enough to teach the contrast without
+  leaking real project codepaths into the prompt or biasing the
+  model toward LGTM-Buzzer's own concerns.
+- **The BAD/GOOD markers are JS line comments** (`// BAD:`,
+  `// GOOD:`) so the model parses them as inline commentary rather
+  than as JSON keys.
+- **Length budget.** The new prompt is ~1.7 KB (≈ 420 tokens). The
+  current prompt is ~0.9 KB. The increase is acceptable: prompt
+  caching (ADR-20 §6 for `claude-api`) makes the static prompt
+  effectively free after the first call within a 5-minute window;
+  CLI adapters re-pay it per call but the dominant cost is the diff
+  payload, not the system block.
+- **Schema unchanged.** `questions[].prompt | choices[] |
+  correctChoiceIndex | explanation` — same as v1. `parseResponse` in
+  every adapter continues to work without modification.
+- **`buildUserMessage` unchanged.** Still 2 parameters, still wraps
+  the diff in `<DIFF>` markers. The diff-only invariant
+  (CLAUDE.md §Key differentiator) is preserved by the signature, the
+  ban on a third parameter, and the prompt's "Use ONLY the diff
+  content" line.
+
+##### Prompt-injection hardening review
+
+ADR-14 §Decision 2's guarantees still hold:
+
+- The system message never references the LLM's own name
+  (`Claude`, `Codex`, `Copilot`, `OpenAI`, `Anthropic` — none
+  appear).
+- No "ignore previous instructions" or "you are a senior engineer"
+  bait.
+- The model is explicitly scoped to the diff content; the few-shot
+  example's internal `<DIFF>` markers are inside a single triple-
+  backtick code block in the prompt, not raw, so the model treats
+  them as illustrative.
+- A malicious diff containing the strings "BAD:", "GOOD:", or its own
+  fake `<DIFF>` markers would be embedded between the REAL
+  `<DIFF>` / `</DIFF>` markers in the USER message; the SYSTEM
+  ordering ("Use ONLY the diff content … between the markers")
+  defines authoritative scope. This is no worse than v1: a malicious
+  diff has always been able to contain JSON-looking text, fake schema
+  hints, etc.; the adapter's `parseResponse` ignores the diff and only
+  parses the model's stdout.
+
+Reviewer enforcement: existing prompt.test.ts canary tests
+(`no "ignore previous instructions"`, `no "you are a senior engineer"`,
+`no "LGTM"`, `no "Claude"`) MUST still pass. New canary tests are
+added in §Test strategy below.
+
+#### Part 2 — Auto-detect local judge in evals
+
+**New file:** `packages/evals/src/providers/judge.ts` — a promptfoo
+custom file provider used by the `llm-rubric` assertion.
+
+**Resolution order (binding):**
+
+1. If `process.env.LGTM_EVAL_JUDGE` is set AND its value is one of
+   `"claude" | "codex" | "copilot" | "claude-api"` AND the
+   corresponding precheck passes → use that judge.
+2. If `LGTM_EVAL_JUDGE` is set but its value is unknown → throw an
+   `Error` with the list of valid values (programmer error: typo in
+   env var). Fail-fast at first `callApi` invocation.
+3. If `LGTM_EVAL_JUDGE` is set to a valid value but the precheck
+   fails → throw an `Error` with the precheck reason. The user
+   explicitly asked for this judge; silently auto-detecting a
+   different one would be surprising.
+4. If `LGTM_EVAL_JUDGE` is unset → auto-detect by trying
+   `claude` → `codex` → `copilot` → `claude-api` in order. First
+   precheck that passes wins.
+5. If NO judge is available (no `LGTM_EVAL_JUDGE` and all four
+   prechecks fail) → throw an `Error` at first `callApi` invocation
+   listing all four candidates and their precheck failure reasons.
+   The eval run fails fast with a useful hint.
+
+**Resolution is cached.** The first `callApi` invocation per process
+resolves the judge once; subsequent invocations reuse the resolved
+judge. This is the "single judge across all cells" guarantee. The
+resolved judge is also logged once to stderr at process startup so
+the user can see which judge is grading (e.g.,
+`[lgtm-evals] judge: claude (auto-detected)`).
+
+**Per-judge implementation:**
+
+| Judge | Binary / endpoint | Argv | Auth check |
+|---|---|---|---|
+| `claude` | `claude` CLI | `["--print", "--output-format", "json", "--model", "sonnet", "--permission-mode", "default"]`, prompt via stdin | `claude --version` exits 0 |
+| `codex` | `codex` CLI | `["exec", "-", "--model", "o4-mini", "--ephemeral", "--skip-git-repo-check", "--full-auto"]`, prompt via stdin | `codex --version` exits 0 |
+| `copilot` | `gh` CLI | `["copilot", "explain", ""]`, prompt via stdin | `gh --version` exits 0 (Copilot extension presence is best-effort; matches `copilot-cli` adapter's posture per ADR-46) |
+| `claude-api` | `https://api.anthropic.com/v1/messages` via `monadyssey-fetch` | model `claude-sonnet-4-7`, single user message containing the rubric prompt | `process.env.ANTHROPIC_API_KEY` non-empty |
+
+**Output parsing.** The judge's text response (extracted from the
+adapter's stdout / API response body the same way the test-subject
+adapters do — `claude-cli` parses the `{"type":"result","result":...}`
+envelope, `codex`/`copilot` parse stdout directly, `claude-api`
+parses `content[0].text`) is fed to a small `parseJudgeVerdict`
+function that:
+
+1. Strips ` ```json … ``` ` fences if present (tolerant).
+2. `JSON.parse` the result.
+3. zod-validates against `JudgeVerdictSchema`:
+
+```ts
+// packages/evals/src/providers/judge.ts
+const JudgeVerdictSchema = z.object({
+  relevance: z.number().int().min(1).max(5),
+  conceptualDepth: z.number().int().min(1).max(5),
+  discrimination: z.number().int().min(1).max(5),
+  notes: z.string().min(1),
+});
+```
+
+4. Computes `average = (relevance + conceptualDepth + discrimination) / 3`.
+5. Returns the promptfoo-expected shape:
+
+```ts
+{
+  pass: average >= 3.5 && Math.min(relevance, conceptualDepth, discrimination) >= 2,
+  score: average / 5,  // promptfoo expects 0-1 range
+  reason: `relevance=${r}, conceptualDepth=${cd}, discrimination=${d}, average=${avg.toFixed(2)} — ${notes}`,
+}
+```
+
+If parsing fails at any step → return `{ pass: false, score: 0,
+reason: "judge verdict could not be parsed: <detail>" }`. The eval
+cell shows up as a rubric FAIL but the overall run does not crash.
+This matches ADR-26's "rubric is advisory in v1" stance.
+
+##### Why one judge per run, not per-cell-matched
+
+User signed off on this. The alternative — grading each cell with the
+same model that generated it — is rejected because:
+- The "tool grades its own output" bias is exactly what evals are
+  meant to surface, not entrench.
+- A single judge across all cells means cross-cell comparisons (e.g.,
+  "does `codex-cli` produce better conceptual questions than
+  `claude-cli`?") are calibrated against the same yardstick. Per-cell
+  matching would make every score relative to a different judge,
+  destroying the cross-cell signal.
+- Operationally simpler: one resolution at process start, no
+  per-cell branching.
+
+##### Why precedence `claude → codex → copilot → claude-api`
+
+- `claude` first because it's the v1 reference CLI and most likely
+  installed on the developer's machine (this project's primary author
+  uses it).
+- `codex` and `copilot` after because they are wired but less
+  commonly authenticated.
+- `claude-api` last because it costs money and requires a key — fall
+  back to it only when no local CLI is available.
+
+The user can override this with `LGTM_EVAL_JUDGE` in any environment
+where the auto-detect order doesn't match their preference.
+
+#### Part 3 — Rubric rewrite
+
+**File:** `packages/evals/src/asserts/rubric.md` — rewritten to align
+with the new SYSTEM_PROMPT. Three axes (replaces the previous
+relevance/difficulty/discrimination set):
+
+| Axis | What it measures |
+|---|---|
+| **relevance** (1-5) | Do the questions target concrete changes in the diff (not unchanged context)? |
+| **conceptualDepth** (1-5) | Do the questions test understanding (behaviour, invariants, edge cases, tradeoffs) or trivia (line numbers, exact names, exact literals)? |
+| **discrimination** (1-5) | Could a reviewer who skimmed but didn't understand the diff pass? Lower scores → quiz is too easy; higher scores → the quiz exposes shallow reading. |
+
+The rubric's text explicitly penalises:
+- Questions about line numbers, exact identifier names, exact
+  literals → max score 2 on `conceptualDepth`.
+- Questions about file paths → max score 2 on `relevance`.
+- Questions about unchanged context code → max score 2 on
+  `relevance`.
+- Quizzes a non-reader could pass by elimination or pattern match →
+  max score 2 on `discrimination`.
+
+And rewards:
+- Questions about behaviour visible to callers / users → +1 on
+  `conceptualDepth`.
+- Questions about invariants / edge cases / tradeoffs → +1 on
+  `conceptualDepth`.
+- Strong plausible distractors → +1 on `discrimination`.
+
+Output shape:
+
+```json
+{
+  "relevance": 4,
+  "conceptualDepth": 3,
+  "discrimination": 4,
+  "notes": "<one-sentence rationale>"
+}
+```
+
+`average` and `pass` are computed by `parseJudgeVerdict` in
+`judge.ts`, not by the judge itself — keeps the judge's reasoning
+load smaller and lets us change the pass threshold without re-running
+the prompt.
+
+#### Part 4 — promptfoo config update
+
+**File:** `packages/evals/promptfoo.config.yaml` — one line changes
+in the rubric block:
+
+```diff
+     - type: llm-rubric
+-      provider: anthropic:messages:claude-sonnet-4-6
++      provider: file://./dist/providers/judge.js
+       value: file://./src/asserts/rubric.md
+       threshold: 0
+```
+
+Same change in `promptfoo.empty-quiz.config.yaml` is NOT needed —
+that config currently has no `llm-rubric` assertion (the negative
+control only checks `errKind === "malformed-response"`).
+
+`threshold: 0` stays — the rubric is still advisory in v1 per
+ADR-26. The `judge.ts` `pass`/`score` shape lets promptfoo display
+PASS/FAIL in the report without gating.
+
+#### Part 5 — Docs
+
+**File:** `packages/evals/README.md` — under "Prerequisites" replace
+the current table with:
+
+```markdown
+| Adapter | Required (for test-subject) |
+|---|---|
+| `claude-cli` | `claude` CLI on PATH |
+| `claude-api` | `ANTHROPIC_API_KEY` environment variable |
+| `codex-cli` | `codex` CLI on PATH |
+| `copilot-cli` | `gh` CLI with `gh copilot` extension on PATH |
+
+The **judge** (used by the LLM-rubric assertion) is auto-detected
+from the same tools. Resolution order: `claude` → `codex` →
+`copilot` → `claude-api`. Override with
+`LGTM_EVAL_JUDGE=claude|codex|copilot|claude-api`. You need at least
+ONE of these for the rubric to score; otherwise the rubric assertion
+fails with a clear error but the run completes.
+```
+
+Add a paragraph under "Interpreting results" noting the resolved
+judge is logged to stderr at run start (`[lgtm-evals] judge: …`).
+
+**File:** `docs/release.md` — under "Prerequisites" mention that the
+extension and host packages do NOT change in this release; evals
+workspace gains a local judge so contributors no longer need
+`ANTHROPIC_API_KEY` purely to grade evals.
+
+### Affected workspaces
+
+| Workspace | Change |
+|---|---|
+| `packages/adapters/_shared/src/prompt.ts` | `SYSTEM_PROMPT` rewritten. `buildUserMessage` unchanged. |
+| `packages/evals/src/providers/judge.ts` | NEW custom provider for `llm-rubric`. |
+| `packages/evals/src/providers/judge.test.ts` | NEW unit tests for resolution + parsing. |
+| `packages/evals/src/asserts/rubric.md` | Rewritten to penalize trivia / reward conceptual depth. |
+| `packages/evals/promptfoo.config.yaml` | One-line judge provider swap. |
+| `packages/evals/README.md` | Document auto-detect + override env var. |
+| `docs/release.md` | Brief note that evals no longer require `ANTHROPIC_API_KEY` purely for judging. |
+| `packages/adapters/claude-cli/src/prompt.test.ts` | New canary tests (ban-list strings present, few-shot markers present, length sane). |
+| `packages/adapters/codex-cli/src/prompt.test.ts` | Mirror new canary tests. |
+| `packages/adapters/claude-api/src/prompt.test.ts` | Mirror new canary tests. |
+| `packages/adapters/copilot-cli/src/prompt.test.ts` (if exists) | Mirror new canary tests. |
+
+**No changes** to:
+- `core` (no new ports, no new domain types).
+- `protocol` (no wire-format change; schema for the response is
+  unchanged).
+- `host` (no dispatcher / cache changes; ADR-30's pool cache keys
+  off the diff, not the prompt).
+- `extension` (no UI changes).
+- Adapter `provider.ts` files (factories), `response.ts` parsers,
+  `ids.ts` — all unchanged.
+- The four test-subject providers in
+  `packages/evals/src/providers/{claude-cli,codex-cli,copilot-cli,claude-api}.ts`
+  — they generate, the judge grades.
+
+Dependency direction (CLAUDE.md):
+
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+                  ← evals (dev-only)
+```
+
+`evals` continues to import only from `adapters/*` and `core` (type
+only). `judge.ts` imports from `@lgtm-buzzer/adapter-shared`
+(`spawnIO`) and `@lgtm-buzzer/adapter-claude-api`
+(`createAnthropicHttpClient`) — both are already deps of the evals
+workspace. No new workspace dependencies.
+
+### Types
+
+```ts
+// packages/evals/src/providers/judge.ts
+
+export type JudgeKind = "claude" | "codex" | "copilot" | "claude-api";
+
+export type JudgeResolution =
+  | { readonly kind: "resolved"; readonly judge: JudgeKind; readonly source: "env" | "auto" }
+  | { readonly kind: "unresolvable"; readonly attempts: ReadonlyArray<{
+        readonly judge: JudgeKind;
+        readonly reason: string;
+      }> };
+
+export type JudgeVerdict = {
+  readonly relevance: number;        // 1-5
+  readonly conceptualDepth: number;  // 1-5
+  readonly discrimination: number;   // 1-5
+  readonly notes: string;
+};
+
+export type PromptfooLlmRubricResult = {
+  readonly pass: boolean;
+  readonly score: number;       // 0-1
+  readonly reason: string;
+};
+```
+
+No new types in `core` or `protocol`. No new types in adapter
+workspaces (the response shape is unchanged).
+
+### Functions and methods
+
+```ts
+// packages/evals/src/providers/judge.ts
+
+/** Resolves which judge to use, caching the result for the process lifetime. */
+export const resolveJudge: () => Promise<JudgeResolution>;
+
+/** Parses the judge's text response into a verdict, or returns a parse-failure shape. */
+export const parseJudgeVerdict: (
+  text: string,
+) => { readonly kind: "ok"; readonly verdict: JudgeVerdict }
+   | { readonly kind: "err"; readonly reason: string };
+
+/** Calls the resolved judge with the rubric+quiz prompt and parses the verdict. */
+export const callJudge: (
+  judge: JudgeKind,
+  rubricPrompt: string,
+) => Promise<{ readonly kind: "ok"; readonly text: string }
+            | { readonly kind: "err"; readonly reason: string }>;
+
+/** promptfoo custom-provider entry point. */
+export const callApi: (
+  prompt: string,
+  context: { readonly vars: Record<string, unknown> },
+) => Promise<PromptfooLlmRubricResult>;
+
+export const id: () => string; // "lgtm-buzzer-judge"
+```
+
+`callJudge` is split out from `callApi` so it's unit-testable with a
+fake adapter. The four per-judge call paths are implemented as
+internal helpers `callClaude`, `callCodex`, `callCopilot`,
+`callClaudeApi`, each ~25 lines mirroring the corresponding
+test-subject provider in `packages/evals/src/providers/`. The
+test-subject providers and the judge share `spawnIO` + the precheck
+helpers but do NOT share the adapter factories — the judge uses its
+own thin wrappers because the prompt shape it sends to the LLM is the
+rubric prompt, not `SYSTEM_PROMPT` + diff.
+
+**Crucially**: `callJudge` does NOT call any of the adapter factories
+(`createClaudeCliProvider` etc.). Those factories embed
+`SYSTEM_PROMPT` and pass it to the LLM — exactly what we do NOT want
+when the goal is for the judge to receive the rubric prompt. The
+judge sends its own prompt directly via `spawnIO` or
+`monadyssey-fetch`.
+
+In `packages/adapters/_shared/src/prompt.ts`:
+
+```ts
+export const SYSTEM_PROMPT: string; // rewritten, see Part 1
+export const buildUserMessage: (diff: Diff, questionCount: number) => string; // unchanged
+```
+
+### File layout
+
+New files:
+
+```
+packages/evals/src/providers/judge.ts
+packages/evals/src/providers/judge.test.ts
+```
+
+Modified files:
+
+```
+packages/adapters/_shared/src/prompt.ts                # SYSTEM_PROMPT body
+packages/adapters/claude-cli/src/prompt.test.ts        # new canaries
+packages/adapters/codex-cli/src/prompt.test.ts         # new canaries
+packages/adapters/claude-api/src/prompt.test.ts        # new canaries
+packages/evals/src/asserts/rubric.md                   # rewritten
+packages/evals/promptfoo.config.yaml                   # provider line swap
+packages/evals/README.md                               # judge docs
+docs/release.md                                        # brief mention
+```
+
+**Not modified** (binding for reviewer):
+- Any `packages/adapters/*/src/provider.ts` (factories).
+- Any `packages/adapters/*/src/response.ts` (parsers).
+- `packages/adapters/_shared/src/quiz-from-text.ts` (LlmQuizSchema).
+- `packages/evals/src/providers/{claude-cli,codex-cli,copilot-cli,claude-api}.ts`
+  (test-subject providers — same interface, same diff-only canary).
+- `packages/evals/src/providers/precheck.ts` (the existing
+  `checkBinary` / `checkAnthropicApiKey` helpers are reused).
+- `packages/host/**` (no host changes).
+- `packages/extension/**` (no extension changes).
+- `packages/core/**` and `packages/protocol/**` (no domain or wire
+  changes).
+
+### Sequence
+
+#### Production quiz generation (per-call, unchanged in shape, new in content)
+
+1. Extension's content-script intercepts Approve. Sends
+   `quiz-request` frame via the SW's native port.
+2. Host receives, validates with zod, dispatches to the active
+   `LLMProvider` adapter (`claude-cli` / `codex-cli` /
+   `copilot-cli` / `claude-api`).
+3. Adapter's `generateQuiz` builds the prompt with
+   `buildPrompt(diff, questionCount)` (CLI adapters) or
+   `buildMessagesPayload(diff, questionCount, model, maxTokens)`
+   (API adapter). The static SYSTEM body is now the new
+   conceptual-depth prompt.
+4. CLI adapters: `spawnIO(binary, fixedArgs, stdin, { graceMs })`,
+   diff in stdin only. API adapter: POST `/v1/messages` with the
+   diff in the user message body. (Diff-only invariant intact —
+   same data flow as ADR-14 / ADR-20.)
+5. Adapter parses the response via `parseResponse` (CLI) /
+   `parseAnthropicResponse` (API). Response schema unchanged.
+6. Host wraps the `Quiz` in `quiz-response` and returns to the SW.
+
+This is identical to today; the LLM is just instructed to produce
+better questions.
+
+#### Eval run with auto-detected judge
+
+1. User runs `npm run evals` (or `:quick` / `:empty-quiz-control`).
+2. `scripts/generate-tests.mjs` produces `tests.generated.json` as
+   today.
+3. promptfoo loads `promptfoo.config.yaml`. For each (test ×
+   test-subject-provider) cell:
+   a. promptfoo calls the test-subject provider's `callApi(prompt,
+      context)` (unchanged from ADR-26).
+   b. The provider generates a quiz via its adapter factory, runs
+      the IO, JSON-stringifies the Quiz into `output`.
+   c. promptfoo runs `defaultTest.assert` in order:
+      1. `is-json` javascript inline assert.
+      2. `schema-conformance.js` assert.
+      3. `expectedSymbols` `contains-any` javascript inline assert.
+      4. `llm-rubric` with `provider:
+         file://./dist/providers/judge.js`. promptfoo loads
+         `judge.js`, calls `judge.callApi(rubricPromptText, {
+         vars })` (the rubric prompt includes the quiz under
+         evaluation, supplied by promptfoo via the `vars` /
+         `context` machinery — verify promptfoo passes the
+         `output` from the previous step as part of `vars` /
+         `prompt`; if it does not, the judge constructs the
+         rubric prompt itself by reading `vars.output` or the
+         documented promptfoo extension point).
+      5. Latency advisory.
+   d. promptfoo records the cell verdict.
+4. On the FIRST `judge.callApi` invocation: `resolveJudge()` runs
+   the resolution order, logs the resolved judge to stderr, caches
+   the result. Subsequent calls reuse the cache.
+5. `judge.callJudge(kind, rubricPrompt)` invokes the appropriate
+   path (spawnIO for CLIs, HttpClient for API) and returns text.
+6. `parseJudgeVerdict(text)` extracts the JSON, validates with
+   `JudgeVerdictSchema`, computes average + pass.
+7. `callApi` returns `{ pass, score, reason }` for promptfoo to
+   surface in the report.
+
+**promptfoo `llm-rubric` integration detail (binding for dev):**
+promptfoo's `llm-rubric` assertion expects either a provider name
+string (`anthropic:messages:claude-sonnet-4-7`) or a custom file
+provider. When using a file provider, promptfoo calls the provider's
+`callApi` with the rubric prompt text (loaded from `value:
+file://./src/asserts/rubric.md`) interpolated with the cell's
+`output` + `vars`. The dev MUST verify against the installed
+promptfoo version (currently `^0.103.6` per
+`packages/evals/package.json`) that the interpolated rubric text
+arrives as the first argument to `callApi`. If promptfoo's contract
+has changed (it has been unstable across 0.x releases), the dev
+should `NEEDS_CLARIFICATION` rather than guess.
+
+### Error cases
+
+| Failure | Surfaced as | Run impact |
+|---|---|---|
+| `LGTM_EVAL_JUDGE` typo (e.g. `LGTM_EVAL_JUDGE=cluade`) | `throw Error("LGTM_EVAL_JUDGE must be one of …")` at first `callApi` | Run crashes — programmer error, fail-fast is correct |
+| `LGTM_EVAL_JUDGE=claude` but `claude` not on PATH | `throw Error("LGTM_EVAL_JUDGE=claude requested but … not available")` | Run crashes — user explicitly asked for a missing tool |
+| `LGTM_EVAL_JUDGE` unset, all four prechecks fail | `throw Error("no judge available: claude=…, codex=…, copilot=…, claude-api=…")` | Run crashes — no way to grade rubric |
+| Judge `claude-api` HTTP error (5xx, network) | `callJudge` returns `{ kind: "err", reason: "…" }`; `callApi` returns `{ pass: false, score: 0, reason: "judge call failed: …" }` | Cell shows rubric FAIL; run continues |
+| Judge stdout / response body unparseable | `parseJudgeVerdict` returns `{ kind: "err", reason: "…" }`; cell shows rubric FAIL with the parse reason | Run continues |
+| Judge verdict JSON valid but scores out of 1-5 range | zod validation rejects; cell shows rubric FAIL | Run continues |
+
+No `throw` on the per-cell happy or partial-failure paths. Only the
+"no judge available at all" path throws — and only at process
+startup — because the entire run is meaningless without a judge and
+silently FAILing every rubric cell would mask the real bug. This
+matches ADR-26 §7 ("evals are advisory") for cell-level outcomes,
+while remaining strict about process-level configuration.
+
+### Test strategy
+
+#### Production prompt canary tests
+
+In `packages/adapters/_shared/` is currently NOT tested directly;
+the `SYSTEM_PROMPT` constant is exercised transitively via each
+adapter's `prompt.test.ts`. Two options for the new tests:
+
+**Option A (chosen):** add canary cases to each adapter's existing
+`prompt.test.ts` files. Pros: keeps the per-adapter test surface
+authoritative; mirrors the existing canary pattern (ADR-14 §Test
+strategy). Cons: three near-identical copies.
+
+**Option B (rejected):** add a new
+`packages/adapters/_shared/src/prompt.test.ts`. Rejected because
+`_shared`'s purpose is to be a stub utility module that adapter
+tests depend on; introducing a test file there opens questions about
+which workspace's coverage budget it falls under.
+
+Per-adapter canary cases to add (each adapter's `prompt.test.ts`):
+
+1. `SYSTEM_PROMPT` contains the literal `DO ask about:` heading.
+2. `SYSTEM_PROMPT` contains the literal `DO NOT ask about:` heading.
+3. `SYSTEM_PROMPT` contains the literal `// BAD:` marker.
+4. `SYSTEM_PROMPT` contains the literal `// GOOD:` marker.
+5. `SYSTEM_PROMPT` contains each of the five ban-list anchors:
+   `Specific line numbers`, `exact new name`, `Exact literal values`,
+   `File paths`, `What an unchanged function`.
+6. `SYSTEM_PROMPT` contains the "Could a teammate … without
+   scrolling back" sweet-spot test sentence.
+7. `SYSTEM_PROMPT.length > 1500 && SYSTEM_PROMPT.length < 3000` —
+   length sanity (catches accidental truncation or a runaway
+   rewrite).
+8. **Existing canaries remain (all four MUST still pass):**
+   - No `Claude` / `Codex` / `Copilot` / `OpenAI` / `Anthropic` by
+     name in `SYSTEM_PROMPT`.
+   - No `ignore previous instructions`, no `you are a senior
+     engineer`, no `LGTM`.
+9. `correctChoiceIndex` schema hint still present.
+10. `buildPrompt.length === 2` (signature size — diff + count).
+
+The existing test cases for diff content / markers / question count
+do NOT need to change; the new prompt has the same outer shape.
+
+#### Judge unit tests (`packages/evals/src/providers/judge.test.ts`)
+
+A. **Resolution tests** with mocked precheck:
+1. `LGTM_EVAL_JUDGE=claude` + claude precheck OK → resolves
+   `{ judge: "claude", source: "env" }`.
+2. `LGTM_EVAL_JUDGE=codex` + codex precheck OK → resolves
+   `{ judge: "codex", source: "env" }`.
+3. `LGTM_EVAL_JUDGE=foo` → throws with valid-values list.
+4. `LGTM_EVAL_JUDGE=claude` + claude precheck FAIL → throws with
+   precheck reason.
+5. `LGTM_EVAL_JUDGE` unset + claude precheck OK → resolves
+   `{ judge: "claude", source: "auto" }`.
+6. `LGTM_EVAL_JUDGE` unset + claude FAIL + codex OK → resolves
+   `{ judge: "codex", source: "auto" }`.
+7. `LGTM_EVAL_JUDGE` unset + claude/codex/copilot FAIL +
+   ANTHROPIC_API_KEY set → resolves
+   `{ judge: "claude-api", source: "auto" }`.
+8. `LGTM_EVAL_JUDGE` unset + all four FAIL → throws with all four
+   precheck reasons.
+9. Resolution is cached across calls (call `resolveJudge` twice;
+   precheck mock invoked only on the first call).
+
+B. **Verdict parser tests** (`parseJudgeVerdict`):
+1. Happy JSON with all three axes in range → `{ kind: "ok",
+   verdict }`.
+2. Markdown ` ```json … ``` ` fence stripped → `kind: "ok"`.
+3. Malformed JSON → `{ kind: "err", reason: "… parse failed" }`.
+4. Out-of-range score (e.g. relevance=7) → `kind: "err"` with zod
+   detail.
+5. Missing `notes` field → `kind: "err"`.
+6. Extra fields ignored (zod default behaviour).
+
+C. **callApi (promptfoo entry point) tests** with fake `callJudge`:
+1. Happy path: fake returns valid verdict JSON →
+   `{ pass: true, score: 0.8, reason: "…" }` with average=4.0.
+2. Average exactly 3.5 with min ≥ 2 → `pass: true`.
+3. Average < 3.5 → `pass: false`.
+4. Per-axis minimum < 2 → `pass: false` (regardless of average).
+5. Fake `callJudge` returns `kind: "err"` → `pass: false, score:
+   0, reason: "judge call failed: …"`.
+6. Fake verdict unparseable → `pass: false, score: 0` with parse
+   detail.
+
+D. **Diff-only / no-secrets canary**: a test that calls `callApi`
+with a `context.vars` containing
+`{ output: <quiz JSON>, expectedSymbols: ["LEAK_CANARY"],
+prTitle: "LEAK_CANARY", description: "LEAK_CANARY",
+ANTHROPIC_API_KEY: "LEAK_CANARY" }`, with a fake `callJudge` that
+captures the rubric prompt text passed in. Asserts:
+1. The captured rubric prompt does NOT contain `"LEAK_CANARY"`
+   anywhere except where the quiz `output` itself contains it
+   (test arranges for the quiz JSON to be a safe minimal stub).
+2. The captured rubric prompt does NOT contain
+   `process.env.ANTHROPIC_API_KEY` value.
+3. No `vars` field other than the documented promptfoo
+   interpolation (rubric.md placeholders) reaches the judge.
+
+E. **CallJudge per-kind tests** (`callJudge("claude", "…")`,
+`callJudge("codex", "…")`, etc.) with fake `spawnIO` / fake
+`HttpClient`:
+1. Correct binary + argv asserted exactly for each CLI judge.
+2. Prompt arrives via stdin (CLI) / user message body (API).
+3. Auth value (`x-api-key`) NEVER appears in the captured argv or
+   stdout payload for `claude-api`.
+4. Subprocess failure → `kind: "err"`.
+
+**Coverage target:** 80% per ADR-26 (provider modules). Add a
+`describe` per group A-E; ≈ 30 cases total.
+
+#### Rubric.md text sanity
+
+The rubric is not code, so it isn't unit-tested. But the
+`judge.test.ts` happy-path case in §B.1 loads `rubric.md` via the
+test setup and confirms it parses as a non-empty string and contains
+the three axis keywords (`relevance`, `conceptualDepth`,
+`discrimination`). This catches accidental deletion.
+
+#### Manual verification (not automated)
+
+The actual quality improvement from the prompt rewrite is verified
+by:
+1. Running `npm run evals:quick` against the three fast fixtures
+   (`ts-add-validator`, `dep-bump-only`, `docs-readme-update`) and
+   comparing the new rubric scores against the baseline.
+2. Dogfooding on at least one real PR (the M3 release dogfooded
+   the v1 prompt — the M4 release does the same with the new
+   prompt).
+3. Updating `packages/evals/results/baseline.json` in a separate PR
+   after the rubric stabilises (ADR-26 §Updating the baseline).
+
+The baseline update is intentionally NOT in scope of this issue —
+it's a follow-up PR that lands once the prompt + judge are merged.
+
+### Consequences
+
+- **Production quiz quality leaps.** Conceptual questions replace
+  trivia. Reviewers who skim get caught; reviewers who understand
+  pass. This is the user-visible win.
+- **`SYSTEM_PROMPT` length ~doubles** (~0.9 KB → ~1.7 KB). For
+  `claude-api`, prompt caching makes this effectively free after
+  the first call. For CLI adapters, the LLM pays the parse cost
+  every call; latency impact is single-digit ms per call (negligible
+  next to the LLM's own ~10-60 s budget).
+- **Existing adapter test suites still pass.** All structural
+  canaries from ADR-14 §Test strategy still apply; new canaries
+  extend the surface rather than replace it.
+- **Evals no longer require `ANTHROPIC_API_KEY` to score.** A
+  contributor with `claude` CLI installed can run the full eval
+  suite — including the rubric — without a key. Reduces friction
+  for the "I want to tweak the prompt and see if it scored better"
+  workflow.
+- **Single-judge policy preserves cross-cell signal.** Comparing
+  `codex-cli` and `claude-cli` scores becomes meaningful because
+  they're graded by the same yardstick.
+- **`LGTM_EVAL_JUDGE` env override gives full control.** A reviewer
+  who suspects `claude` is too lenient as a judge can force
+  `LGTM_EVAL_JUDGE=codex` for a single run and compare.
+- **Diff-only invariant intact, end-to-end.** `buildUserMessage` is
+  unchanged (2 params). Adapter factories unchanged. Test-subject
+  providers in evals unchanged. Judge sends only the rubric prompt
+  + the quiz output to the LLM — never the original PR text. New
+  canary tests in §Test strategy.D enforce this.
+- **No new runtime deps anywhere.** `judge.ts` reuses `spawnIO`
+  (already a dep), `createAnthropicHttpClient` (already a dep), and
+  zod (already a dep).
+- **No `core` / `protocol` changes.** No new ports, no new wire
+  shapes. The change is isolated to: (a) a prompt constant, (b) an
+  eval-only file provider, (c) eval config + docs.
+- **Reversibility high.** Reverting is a three-PR job: revert
+  prompt commit (1 file), revert judge.ts + config (3 files),
+  revert rubric (1 file). No data migration, no protocol bump.
+- **ADR-30 (question pool with diff-hash cache) is orthogonal.** The
+  pool cache keys off the diff bytes, not the prompt text. A prompt
+  change does NOT invalidate the cache; this is by design (the
+  user's "Try Again" experience should not regenerate questions
+  just because the maintainer redeployed a new prompt build). The
+  M4 release should ship the cache invalidation manually if needed
+  (clear the host's in-process Map on host restart, which happens
+  per ADR-17's port lifecycle).
+- **Future ADR seeds (not in scope):**
+  - Per-cell-matched judging as an opt-in mode (requires explicit
+    user request — current single-judge policy is the default).
+  - Configurable judge model per CLI (e.g. claude-haiku for cheap
+    judging in CI).
+  - Open-ended / free-text questions (a different schema; significant
+    UI work in the modal).
+  - Auto-rerun evals on every prompt PR (currently manual /
+    scheduled per ADR-27).
+
+**Binding for reviewer (PR for #121 implementation):**
+
+- (a) `SYSTEM_PROMPT` text in `packages/adapters/_shared/src/prompt.ts`
+  matches the §Part 1 binding body verbatim modulo whitespace. No
+  paraphrasing of the DO / DO NOT bullets.
+- (b) `buildUserMessage.length === 2` (signature unchanged).
+- (c) New canary tests are added to EACH of `claude-cli`,
+  `codex-cli`, `claude-api` (and `copilot-cli` if a `prompt.test.ts`
+  exists there). All ten cases from §Test strategy.A.1-10 pass in
+  each file.
+- (d) `packages/evals/src/providers/judge.ts` exists and exports
+  `id`, `callApi`. NO adapter factory (`createClaudeCliProvider`
+  etc.) is called inside `judge.ts` — verified by grep.
+- (e) `parseJudgeVerdict` uses zod with the exact schema in
+  §Part 2.
+- (f) `resolveJudge` caches its result; second call with the same
+  process does NOT re-run prechecks. Verified by §Test strategy.A.9.
+- (g) `promptfoo.config.yaml` references
+  `file://./dist/providers/judge.js`, NOT
+  `anthropic:messages:…`. Verified by grep.
+- (h) Diff-only canary in `judge.test.ts` §D passes — non-diff
+  `vars` keys never reach the judge.
+- (i) `rubric.md` contains the three axis names (`relevance`,
+  `conceptualDepth`, `discrimination`) and explicitly mentions the
+  ban-list categories (line numbers, exact identifier names, exact
+  literals, file paths, unchanged context).
+- (j) `packages/evals/README.md` documents `LGTM_EVAL_JUDGE` and
+  the auto-detection order.
+- (k) NO modifications to any `packages/adapters/*/src/provider.ts`,
+  `response.ts`, `ids.ts`. NO modifications to any
+  `packages/evals/src/providers/{claude-cli,codex-cli,copilot-cli,claude-api}.ts`.
+  Verified by `git diff --stat` on the PR.
+- (l) `npm run check` still passes (build + test + lint +
+  typecheck:tests).
+
+---

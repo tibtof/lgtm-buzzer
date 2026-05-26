@@ -42,7 +42,7 @@ defaultTest:
     #    Uses claude-sonnet-4-6 as judge. Advisory in v1 — failures surface in
     #    the report but do not block the run (threshold: 0 means always pass).
     - type: llm-rubric
-      provider: anthropic:messages:claude-sonnet-4-6
+      provider: file://./dist/providers/judge.js
       value: file://./src/asserts/rubric.md
       threshold: 0
 
