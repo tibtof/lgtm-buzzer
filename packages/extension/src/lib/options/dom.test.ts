@@ -14,7 +14,7 @@ import type { AuthStatus } from "@lgtm-buzzer/protocol";
 
 const makeFakeStore = (initial?: StoredOptions) => {
   const data: Record<string, unknown> = initial !== undefined
-    ? { "lgtm_buzzer.options.v2": initial }
+    ? { "lgtm_buzzer.options.v3": initial }
     : {};
   const area = {
     get: async (key: string) => ({ [key]: data[key] }),
@@ -182,7 +182,7 @@ describe("createOptionsView (ADR-29)", () => {
     expect(detail?.textContent).toContain("az login");
   });
 
-  // 6. Save handler persists only { schemaVersion: 2, llmAdapterId }
+  // 6. Save handler persists only { schemaVersion: 3, llmAdapterId, questionPoolSize }
   it("clicking Save writes only schemaVersion and llmAdapterId to storage", async () => {
     const store = makeFakeStore();
     const root = document.createElement("main");
@@ -212,7 +212,7 @@ describe("createOptionsView (ADR-29)", () => {
     );
 
     expect(savedOptions).toBeDefined();
-    expect(savedOptions?.schemaVersion).toBe(2);
+    expect(savedOptions?.schemaVersion).toBe(3);
     // No vcsAdapterId or credentials in the saved shape.
     expect(Object.keys(savedOptions ?? {})).not.toContain("vcsAdapterId");
     expect(Object.keys(savedOptions ?? {})).not.toContain("credentials");

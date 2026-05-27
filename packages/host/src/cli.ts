@@ -49,6 +49,7 @@ import { createDispatcher } from "./dispatcher.js";
 import { createDefaultAdapterRegistry } from "./registry.js";
 import { createDefaultCredentialResolver } from "./credentials/index.js";
 import { createQuestionPoolCache } from "./question-pool-cache.js";
+import { createProgressEmitter } from "./progress-emitter.js";
 
 // ---------------------------------------------------------------------------
 // Decode-error helper
@@ -109,12 +110,20 @@ const main = async (): Promise<void> => {
   // Cap 10 pools in-process. Cold start on host restart is acceptable.
   const cache = createQuestionPoolCache({ capacity: 10 });
 
+  // ADR-32: progress emitter fires quiz-progress heartbeat frames during generation.
+  const progress = createProgressEmitter({
+    write,
+    logger,
+    now: () => Date.now(),
+  });
+
   const { dispatch } = createDispatcher({
     write,
     store,
     logger,
     registry,
     cache,
+    progress,
   });
 
   let streamFailed = false;

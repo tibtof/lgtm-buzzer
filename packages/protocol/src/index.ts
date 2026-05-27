@@ -118,4 +118,13 @@ export {
   type CheckAuthResponseFrame,
 } from "./messages/check-auth-response.js";
 
+export {
+  QuizProgressPhaseSchema,
+  QuizProgressPayloadSchema,
+  QuizProgressFrameSchema,
+  type QuizProgressPhase,
+  type QuizProgressPayload,
+  type QuizProgressFrame,
+} from "./messages/quiz-progress.js";
+
 export { parseFrame } from "./parse.js";

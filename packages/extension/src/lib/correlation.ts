@@ -3,14 +3,14 @@ import type { Frame } from "@lgtm-buzzer/protocol";
 /**
  * Represents a pending request awaiting a reply from the native host.
  *
- * The `timer` field holds the timeout handle so it can be cleared on
- * successful resolution or drain.
+ * `timer` is intentionally NOT readonly: heartbeat frames re-arm the
+ * timeout to extend the 180s budget on each heartbeat tick. ADR-32.
  */
 export type PendingRequest = {
   readonly correlationId: string;
   readonly tabId: number | undefined;
   readonly resolve: (frame: Frame) => void;
-  readonly timer: ReturnType<typeof setTimeout>;
+  timer: ReturnType<typeof setTimeout>;
 };
 
 /**
@@ -32,6 +32,12 @@ export type CorrelationMap = {
    * or returns `undefined` if not found.
    */
   readonly takeById: (correlationId: string) => PendingRequest | undefined;
+  /**
+   * Returns the pending request for the given correlationId WITHOUT removing
+   * it from the map. Used by heartbeat handling to re-arm the timeout.
+   * ADR-32.
+   */
+  readonly peekById: (correlationId: string) => PendingRequest | undefined;
   /**
    * Drains all pending requests by resolving each one with a synthesised
    * error frame produced by `reason(correlationId)`. Clears all timers.
@@ -64,6 +70,10 @@ export const createCorrelationMap = (): CorrelationMap => {
       if (pending === undefined) return undefined;
       store.delete(correlationId);
       return pending;
+    },
+
+    peekById: (correlationId: string): PendingRequest | undefined => {
+      return store.get(correlationId);
     },
 
     drainAll: (reason: (correlationId: string) => Frame): void => {

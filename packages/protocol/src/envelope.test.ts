@@ -246,4 +246,38 @@ describe("FrameSchema", () => {
       expect(result.data.kind).toBe("check-auth-response");
     }
   });
+
+  // ADR-32: quiz-progress heartbeat frame kind
+  it("parses a well-formed quiz-progress frame", () => {
+    const result = FrameSchema.safeParse({
+      v: 1,
+      kind: "quiz-progress",
+      correlationId: "cid-qp",
+      payload: { phase: "generating-quiz", elapsedMs: 5000 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("quiz-progress");
+    }
+  });
+
+  it("parses quiz-progress with null correlationId", () => {
+    const result = FrameSchema.safeParse({
+      v: 1,
+      kind: "quiz-progress",
+      correlationId: null,
+      payload: { phase: "fetching-diff", elapsedMs: 0 },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects quiz-progress with invalid phase", () => {
+    const result = FrameSchema.safeParse({
+      v: 1,
+      kind: "quiz-progress",
+      correlationId: "cid-qp",
+      payload: { phase: "unknown-phase", elapsedMs: 0 },
+    });
+    expect(result.success).toBe(false);
+  });
 });

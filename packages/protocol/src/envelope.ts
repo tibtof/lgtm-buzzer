@@ -11,6 +11,7 @@ import { ListAdaptersRequestFrameSchema } from "./messages/list-adapters-request
 import { ListAdaptersResponseFrameSchema } from "./messages/list-adapters-response.js";
 import { CheckAuthRequestFrameSchema } from "./messages/check-auth-request.js";
 import { CheckAuthResponseFrameSchema } from "./messages/check-auth-response.js";
+import { QuizProgressFrameSchema } from "./messages/quiz-progress.js";
 
 export { PROTOCOL_VERSION, EnvelopeBase } from "./base.js";
 
@@ -28,6 +29,7 @@ export const FrameSchema = z.discriminatedUnion("kind", [
   ListAdaptersResponseFrameSchema,
   CheckAuthRequestFrameSchema,
   CheckAuthResponseFrameSchema,
+  QuizProgressFrameSchema,
 ]);
 
 /** A well-formed native-messaging frame after parsing. */

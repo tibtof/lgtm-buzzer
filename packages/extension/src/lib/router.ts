@@ -1,7 +1,9 @@
 import { CSRequestSchema, type CSResponse } from "./cs-protocol.js";
 import type { PortClient } from "./port.js";
+import type { ProgressMap } from "./progress-map.js";
 import type { SwOptionsProjection } from "./options/storage-reader.js";
 import type { Frame } from "@lgtm-buzzer/protocol";
+import type { QuizProgressFrame } from "@lgtm-buzzer/protocol";
 
 /**
  * Logger interface required by `RouterDeps`.
@@ -17,14 +19,32 @@ export type RouterDeps = {
    * Reads the stored options projection for the SW.
    *
    * Called on every outbound `quiz-request` frame to merge `llmAdapterId`
-   * into the payload. As of ADR-29, `vcsAdapterId` is inferred from `pr.kind`
-   * and `credentials` are resolved host-side — neither is read from storage.
-   * Injected so tests can supply a stub without touching `chrome.storage`.
+   * and `questionPoolSize` into the payload. As of ADR-29, `vcsAdapterId`
+   * is inferred from `pr.kind` and `credentials` are resolved host-side —
+   * neither is read from storage. Injected so tests can supply a stub without
+   * touching `chrome.storage`.
    */
   readonly readSwOptions: () => Promise<SwOptionsProjection>;
   /** Called when the CS sends an `open-options` message. */
   readonly openOptionsPage?: () => void;
   readonly logger?: RouterLogger;
+  /**
+   * Optional progress-frame registry (ADR-32).
+   *
+   * When provided, the router subscribes a forwarding callback before sending
+   * each `quiz-request` frame and unsubscribes on the terminal reply. This
+   * routes heartbeat frames from the host → SW → CS via
+   * `chrome.tabs.sendMessage`.
+   */
+  readonly progressMap?: ProgressMap;
+  /**
+   * Sends a one-way message to a content-script tab (ADR-32 heartbeat forwarding).
+   *
+   * Injected so the router does not reference the global `chrome` directly,
+   * keeping this file unit-testable without `@types/chrome`.
+   * In production this is `(tabId, msg) => browser.tabs.sendMessage(tabId, msg)`.
+   */
+  readonly sendTabMessage?: (tabId: number, msg: unknown) => Promise<unknown>;
 };
 
 /**
@@ -68,7 +88,7 @@ export type CSMessageHandler = (
  * @returns The handler function to pass to `chrome.runtime.onMessage.addListener`.
  */
 export const createCSMessageHandler = (deps: RouterDeps): CSMessageHandler => {
-  const { portClient, readSwOptions, openOptionsPage, logger } = deps;
+  const { portClient, readSwOptions, openOptionsPage, logger, progressMap, sendTabMessage } = deps;
 
   return (
     message: unknown,
@@ -116,6 +136,7 @@ export const createCSMessageHandler = (deps: RouterDeps): CSMessageHandler => {
           llmAdapterId?: string;
           vcsAdapterId?: string;
           credentials?: unknown;
+          questionPoolSize?: number;
         };
 
         // ADR-29: auto-pick VCS adapter from the PR kind.
@@ -136,6 +157,13 @@ export const createCSMessageHandler = (deps: RouterDeps): CSMessageHandler => {
           vcsAdapterId: vcsFromPrKind ?? originalPayload.vcsAdapterId,
         };
 
+        // ADR-32: merge questionPoolSize from storage into the payload.
+        // quiz-flow.ts no longer hardcodes a pool size; the router is the
+        // single place responsible for injecting the stored preference.
+        if (projection.questionPoolSize !== undefined) {
+          mergedPayload["questionPoolSize"] = projection.questionPoolSize;
+        }
+
         // ADR-29: strip credentials field entirely (stale CS may still send it).
         delete mergedPayload["credentials"];
 
@@ -146,7 +174,37 @@ export const createCSMessageHandler = (deps: RouterDeps): CSMessageHandler => {
           payload: mergedPayload,
         } as unknown as Frame;
 
+        // ADR-32: subscribe to progress frames before sending; unsubscribe on
+        // terminal reply. This routes heartbeat frames to the originating tab.
+        const correlationId = mergedFrame.correlationId;
+        if (progressMap !== undefined && correlationId !== null) {
+          progressMap.subscribe(correlationId, (progressFrame: QuizProgressFrame) => {
+            if (tabId !== undefined && sendTabMessage !== undefined) {
+              // Forward heartbeat to the originating tab's content script.
+              // Wrap in try/catch: the tab may have been closed.
+              try {
+                void sendTabMessage(tabId, {
+                  kind: "quiz-progress",
+                  payload: progressFrame.payload,
+                  correlationId: progressFrame.correlationId,
+                });
+              } catch {
+                logger?.warn(
+                  "[lgtm-buzzer:sw] sendTabMessage failed for heartbeat — tab may be closed",
+                  { tabId },
+                );
+              }
+            }
+          });
+        }
+
         const reply = await portClient.sendFrame(mergedFrame, tabId);
+
+        // Unsubscribe progress after terminal reply.
+        if (progressMap !== undefined && correlationId !== null) {
+          progressMap.unsubscribe(correlationId);
+        }
+
         sendResponse({ kind: "frame", frame: reply });
       })();
 

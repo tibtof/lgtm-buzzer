@@ -1176,10 +1176,11 @@ describe("createQuizFlowController", () => {
   });
 
   // -------------------------------------------------------------------------
-  // ADR-30: questionPoolSize included in initial quiz-request
+  // ADR-32: questionPoolSize is owned by the router (SW), not quiz-flow.
+  // quiz-flow does NOT inject questionPoolSize into the outbound quiz-request.
   // -------------------------------------------------------------------------
 
-  it("ADR-30: initial quiz-request includes questionPoolSize: 5 (demo-mode default)", async () => {
+  it("ADR-32: quiz-flow does NOT include questionPoolSize in outbound quiz-request (router owns it)", async () => {
     const sentFrames: Frame[] = [];
     const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
       sentFrames.push(frame);
@@ -1203,7 +1204,9 @@ describe("createQuizFlowController", () => {
     expect(quizRequests).toHaveLength(1);
     const req = quizRequests[0]!;
     if (req.kind === "quiz-request") {
-      expect(req.payload.questionPoolSize).toBe(5);
+      // questionPoolSize must be absent — the router merges it from storage
+      // (ADR-32). quiz-flow's sendQuizRequest must not hardcode any pool value.
+      expect(req.payload.questionPoolSize).toBeUndefined();
       expect(req.payload.questionCount).toBe(5);
     }
   });

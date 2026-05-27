@@ -5,6 +5,7 @@ import {
   QuizResultPayloadSchema,
   SubmittedAnswerSchema,
   ErrorReasonSchema,
+  QuizProgressPhaseSchema,
 } from "@lgtm-buzzer/protocol";
 
 /**
@@ -21,6 +22,8 @@ export const DOM_EVENTS = {
   quizSubmit: "lgtm-buzzer:quiz-submit",
   quizCancel: "lgtm-buzzer:quiz-cancel",
   quizRetry: "lgtm-buzzer:quiz-retry",
+  /** ADR-32: host-streamed progress heartbeat routed from SW → CS → modal. */
+  quizProgress: "lgtm-buzzer:quiz-progress",
 } as const;
 
 /**
@@ -119,6 +122,25 @@ export const QuizRetryEventDetailSchema = z.object({
 
 /** The detail object for a `lgtm-buzzer:quiz-retry` custom event. */
 export type QuizRetryEventDetail = z.infer<typeof QuizRetryEventDetailSchema>;
+
+/**
+ * Detail carried by `lgtm-buzzer:quiz-progress` (SW → CS → modal, ADR-32).
+ *
+ * Routed by `QuizFlowController.onProgressFrame` after resolving the
+ * correlationId → requestId mapping. The modal subscribes to this event to
+ * update its phase indicator.
+ *
+ * BINDING (diff-only invariant): no diff bytes, PR title, or partial quiz
+ * content are permitted. Only phase metadata and elapsed time.
+ */
+export const QuizProgressEventDetailSchema = z.object({
+  requestId: z.string().min(1),
+  phase: QuizProgressPhaseSchema,
+  elapsedMs: z.number().int().min(0),
+});
+
+/** The detail object for a `lgtm-buzzer:quiz-progress` custom event. */
+export type QuizProgressEventDetail = z.infer<typeof QuizProgressEventDetailSchema>;
 
 /**
  * Emits a `CustomEvent` with the given name and detail on `doc`.

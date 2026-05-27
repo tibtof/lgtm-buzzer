@@ -14,7 +14,8 @@ import { createOptionsStore } from "../src/lib/options/storage.js";
 import type {
   InterceptorFactory,
 } from "../src/lib/dom/index.js";
-import type { Frame } from "@lgtm-buzzer/protocol";
+import type { Frame, QuizProgressFrame } from "@lgtm-buzzer/protocol";
+import { QuizProgressPayloadSchema } from "@lgtm-buzzer/protocol";
 import { CSResponseSchema } from "../src/lib/cs-protocol.js";
 
 export default defineContentScript({
@@ -170,16 +171,37 @@ export default defineContentScript({
     // Toolbar popup → CS message bridge. Popup sends
     // `{ kind: "trigger-manual-quiz" }` via chrome.tabs.sendMessage; the SW
     // ignores it (no `send-frame` shape) and Chrome routes it here too.
+    // ADR-32: also handles `{ kind: "quiz-progress", payload, correlationId }`
+    // forwarded by the SW router to relay heartbeat frames from the host.
     browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-      if (
-        typeof msg === "object" &&
-        msg !== null &&
-        (msg as { kind?: string }).kind === "trigger-manual-quiz"
-      ) {
+      const m = msg as { kind?: string; payload?: unknown; correlationId?: unknown };
+
+      if (typeof m === "object" && m !== null && m.kind === "trigger-manual-quiz") {
         const result = controller.triggerManual();
         sendResponse({ ok: result.ok });
         return true;
       }
+
+      // ADR-32: quiz-progress heartbeat forwarded from the SW router.
+      if (typeof m === "object" && m !== null && m.kind === "quiz-progress") {
+        const payloadParsed = QuizProgressPayloadSchema.safeParse(m.payload);
+        const correlationId = typeof m.correlationId === "string" ? m.correlationId : null;
+
+        if (payloadParsed.success) {
+          const frame: QuizProgressFrame = {
+            v: 1,
+            kind: "quiz-progress",
+            correlationId,
+            payload: payloadParsed.data,
+          };
+          controller.onProgressFrame(frame);
+        } else {
+          logger.warn("[lgtm-buzzer:cs] quiz-progress payload failed validation — dropped", {});
+        }
+        // No async reply needed; return false to close channel synchronously.
+        return false;
+      }
+
       return undefined;
     });
   },

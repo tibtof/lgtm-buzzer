@@ -12,9 +12,14 @@ import type { OptionsStore } from "./storage.js";
  * - `vcsAdapterId` is REMOVED — inferred from `pr.kind` by the SW router.
  * - `credentials` is REMOVED — resolved host-side by `CredentialResolver`.
  * - Only `llmAdapterId` remains as a user preference.
+ *
+ * As of ADR-32:
+ * - `questionPoolSize` is added. Undefined means "use default (5)".
  */
 export type SwOptionsProjection = {
   readonly llmAdapterId: string | undefined;
+  /** One of {5, 10, 20} or undefined (default 5). ADR-32. */
+  readonly questionPoolSize: 5 | 10 | 20 | undefined;
 };
 
 // ---------------------------------------------------------------------------
@@ -38,6 +43,7 @@ export const readSwOptions = (deps: {
   const { store } = deps;
   const empty: SwOptionsProjection = {
     llmAdapterId: undefined,
+    questionPoolSize: undefined,
   };
 
   return async (): Promise<SwOptionsProjection> => {
@@ -46,6 +52,7 @@ export const readSwOptions = (deps: {
       () => empty,
       (options) => ({
         llmAdapterId: options.llmAdapterId,
+        questionPoolSize: options.questionPoolSize,
       }),
     );
   };

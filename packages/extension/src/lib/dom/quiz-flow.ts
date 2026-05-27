@@ -1,4 +1,4 @@
-import type { Frame } from "@lgtm-buzzer/protocol";
+import type { Frame, QuizProgressFrame } from "@lgtm-buzzer/protocol";
 import { RESAMPLE_FAILED_PREFIX } from "@lgtm-buzzer/protocol";
 import type { PRIdentifier } from "@lgtm-buzzer/core";
 import {
@@ -10,6 +10,7 @@ import {
   addDOMEventListener,
   type QuizRetryEventDetail,
 } from "./dom-events.js";
+import { QuizProgressPayloadSchema } from "@lgtm-buzzer/protocol";
 import type { StatsStore } from "../stats/store.js";
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,9 @@ export type QuizFlowDeps = {
  * Approve-click intercept. Used by the toolbar popup and the page-injected
  * "Quiz me" button. On pass, the modal closes with a success message — there
  * is no replay (you did not click Approve, so there is nothing to replay).
+ * `onProgressFrame()` routes an incoming `quiz-progress` frame (received
+ * from the SW via chrome.tabs.sendMessage) to the DOM event channel so the
+ * modal can update its phase indicator. ADR-32.
  */
 export type QuizFlowController = {
   /** Attaches all DOM and frame listeners. Safe to call only once. */
@@ -142,6 +146,16 @@ export type QuizFlowController = {
    * On `{ ok: true }`, the modal will open in `generating` state shortly.
    */
   readonly triggerManual: () => { readonly ok: boolean };
+  /**
+   * Routes an incoming `quiz-progress` frame to the modal via a
+   * `lgtm-buzzer:quiz-progress` DOM event.
+   *
+   * Resolves the correlationId → requestId mapping maintained in the factory
+   * closure, then emits the event with `{ requestId, phase, elapsedMs }`.
+   *
+   * ADR-32.
+   */
+  readonly onProgressFrame: (frame: QuizProgressFrame) => void;
 };
 
 /**
@@ -231,6 +245,11 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   // Per-request generation start times (set when quiz-request frame is sent).
   const generationStartTimes = new Map<string, number>();
 
+  // ADR-32: correlationId → requestId mapping for routing quiz-progress frames.
+  // Populated in sendQuizRequest / sendQuizResampleRequest.
+  // Cleared in handleQuizRequestReply, onQuizCancel, onWillNavigate.
+  const correlationToRequest = new Map<string, string>();
+
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
@@ -263,7 +282,13 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     requestId: string,
     reply: Frame,
     viaResample = false,
+    correlationId?: string,
   ): void => {
+    // ADR-32: clean up the correlationId → requestId mapping on terminal reply.
+    if (correlationId !== undefined) {
+      correlationToRequest.delete(correlationId);
+    }
+
     if (reply.kind === "quiz-response") {
       // Record generation duration for stats — only for real LLM calls (not resamples).
       if (!viaResample) {
@@ -394,6 +419,10 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     // Record the generation start time for stats.
     generationStartTimes.set(requestId, Date.now());
 
+    // ADR-32: store correlationId → requestId so that onProgressFrame can
+    // route heartbeat frames to the correct modal.
+    correlationToRequest.set(correlationId, requestId);
+
     const frame: Frame = {
       v: 1,
       kind: "quiz-request",
@@ -403,13 +432,10 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
           ? { kind: "github", owner: p.pr.owner, repo: p.pr.repo, number: p.pr.number }
           : { kind: "ado", org: p.pr.org, project: p.pr.project, repo: p.pr.repo, pullRequestId: p.pr.pullRequestId },
         questionCount: 5,
-        // ADR-30: pool size 5 effectively disables the pool — the host
-        // generates 5 questions, the extension samples all 5, and resample
-        // is a no-op (returns the same 5). Trade: instant retry-cache is
-        // gone, but first-quiz time drops from ~60s to ~15s, which matches
-        // pre-ADR-30 behavior. Adjust upward (e.g. 10) when first-quiz
-        // latency is less of a concern than retry variety.
-        questionPoolSize: 5,
+        // ADR-32: questionPoolSize is NO LONGER hardcoded here. The router
+        // merges the stored preference (from options storage) into the payload
+        // before forwarding to the host. quiz-flow sends only questionCount.
+        // See packages/extension/src/lib/router.ts for the merge logic.
       },
     };
 
@@ -424,7 +450,7 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     // If the SW replied with sw-error, wrap as synthetic ErrorFrame.
     const csResponse = CSResponseSchema.safeParse({ kind: "frame", frame: reply });
     if (!csResponse.success) {
-      handleQuizRequestReply(requestId, makeSyntheticErrorFrame(correlationId, "invalid SW response"));
+      handleQuizRequestReply(requestId, makeSyntheticErrorFrame(correlationId, "invalid SW response"), false, correlationId);
       return;
     }
 
@@ -434,10 +460,11 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
         requestId,
         kind: reply.kind,
       });
+      correlationToRequest.delete(correlationId);
       return;
     }
 
-    handleQuizRequestReply(requestId, reply);
+    handleQuizRequestReply(requestId, reply, false, correlationId);
   };
 
   // ---------------------------------------------------------------------------
@@ -531,6 +558,9 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
     // Record a start time (for potential timing diagnostics); NOT counted in stats.
     generationStartTimes.set(requestId, Date.now());
 
+    // ADR-32: store correlationId → requestId for heartbeat routing.
+    correlationToRequest.set(correlationId, requestId);
+
     const frame: Frame = {
       v: 1,
       kind: "quiz-resample-request",
@@ -552,6 +582,7 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
         requestId,
         makeSyntheticErrorFrame(correlationId, "invalid SW response"),
         true,
+        correlationId,
       );
       return;
     }
@@ -562,12 +593,13 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
         requestId,
         kind: reply.kind,
       });
+      correlationToRequest.delete(correlationId);
       return;
     }
 
     // Happy path: got a quiz-response from the resample.
     if (reply.kind === "quiz-response") {
-      handleQuizRequestReply(requestId, reply, true /* viaResample — do not count in stats */);
+      handleQuizRequestReply(requestId, reply, true /* viaResample — do not count in stats */, correlationId);
       return;
     }
 
@@ -585,13 +617,14 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
           reason: reply.payload.reason,
           message: reply.payload.message,
         });
+        correlationToRequest.delete(correlationId);
         const freshCorrelationId = newCorrelationId();
         await sendQuizRequest(requestId, p, freshCorrelationId);
         return;
       }
 
       // Any other error — propagate to the modal as usual.
-      handleQuizRequestReply(requestId, reply, true);
+      handleQuizRequestReply(requestId, reply, true, correlationId);
       return;
     }
 
@@ -600,6 +633,7 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
       requestId,
       makeSyntheticErrorFrame(correlationId, `Unexpected reply kind: ${reply.kind}`),
       true,
+      correlationId,
     );
   };
 
@@ -610,7 +644,13 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   const onQuizCancel = (detail: { requestId: string }): void => {
     dropPending(detail.requestId);
     generationStartTimes.delete(detail.requestId);
-    // SW's 60s timeout cleans the host side (ADR-18 §Decision 5).
+    // ADR-32: drain any correlationId → requestId entries for this requestId.
+    for (const [corrId, reqId] of correlationToRequest) {
+      if (reqId === detail.requestId) {
+        correlationToRequest.delete(corrId);
+      }
+    }
+    // SW's 180s timeout cleans the host side (ADR-18 §Decision 5 / ADR-30).
   };
 
   // ---------------------------------------------------------------------------
@@ -700,6 +740,8 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   const onWillNavigate = (): void => {
     approveBypass = false;
     dropAll();
+    // ADR-32: clear all heartbeat correlation mappings on navigation.
+    correlationToRequest.clear();
   };
 
   const onDidNavigate = (): void => {
@@ -766,6 +808,7 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
       approveBypass = false;
       dropAll();
       generationStartTimes.clear();
+      correlationToRequest.clear();
       for (const dispose of disposers) {
         dispose();
       }
@@ -799,6 +842,35 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
 
       void sendQuizRequest(requestId, p, correlationId);
       return { ok: true };
+    },
+
+    onProgressFrame: (frame: QuizProgressFrame): void => {
+      const correlationId = frame.correlationId;
+      if (correlationId === null) return;
+
+      const requestId = correlationToRequest.get(correlationId);
+      if (requestId === undefined) {
+        logger?.warn("[lgtm-buzzer:cs] quiz-progress with no active request — dropped", {
+          correlationId,
+        });
+        return;
+      }
+
+      // Validate the payload before forwarding to DOM.
+      const parsed = QuizProgressPayloadSchema.safeParse(frame.payload);
+      if (!parsed.success) {
+        logger?.warn("[lgtm-buzzer:cs] quiz-progress payload failed validation — dropped", {
+          correlationId,
+        });
+        return;
+      }
+
+      // ADR-32: emit the progress DOM event so the modal can update its phase indicator.
+      emitDOMEvent(doc, DOM_EVENTS.quizProgress, {
+        requestId,
+        phase: parsed.data.phase,
+        elapsedMs: parsed.data.elapsedMs,
+      });
     },
   };
 };

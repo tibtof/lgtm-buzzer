@@ -20,10 +20,12 @@ import {
   DOM_EVENTS,
   QuizRequestEventDetailSchema,
   QuizResultEventDetailSchema,
+  QuizProgressEventDetailSchema,
   emitDOMEvent,
   addDOMEventListener,
   type DOMEventLogger,
 } from "./dom-events.js";
+import type { QuizProgressPhase } from "@lgtm-buzzer/protocol";
 import { classifyError, errorClassToUI } from "./error-classes.js";
 import { createFocusTrap } from "./focus-trap.js";
 import type { FocusTrap } from "./focus-trap.js";
@@ -842,6 +844,27 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
   // Recent pass rate cached on entering result states.
   let cachedPassRate: { passed: number; total: number } | null = null;
 
+  // ADR-32: heartbeat tracking. Set to Date.now() when a quiz-progress arrives.
+  // Null when no heartbeat has been received for the current generation.
+  let lastHeartbeatMs: number | null = null;
+
+  // ADR-32: current phase from heartbeat. Used to update the subtitle text.
+  let currentPhase: QuizProgressPhase | null = null;
+
+  // ---------------------------------------------------------------------------
+  // ADR-32: phase-copy helper
+  // ---------------------------------------------------------------------------
+
+  /** Returns human-readable copy for the current heartbeat phase. */
+  const phaseCopy = (phase: QuizProgressPhase): string => {
+    switch (phase) {
+      case "fetching-diff":    return "Fetching diff…";
+      case "generating-quiz":  return "Generating quiz…";
+      case "parsing":          return "Parsing response…";
+      case "caching":          return "Almost ready…";
+    }
+  };
+
   // ---------------------------------------------------------------------------
   // Stats footer helper (closes over factory-scope state)
   // ---------------------------------------------------------------------------
@@ -993,7 +1016,9 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
     switch (state.kind) {
       case "generating": {
         const { requestId } = state;
-        subtitle.textContent = "Preparing your quiz…";
+        // ADR-32: show phase copy when we have a heartbeat; otherwise static text.
+        subtitle.textContent = currentPhase !== null ? phaseCopy(currentPhase) : "Preparing your quiz…";
+        subtitle.setAttribute("data-testid", "lgtm-buzzer-generation-subtitle");
         content.appendChild(renderGenerating(doc));
 
         // Live generation timer.
@@ -1009,8 +1034,10 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           loadingDiv.appendChild(timerEl);
         }
 
-        // ETA progress bar — shown only when we have a cached median.
-        if (cachedMedianMs !== null) {
+        // ETA progress bar — shown only when we have a cached median AND no
+        // heartbeat has arrived yet (ADR-32: first heartbeat clears cachedMedianMs
+        // and switches to indeterminate progress).
+        if (cachedMedianMs !== null && lastHeartbeatMs === null) {
           const etaBar = el(doc, "progress", {
             "data-testid": "lgtm-buzzer-generation-eta",
             class: "eta-bar",
@@ -1028,7 +1055,12 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           timerEl.textContent = `${seconds}s`;
           timerEl.setAttribute("datetime", `PT${seconds}S`);
 
-          if (cachedMedianMs !== null) {
+          // ADR-32: after 10s of no heartbeat, revert subtitle to static text.
+          if (lastHeartbeatMs !== null && Date.now() - lastHeartbeatMs > 10_000) {
+            subtitle.textContent = "Preparing your quiz…";
+          }
+
+          if (cachedMedianMs !== null && lastHeartbeatMs === null) {
             const etaBar = shadow?.querySelector<HTMLProgressElement>(
               "[data-testid='lgtm-buzzer-generation-eta']",
             );
@@ -1321,6 +1353,20 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
       generationStartMs = null;
       cachedMedianMs = null;
       cachedPassRate = null;
+      lastHeartbeatMs = null;
+      currentPhase = null;
+    }
+
+    // Leaving generating: clear heartbeat state.
+    if (prev.kind === "generating" && next.kind !== "generating") {
+      lastHeartbeatMs = null;
+      currentPhase = null;
+    }
+
+    // Entering generating: reset heartbeat state for fresh generation.
+    if (next.kind === "generating") {
+      lastHeartbeatMs = null;
+      currentPhase = null;
     }
 
     state = next;
@@ -1430,6 +1476,43 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
     transition({ kind: "generating", requestId: detail.requestId });
   };
 
+  /**
+   * ADR-32: handles `lgtm-buzzer:quiz-progress` DOM events emitted by the CS
+   * via `QuizFlowController.onProgressFrame`.
+   *
+   * In `generating` state:
+   * - Updates the subtitle to phase-aware copy.
+   * - Clears `cachedMedianMs` so the ETA bar switches to indeterminate.
+   * - Resets `lastHeartbeatMs`.
+   *
+   * In any other state: ignored (no-op).
+   */
+  const onQuizProgress = (detail: {
+    requestId: string;
+    phase: QuizProgressPhase;
+    elapsedMs: number;
+  }): void => {
+    if (state.kind !== "generating") return;
+    // Only handle progress for the active request.
+    if (state.requestId !== detail.requestId) return;
+
+    // ADR-32: first heartbeat cancels the cached-median ETA bar (switch to
+    // indeterminate) and marks the heartbeat timestamp.
+    if (lastHeartbeatMs === null) {
+      // Clear the median — ETA bar disappears on next tick (indeterminate).
+      cachedMedianMs = null;
+    }
+
+    lastHeartbeatMs = Date.now();
+    currentPhase = detail.phase;
+
+    // Update the subtitle text directly (avoid a full re-render).
+    const subtitleEl = shadow?.querySelector<HTMLElement>("[data-testid='lgtm-buzzer-generation-subtitle']");
+    if (subtitleEl !== null && subtitleEl !== undefined) {
+      subtitleEl.textContent = phaseCopy(detail.phase);
+    }
+  };
+
   const onQuizResult = (detail: {
     requestId: string;
     outcome:
@@ -1499,11 +1582,21 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         logger,
       );
 
+      // ADR-32: subscribe to quiz-progress heartbeat events.
+      const disposeProgress = addDOMEventListener(
+        doc,
+        DOM_EVENTS.quizProgress,
+        QuizProgressEventDetailSchema,
+        onQuizProgress,
+        logger,
+      );
+
       doc.addEventListener("keydown", handleKeyDown);
 
       return (): void => {
         disposeRequest();
         disposeResult();
+        disposeProgress();
         doc.removeEventListener("keydown", handleKeyDown);
         stopTimer();
         focusTrap?.deactivate();
@@ -1519,6 +1612,8 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         lastGenerationDurationMs = null;
         cachedMedianMs = null;
         cachedPassRate = null;
+        lastHeartbeatMs = null;
+        currentPhase = null;
       };
     },
   };
