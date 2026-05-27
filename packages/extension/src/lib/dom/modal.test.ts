@@ -1427,6 +1427,25 @@ describe("createQuizModal — stats UI", () => {
     expect(footer!.textContent).toContain("claude-cli");
   });
 
+  // 39b. PR identifier line: idle state has no pr-id element
+  it("39b. pr-id: idle state has no [data-testid='lgtm-buzzer-modal-pr-id'] element", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    // Do not fire any quiz-request — modal stays idle (no backdrop rendered).
+    const host = document.querySelector("[data-lgtm-modal-host]");
+    expect(host).toBeNull();
+
+    // Even after mounting via a request + cancel, no pr-id should exist.
+    fireQuizRequest(document);
+    const shadow = getShadow(document)!;
+    const cancelBtn = shadow.querySelector<HTMLButtonElement>("[data-testid='lgtm-buzzer-quiz-cancel']");
+    cancelBtn!.click(); // transitions to idle, removes backdrop
+
+    const prId = shadow.querySelector("[data-testid='lgtm-buzzer-modal-pr-id']");
+    expect(prId).toBeNull();
+  });
+
   // 40. Timer is cleared when transitioning out of generating state
   it("40. stats: timer interval is cleared on transition away from generating", async () => {
     const modal = createQuizModal({
@@ -1443,5 +1462,119 @@ describe("createQuizModal — stats UI", () => {
     const shadow = getShadow(document)!;
     const timer = shadow.querySelector("[data-testid='lgtm-buzzer-generation-timer']");
     expect(timer).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — PR identifier line in modal header (#116)
+// ---------------------------------------------------------------------------
+
+describe("createQuizModal — PR identifier line", () => {
+  let dispose: (() => void) | null = null;
+
+  beforeEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  afterEach(() => {
+    dispose?.();
+    dispose = null;
+    document.querySelectorAll("[data-lgtm-modal-host]").forEach((n) => n.remove());
+  });
+
+  // 41. GitHub PR identifier renders correctly in modal header
+  it("41. pr-id: GitHub PR shows '{owner}/{repo} #{number}' before h2", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    const detail: QuizRequestEventDetail = {
+      requestId: "req-gh",
+      correlationId: "corr-gh",
+      pr: { kind: "github", owner: "tibtof", repo: "lgtm-buzzer", number: 42 },
+    };
+    emitDOMEvent(document, DOM_EVENTS.quizRequest, detail);
+
+    const shadow = getShadow(document)!;
+    const prId = shadow.querySelector("[data-testid='lgtm-buzzer-modal-pr-id']");
+    expect(prId).not.toBeNull();
+    expect(prId!.textContent).toBe("tibtof/lgtm-buzzer #42");
+
+    // Must appear before the <h2>
+    const panel = shadow.querySelector(".panel")!;
+    const children = Array.from(panel.children);
+    const prIdIndex = children.findIndex((el) => el.getAttribute("data-testid") === "lgtm-buzzer-modal-pr-id");
+    const h2Index = children.findIndex((el) => el.tagName.toLowerCase() === "h2");
+    expect(prIdIndex).toBeGreaterThanOrEqual(0);
+    expect(h2Index).toBeGreaterThan(prIdIndex);
+  });
+
+  // 42. ADO PR identifier renders correctly in modal header
+  it("42. pr-id: ADO PR shows '{org}/{project}/{repo} !{id}' before h2", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    const detail: QuizRequestEventDetail = {
+      requestId: "req-ado",
+      correlationId: "corr-ado",
+      pr: { kind: "ado", org: "myorg", project: "myproject", repo: "myrepo", pullRequestId: 7 },
+    };
+    emitDOMEvent(document, DOM_EVENTS.quizRequest, detail);
+
+    const shadow = getShadow(document)!;
+    const prId = shadow.querySelector("[data-testid='lgtm-buzzer-modal-pr-id']");
+    expect(prId).not.toBeNull();
+    expect(prId!.textContent).toBe("myorg/myproject/myrepo !7");
+  });
+
+  // 43. Idle state — no pr-id element present (no backdrop at all)
+  it("43. pr-id: idle state has no lgtm-buzzer-modal-pr-id element in the DOM", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    // No quiz-request fired; modal never mounts.
+    const host = document.querySelector("[data-lgtm-modal-host]");
+    expect(host).toBeNull();
+  });
+
+  // 44. PR id persists across generating → ready → submitting → passed
+  it("44. pr-id: persists across generating → ready → submitting → passed", () => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+
+    const detail: QuizRequestEventDetail = {
+      requestId: "req-chain",
+      correlationId: "corr-chain",
+      pr: { kind: "github", owner: "tibtof", repo: "lgtm-buzzer", number: 42 },
+    };
+    emitDOMEvent(document, DOM_EVENTS.quizRequest, detail);
+
+    // generating state
+    let shadow = getShadow(document)!;
+    expect(shadow.querySelector("[data-testid='lgtm-buzzer-modal-pr-id']")?.textContent).toBe(
+      "tibtof/lgtm-buzzer #42",
+    );
+
+    // → ready
+    fireQuizReady(document, "req-chain");
+    shadow = getShadow(document)!;
+    expect(shadow.querySelector("[data-testid='lgtm-buzzer-modal-pr-id']")?.textContent).toBe(
+      "tibtof/lgtm-buzzer #42",
+    );
+
+    // → submitting (click submit after answering)
+    advanceToLastQuestion(shadow, 2);
+    selectFirstChoice(shadow, 1);
+    shadow.querySelector<HTMLButtonElement>("[data-testid='lgtm-buzzer-quiz-submit']")!.click();
+    shadow = getShadow(document)!;
+    expect(shadow.querySelector("[data-testid='lgtm-buzzer-modal-pr-id']")?.textContent).toBe(
+      "tibtof/lgtm-buzzer #42",
+    );
+
+    // → passed
+    fireQuizPassed(document, "req-chain");
+    shadow = getShadow(document)!;
+    expect(shadow.querySelector("[data-testid='lgtm-buzzer-modal-pr-id']")?.textContent).toBe(
+      "tibtof/lgtm-buzzer #42",
+    );
   });
 });

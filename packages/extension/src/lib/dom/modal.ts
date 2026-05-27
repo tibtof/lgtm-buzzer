@@ -26,6 +26,7 @@ import {
   type DOMEventLogger,
 } from "./dom-events.js";
 import type { QuizProgressPhase } from "@lgtm-buzzer/protocol";
+import type { PRIdentifier } from "@lgtm-buzzer/core";
 import { classifyError, errorClassToUI } from "./error-classes.js";
 import { createFocusTrap } from "./focus-trap.js";
 import type { FocusTrap } from "./focus-trap.js";
@@ -62,32 +63,37 @@ const OPEN_OPTIONS_EVENT = "lgtm-buzzer:open-options";
  */
 type ModalState =
   | { readonly kind: "idle" }
-  | { readonly kind: "generating"; readonly requestId: string }
+  | { readonly kind: "generating"; readonly requestId: string; readonly pr?: PRIdentifier }
   | {
       readonly kind: "ready";
       readonly requestId: string;
       readonly quiz: QuizDTO;
+      readonly pr?: PRIdentifier;
     }
   | {
       readonly kind: "submitting";
       readonly requestId: string;
       readonly quiz: QuizDTO;
+      readonly pr?: PRIdentifier;
     }
   | {
       readonly kind: "passed";
       readonly requestId: string;
       readonly result: QuizResultPayload;
+      readonly pr?: PRIdentifier;
     }
   | {
       readonly kind: "failed";
       readonly requestId: string;
       readonly result: QuizResultPayload;
+      readonly pr?: PRIdentifier;
     }
   | {
       readonly kind: "error";
       readonly requestId: string;
       readonly reason: string;
       readonly message: string;
+      readonly pr?: PRIdentifier;
     };
 
 // ---------------------------------------------------------------------------
@@ -140,6 +146,14 @@ const MODAL_CSS = `
     clip-path: inset(50%);
     overflow: hidden;
     white-space: nowrap;
+  }
+  .pr-id {
+    font-size: 12px;
+    color: #57606a;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin: 0 0 6px 0;
+    line-height: 1.4;
+    user-select: text;
   }
   h2 {
     margin: 0 0 8px 0;
@@ -462,6 +476,23 @@ const textEl = <K extends keyof HTMLElementTagNameMap>(
   const elem = el(doc, tag, attrs);
   elem.textContent = text;
   return elem;
+};
+
+// ---------------------------------------------------------------------------
+// PR identifier formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Formats a `PRIdentifier` as a short human-readable coordinate string.
+ *
+ * - GitHub: `{owner}/{repo} #{number}`
+ * - ADO:    `{org}/{project}/{repo} !{pullRequestId}`
+ */
+const formatPRIdentifier = (pr: PRIdentifier): string => {
+  switch (pr.kind) {
+    case "github": return `${pr.owner}/${pr.repo} #${pr.number}`;
+    case "ado":    return `${pr.org}/${pr.project}/${pr.repo} !${pr.pullRequestId}`;
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -1278,6 +1309,14 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
       }
     }
 
+    if (state.pr !== undefined) {
+      const prIdEl = textEl(doc, "div", formatPRIdentifier(state.pr), {
+        class: "pr-id",
+        "data-testid": "lgtm-buzzer-modal-pr-id",
+      });
+      panel.appendChild(prIdEl);
+    }
+
     panel.appendChild(heading);
     panel.appendChild(subtitle);
     panel.appendChild(content);
@@ -1435,7 +1474,9 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
     const quiz = activeQuiz;
     if (quiz === null) return;
 
-    transition({ kind: "submitting", requestId, quiz });
+    // Read pr BEFORE calling transition to avoid stale-closure bugs.
+    const pr = state.kind !== "idle" ? state.pr : undefined;
+    transition({ kind: "submitting", requestId, quiz, ...(pr !== undefined ? { pr } : {}) });
 
     emitDOMEvent(doc, DOM_EVENTS.quizSubmit, {
       requestId,
@@ -1469,11 +1510,11 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
   // DOM-event listeners
   // ---------------------------------------------------------------------------
 
-  const onQuizRequest = (detail: { requestId: string }): void => {
+  const onQuizRequest = (detail: { requestId: string; correlationId: string; pr: PRIdentifier }): void => {
     ensureMounted();
     // If we get a new quiz-request while in any non-idle state (e.g., from
     // a retry), transition to generating with the new requestId.
-    transition({ kind: "generating", requestId: detail.requestId });
+    transition({ kind: "generating", requestId: detail.requestId, pr: detail.pr });
   };
 
   /**
@@ -1522,11 +1563,18 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
       | { kind: "error"; reason: string; message: string };
   }): void => {
     const { requestId, outcome } = detail;
+    // Read pr BEFORE calling transition to avoid stale-closure bugs.
+    const pr = state.kind !== "idle" ? state.pr : undefined;
 
     switch (outcome.kind) {
       case "quiz-ready": {
         activeQuiz = outcome.quiz;
-        transition({ kind: "ready", requestId, quiz: outcome.quiz });
+        transition({
+          kind: "ready",
+          requestId,
+          quiz: outcome.quiz,
+          ...(pr !== undefined ? { pr } : {}),
+        });
         break;
       }
 
@@ -1535,6 +1583,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           kind: "passed",
           requestId,
           result: outcome.result,
+          ...(pr !== undefined ? { pr } : {}),
         });
         break;
       }
@@ -1544,6 +1593,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           kind: "failed",
           requestId,
           result: outcome.result,
+          ...(pr !== undefined ? { pr } : {}),
         });
         break;
       }
@@ -1554,6 +1604,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           requestId,
           reason: outcome.reason,
           message: outcome.message,
+          ...(pr !== undefined ? { pr } : {}),
         });
         break;
       }
