@@ -90,7 +90,10 @@ const mapSpawnError = (e: SpawnError): LLMProviderError => {
 export const createClaudeCliProvider = (deps: ClaudeCliDeps): LLMProvider => {
   const binary = deps.config?.binary ?? "claude";
   const model = deps.config?.model ?? "sonnet";
-  const timeoutMs = deps.config?.timeoutMs ?? 60_000;
+  // 180s default. ADR-30 first-quiz generates a 20-question pool which
+  // routinely takes 60-90s. The 60s default predates ADR-30 (M2's 5-question
+  // path). Tests can still override via deps.config.timeoutMs.
+  const timeoutMs = deps.config?.timeoutMs ?? 180_000;
   const graceMs = deps.config?.graceMs ?? 5_000;
   const ids = deps.ids ?? defaultIdGenerator();
 

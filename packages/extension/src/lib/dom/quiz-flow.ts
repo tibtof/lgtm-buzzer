@@ -403,10 +403,13 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
           ? { kind: "github", owner: p.pr.owner, repo: p.pr.repo, number: p.pr.number }
           : { kind: "ado", org: p.pr.org, project: p.pr.project, repo: p.pr.repo, pullRequestId: p.pr.pullRequestId },
         questionCount: 5,
-        // ADR-30: request a pool of 20 questions; host samples 5 from cache on hits.
-        // Old hosts ignore this unknown optional field (zod passthrough). New extension +
-        // old host → host returns a normal single quiz; resample falls back to fresh request.
-        questionPoolSize: 20,
+        // ADR-30: pool size 5 effectively disables the pool — the host
+        // generates 5 questions, the extension samples all 5, and resample
+        // is a no-op (returns the same 5). Trade: instant retry-cache is
+        // gone, but first-quiz time drops from ~60s to ~15s, which matches
+        // pre-ADR-30 behavior. Adjust upward (e.g. 10) when first-quiz
+        // latency is less of a concern than retry variety.
+        questionPoolSize: 5,
       },
     };
 

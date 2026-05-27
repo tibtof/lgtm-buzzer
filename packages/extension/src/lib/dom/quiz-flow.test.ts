@@ -1179,7 +1179,7 @@ describe("createQuizFlowController", () => {
   // ADR-30: questionPoolSize included in initial quiz-request
   // -------------------------------------------------------------------------
 
-  it("ADR-30: initial quiz-request includes questionPoolSize: 20", async () => {
+  it("ADR-30: initial quiz-request includes questionPoolSize: 5 (demo-mode default)", async () => {
     const sentFrames: Frame[] = [];
     const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
       sentFrames.push(frame);
@@ -1203,7 +1203,7 @@ describe("createQuizFlowController", () => {
     expect(quizRequests).toHaveLength(1);
     const req = quizRequests[0]!;
     if (req.kind === "quiz-request") {
-      expect(req.payload.questionPoolSize).toBe(20);
+      expect(req.payload.questionPoolSize).toBe(5);
       expect(req.payload.questionCount).toBe(5);
     }
   });

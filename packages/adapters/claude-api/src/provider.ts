@@ -77,7 +77,8 @@ const isRetryable = (err: LLMProviderError): boolean =>
 export const createClaudeApiProvider = (deps: ClaudeApiDeps): LLMProvider => {
   const { config } = deps;
   const model = config.model ?? "claude-sonnet-4-7";
-  const timeoutMs = config.timeoutMs ?? 60_000;
+  // 180s default to match the ADR-30 20-question pool generation time.
+  const timeoutMs = config.timeoutMs ?? 180_000;
   const maxTokens = config.maxTokens ?? 4096;
   const ids = deps.ids ?? defaultIdGenerator();
 

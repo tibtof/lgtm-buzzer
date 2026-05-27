@@ -13,7 +13,13 @@ export default defineBackground(() => {
     connect: () => browser.runtime.connectNative(NATIVE_HOST_ID),
     map,
     now: () => Date.now(),
-    timeoutMs: 60_000,
+    // 180s budget: ADR-30 first-quiz generates a 20-question pool which
+    // routinely takes 60-90s on real PRs. 60s was tuned for the M2 5-question
+    // path. The host's own LLM-adapter timeout (claude-cli, etc.) caps at
+    // 180s too — they should fail together rather than the SW giving up
+    // mid-generation. Future improvement: stream heartbeat frames from host
+    // (#TBD) so the modal's ETA bar can advance smoothly.
+    timeoutMs: 180_000,
     logger: {
       warn: (msg, ctx) => console.warn(`[lgtm-buzzer:sw] ${msg}`, ctx ?? {}),
     },
