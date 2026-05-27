@@ -2,6 +2,7 @@ import { defineBackground } from "wxt/utils/define-background";
 import { browser } from "wxt/browser";
 import { createCorrelationMap } from "../src/lib/correlation.js";
 import { createPortClient } from "../src/lib/port.js";
+import { createProgressMap } from "../src/lib/progress-map.js";
 import { createCSMessageHandler } from "../src/lib/router.js";
 import { NATIVE_HOST_ID } from "../src/lib/host-id.js";
 import { createOptionsStore } from "../src/lib/options/storage.js";
@@ -9,17 +10,18 @@ import { readSwOptions } from "../src/lib/options/storage-reader.js";
 
 export default defineBackground(() => {
   const map = createCorrelationMap();
+  // ADR-32: progress map routes quiz-progress heartbeat frames from host to CS.
+  const progressMap = createProgressMap();
   const portClient = createPortClient({
     connect: () => browser.runtime.connectNative(NATIVE_HOST_ID),
     map,
     now: () => Date.now(),
     // 180s budget: ADR-30 first-quiz generates a 20-question pool which
-    // routinely takes 60-90s on real PRs. 60s was tuned for the M2 5-question
-    // path. The host's own LLM-adapter timeout (claude-cli, etc.) caps at
-    // 180s too — they should fail together rather than the SW giving up
-    // mid-generation. Future improvement: stream heartbeat frames from host
-    // (#TBD) so the modal's ETA bar can advance smoothly.
+    // routinely takes 60-90s on real PRs. The budget is reset on every
+    // heartbeat tick (ADR-32), so in practice the host can run indefinitely
+    // as long as it keeps emitting progress frames.
     timeoutMs: 180_000,
+    progressMap,
     logger: {
       warn: (msg, ctx) => console.warn(`[lgtm-buzzer:sw] ${msg}`, ctx ?? {}),
     },
@@ -43,6 +45,9 @@ export default defineBackground(() => {
       openOptionsPage: () => {
         void browser.runtime.openOptionsPage();
       },
+      progressMap,
+      sendTabMessage: (tabId, msg) =>
+        browser.tabs.sendMessage(tabId, msg) as Promise<unknown>,
       logger: {
         warn: (msg, ctx) => console.warn(`[lgtm-buzzer:sw] ${msg}`, ctx ?? {}),
       },

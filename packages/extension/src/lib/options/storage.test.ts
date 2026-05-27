@@ -46,7 +46,7 @@ const VALID_OPTIONS: StoredOptions = {
   llmAdapterId: "claude-api",
 };
 
-describe("createOptionsStore — v2 schema", () => {
+describe("createOptionsStore — v3 schema", () => {
   it("read of empty storage returns Left<absent>", async () => {
     const area = makeStorageArea();
     const store = createOptionsStore({ area });
@@ -125,17 +125,19 @@ describe("createOptionsStore — v2 schema", () => {
     expect(area.data[STORAGE_KEY]).toEqual(VALID_OPTIONS);
   });
 
-  it("write only stores llmAdapterId — no vcsAdapterId or credentials", async () => {
+  it("write only stores llmAdapterId and questionPoolSize — no vcsAdapterId or credentials", async () => {
     const area = makeStorageArea();
     const store = createOptionsStore({ area });
     const opts: StoredOptions = {
       schemaVersion: SCHEMA_VERSION,
       llmAdapterId: "claude-cli",
+      questionPoolSize: 10,
     };
     await store.write(opts);
     const stored = area.data[STORAGE_KEY] as Record<string, unknown>;
-    expect(stored["schemaVersion"]).toBe(2);
+    expect(stored["schemaVersion"]).toBe(3);
     expect(stored["llmAdapterId"]).toBe("claude-cli");
+    expect(stored["questionPoolSize"]).toBe(10);
     expect(stored["vcsAdapterId"]).toBeUndefined();
     expect(stored["credentials"]).toBeUndefined();
   });

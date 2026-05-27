@@ -11373,3 +11373,815 @@ the wire ErrorFrame path. No `throw` introduced.
   call site of `buildKey` in `dispatcher.ts`.
 
 ---
+
+## ADR-32 (2026-05-27): Host-streamed quiz-progress heartbeat + configurable question pool size
+**Date**: 2026-05-27
+**Issue**: #125 (supersedes scope of #124)
+**Status**: Accepted
+
+### Context
+
+Two closely-coupled extension UX issues, bundled because they touch the
+same files and ship as one PR:
+
+**Part A — Heartbeat (#124).** After ADR-30, the first quiz on a cache
+miss generates a 20-question pool. That LLM call takes 60–90 s on real
+PRs. During that window:
+
+- The SW receives no traffic (one `quiz-request` out, one
+  `quiz-response` in, much later).
+- The modal shows a static spinner + a live elapsed timer + an ETA
+  `<progress>` bar that caps at `0.95 * cachedMedianMs` and then
+  stalls.
+- The user has no feedback that the host fiber is still alive; the
+  perception is "the host hung."
+- ADR-30 raised the SW `timeoutMs` to 180 s precisely because of this,
+  but raising a timeout does not improve the wait — it just delays the
+  error. The right primitive is a heartbeat.
+
+ADR-13's wire format is fully request/response today. There is no
+host-initiated frame on the protocol. The dispatcher's per-request fiber
+already logs at info on every phase boundary (`Cache miss — generating`,
+`Quiz generated`, etc.) — those log lines are the natural emission
+points.
+
+ADR-17's port client routes every host frame through the
+`CorrelationMap`: lookup by `correlationId`, resolve the pending
+`Promise`, delete the entry. The map assumes exactly one reply per
+correlation id. A heartbeat frame is the first wire frame that violates
+this assumption — it carries the in-flight `correlationId` but is NOT
+the final reply.
+
+**Part B — Configurable question pool size (post-demo cleanup).** PR
+#123 hardcoded `questionPoolSize: 5` in `quiz-flow.ts` as a demo hack
+to drop first-quiz latency from ~60 s to ~15 s. With Part A landing,
+that trade-off is no longer forced — higher pool sizes become
+tolerable because the modal shows real progress. The hardcoded `5`
+must move into stored options before users discover the regression
+("retry just gives me the same five questions").
+
+ADR-23 §Storage schema already established the pattern: bump
+`STORAGE_KEY` + `SCHEMA_VERSION`, optional fields preserve forward
+compat. ADR-29 already bumped to v2 and stripped credentials. v3
+extends v2 with one optional `questionPoolSize` field. The SW
+projection (`SwOptionsProjection`) gains the field; the router merges
+it into outbound `quiz-request` payloads the same way it already
+merges `llmAdapterId`.
+
+Forces:
+
+- **Backward compat on the wire.** Envelope `v: 1` stays. New
+  `quiz-progress` frame is additive in `FrameSchema`. Old SW + new
+  host: SW must not crash on unknown reply-shaped frames. New SW +
+  old host: host never emits the frame, modal falls back to ADR-30's
+  spinner + static elapsed timer.
+- **Quiz-integrity invariant.** Per CLAUDE.md §Key differentiator,
+  no non-diff PR text reaches the LLM prompt. Progress frames are
+  metadata (phase label, elapsed ms) — they MUST NOT carry diff
+  bytes, PR title, partial quiz content, or any field the host
+  could be tempted to fill with prompt input. The schema enforces
+  this by listing the exact allowed fields.
+- **No new runtime deps anywhere.** Heartbeat timer in host uses
+  `setInterval`; no `Schedule` (this is fire-and-forget logging,
+  not a retried IO). zod schema in `protocol` is the only new code
+  with a dep, and `zod` is already the protocol's sole runtime dep.
+- **Diff-only invariant for pool size.** `questionPoolSize` is a
+  scalar number. Cannot smuggle PR text. No additional review gate.
+- **Dispatcher fiber stays sequential.** The existing `IO.lift`
+  chain in `handleQuizRequest` is sequential. The heartbeat timer
+  runs in parallel via plain `setInterval` started before
+  `llm.generateQuiz` and cleared after. This is an explicit
+  exception to "no raw Promise outside `IO.of`" because the
+  heartbeat is a side-effecting log, not an effect we care to
+  compose into the request fiber. The reviewer accepts this on the
+  grounds that (a) the interval lifetime is fully bracketed by the
+  IO boundary, (b) clearing the interval on the IO's success path
+  is enforced by `try/finally` semantics inside `IO.lift`'s async
+  block, and (c) the heartbeat never throws — `safeWrite` absorbs
+  write failures.
+
+### Decision
+
+Add a one-way `quiz-progress` wire frame, route it through a new
+`progressMap` parallel to the existing `CorrelationMap`, bridge it
+through the SW → CS → modal via a new DOM event, and have the modal
+swap its static spinner for a phase-aware indicator that resets the
+SW timeout on every heartbeat. Separately, expose `questionPoolSize`
+in the options page with a 3-value dropdown, bump storage to v3, and
+have the SW merge the stored value into outbound `quiz-request`
+payloads (replacing the hardcoded `5` in `quiz-flow.ts`).
+
+#### Affected workspaces
+
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+```
+
+- `protocol`: new `quiz-progress` frame schema, added to `FrameSchema`.
+  Zero runtime impact on existing frames.
+- `core`: no changes. Progress is wire-only metadata; no domain type.
+- `adapters/*`: no changes. The host dispatcher owns phase emission;
+  adapters keep their existing `IO<E, A>` shapes.
+- `host`: new helper `createProgressEmitter` plus emission calls
+  inside `handleQuizRequest`. No new deps.
+- `extension`: new `ProgressMap` (parallel to `CorrelationMap`),
+  router wiring for `quiz-progress`, CS bridge, new
+  `lgtm-buzzer:quiz-progress` DOM event, modal phase indicator,
+  storage schema v3, options-page dropdown.
+
+Dependency direction holds: `extension` and `host` both import from
+`protocol` only. Nothing in `core` or `protocol` learns about heartbeats
+beyond the schema itself.
+
+#### Types
+
+**New (`packages/protocol/src/messages/quiz-progress.ts`):**
+
+```ts
+// One-way host → SW frame. NO REPLY EXPECTED.
+export const QuizProgressPhaseSchema = z.enum([
+  "fetching-diff",
+  "generating-quiz",
+  "parsing",
+  "caching",
+]);
+
+export type QuizProgressPhase = z.infer<typeof QuizProgressPhaseSchema>;
+
+export const QuizProgressPayloadSchema = z.object({
+  phase: QuizProgressPhaseSchema,
+  /** Milliseconds since the host started handling the originating quiz-request. */
+  elapsedMs: z.number().int().min(0),
+  /** Optional host-side ETA hint. v1: always undefined (modal uses its own historical median). */
+  expectedMs: z.number().int().min(0).optional(),
+});
+
+export type QuizProgressPayload = z.infer<typeof QuizProgressPayloadSchema>;
+
+export const QuizProgressFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("quiz-progress"),
+  payload: QuizProgressPayloadSchema,
+});
+
+export type QuizProgressFrame = z.infer<typeof QuizProgressFrameSchema>;
+```
+
+Added to `FrameSchema` discriminated union in
+`packages/protocol/src/envelope.ts`. `PROTOCOL_VERSION` stays `1`
+(purely additive).
+
+**BINDING (diff-only invariant):** `QuizProgressPayloadSchema` lists
+the exact allowed fields. No `partial`, no `questionsGenerated`, no
+`diffPreview`, no `prTitle`. Reviewer asserts via a schema test that
+attempts to parse a payload with extra fields and confirms zod strips
+them (or rejects, depending on the chosen passthrough setting — we
+use the default `strip`).
+
+**New (`packages/host/src/progress-emitter.ts`):**
+
+```ts
+export type ProgressEmitterDeps = {
+  readonly write: FrameWriter;
+  readonly logger: Logger;
+  readonly now: () => number;
+  /** Tick interval for the heartbeat (default 5000 ms). */
+  readonly intervalMs?: number;
+};
+
+export type ProgressEmitter = {
+  /** Emit a single phase-boundary frame immediately. */
+  readonly emit: (correlationId: string | null, phase: QuizProgressPhase) => Promise<void>;
+  /**
+   * Start a recurring heartbeat for the current phase. Returns a stop
+   * function. The heartbeat emits a frame at construction and then every
+   * `intervalMs`. The stop function is idempotent and MUST be called from
+   * the dispatcher's `try/finally`.
+   */
+  readonly startHeartbeat: (
+    correlationId: string | null,
+    phase: QuizProgressPhase,
+  ) => () => void;
+};
+
+export const createProgressEmitter = (deps: ProgressEmitterDeps): ProgressEmitter;
+```
+
+Writes via the existing `FrameWriter`. Absorbs `WriteError` to a logger
+warning — a failed heartbeat must NEVER fail the request fiber.
+
+**New (`packages/extension/src/lib/progress-map.ts`):**
+
+```ts
+export type ProgressSubscriber = (frame: QuizProgressFrame) => void;
+
+export type ProgressMap = {
+  readonly subscribe: (correlationId: string, subscriber: ProgressSubscriber) => void;
+  readonly unsubscribe: (correlationId: string) => void;
+  readonly dispatch: (frame: QuizProgressFrame) => boolean; // true if a subscriber received it
+};
+
+export const createProgressMap = (): ProgressMap;
+```
+
+Parallel to `CorrelationMap`. Separate map so adding a heartbeat
+subscriber does NOT touch the pending-reply semantics. A
+`quiz-progress` frame neither resolves nor extends the
+`PendingRequest`'s `Promise` — the `resolve` callback fires only on
+the terminal `quiz-response` / `error` frame.
+
+The router subscribes when sending the `quiz-request` frame and
+unsubscribes on terminal reply. Subscriber is called synchronously
+from `port.ts`'s `onMessage` listener after `FrameSchema.safeParse`
+succeeds — same place the correlation map is consulted today.
+
+**Modified (`packages/extension/src/lib/options/schema.ts`):**
+
+```ts
+export const STORAGE_KEY = "lgtm_buzzer.options.v3" as const;
+export const SCHEMA_VERSION = 3 as const;
+
+export const StoredOptionsSchema = z.object({
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  llmAdapterId: z.string().min(1).optional(),
+  /** Question pool size — see ADR-30 + ADR-32. One of {5, 10, 20}. */
+  questionPoolSize: z.union([z.literal(5), z.literal(10), z.literal(20)]).optional(),
+});
+```
+
+A `z.literal(5) | z.literal(10) | z.literal(20)` (rather than
+`z.number().int().min(5).max(20)`) prevents users from hand-editing
+storage to weird values. Absent value falls back to default `5`.
+
+**v2 → v3 migration:** Stored v2 keys read by v3 code return
+`Left<absent>` because the storage key changed (same posture as ADR-23's
+v1 → v2 jump). DOM layer treats it as defaults and writes a fresh v3
+envelope on Save. The dead v2 entry is left to age out — no destructive
+migration. Documented in the schema TSDoc.
+
+**Modified (`packages/extension/src/lib/options/storage-reader.ts`):**
+
+```ts
+export type SwOptionsProjection = {
+  readonly llmAdapterId: string | undefined;
+  readonly questionPoolSize: 5 | 10 | 20 | undefined;
+};
+```
+
+#### Functions and methods
+
+**`protocol`:** standard zod schema exports (see types section).
+
+**`host` — `progress-emitter.ts`:**
+
+```ts
+export const createProgressEmitter = (deps: ProgressEmitterDeps): ProgressEmitter => {
+  // emit: build a QuizProgressFrame; await write(frame).unsafeRun();
+  //        on Err, logger.warn — never propagate.
+  // startHeartbeat: take a startedAt = now(); emit immediately with
+  //   elapsedMs: 0; setInterval(() => emit(... { elapsedMs: now() - startedAt }), intervalMs);
+  //   return () => clearInterval(handle).
+};
+```
+
+**`host` — `dispatcher.ts` (modifications):**
+
+`handleQuizRequest` gains a `progress: ProgressEmitter` field in
+`DispatcherDeps`. The pool path (cache-miss branch) is the only place
+heartbeats start. Sequence:
+
+1. `progress.emit(correlationId, "fetching-diff")` immediately after
+   the fiber forks.
+2. `vcs.fetchDiff(pr)` runs.
+3. `progress.emit(correlationId, "generating-quiz")` just before
+   `llm.generateQuiz`.
+4. `const stopHeartbeat = progress.startHeartbeat(correlationId, "generating-quiz")`
+   inside the `IO.lift` for the pool path, immediately before the
+   `await llm.generateQuiz(...).unsafeRun()` call.
+5. `try { ... } finally { stopHeartbeat() }` — guarantees the
+   interval is cleared on success, error, AND cancellation.
+6. `progress.emit(correlationId, "parsing")` after the LLM returns
+   and before `quizToPool`.
+7. `progress.emit(correlationId, "caching")` after `cache.put`,
+   before `cache.putSampleMapping`.
+
+On the legacy path (no `questionPoolSize`), heartbeat is still
+emitted around `llm.generateQuiz` — the legacy call is still
+long. Phase boundaries `fetching-diff` and `generating-quiz` are
+emitted; `parsing` and `caching` are not.
+
+`createDispatcher` accepts the emitter in `DispatcherDeps`.
+
+**`extension` — `progress-map.ts`:** see types section.
+
+**`extension` — `port.ts` (modifications):**
+
+```ts
+export type PortClientDeps = {
+  // ...existing
+  readonly progressMap?: ProgressMap; // optional for backward-compat in tests
+};
+```
+
+`onMessage` listener gets a new branch:
+
+```ts
+if (reply.kind === "quiz-progress") {
+  const ok = progressMap?.dispatch(reply) ?? false;
+  if (!ok) {
+    logger?.warn("[lgtm-buzzer:sw] quiz-progress with no subscriber — dropped", {
+      correlationId: reply.correlationId,
+    });
+  }
+  // Reset the pending request's timeout to give the host more headroom
+  // for this in-flight quiz. See "Timeout extension on heartbeat" below.
+  if (reply.correlationId !== null) {
+    const pending = map.peekById(reply.correlationId); // new read-only accessor
+    if (pending !== undefined) {
+      clearTimeout(pending.timer);
+      pending.timer = setTimeout(...);  // re-arm to deps.timeoutMs from now
+    }
+  }
+  return; // do NOT call resolve, do NOT delete the pending entry
+}
+```
+
+**`CorrelationMap` gains a read-only accessor** to support timeout
+extension without taking the entry:
+
+```ts
+readonly peekById: (correlationId: string) => PendingRequest | undefined;
+```
+
+`PendingRequest.timer` becomes mutable (`let` semantics inside the
+map) — the existing field is `readonly` today; this ADR relaxes it.
+Reviewer accepts because the timer handle is the only field that
+legitimately mutates after `add`.
+
+**`extension` — `router.ts` (modifications):** when sending a
+`quiz-request`, the router calls
+`progressMap.subscribe(correlationId, forwardToTab)` where
+`forwardToTab` calls
+`chrome.tabs.sendMessage(tabId, { kind: "quiz-progress", payload: frame.payload })`.
+On terminal reply (the existing `sendResponse({ kind: "frame", frame: reply })`
+call), the router calls `progressMap.unsubscribe(correlationId)`.
+
+**`extension` — `entrypoints/content.ts` (modifications):** a new
+`browser.runtime.onMessage` branch handles
+`{ kind: "quiz-progress", payload: QuizProgressPayload }`. Validates
+payload via `QuizProgressPayloadSchema`. On success, dispatches a
+`lgtm-buzzer:quiz-progress` DOM event with detail
+`{ requestId: <current pending requestId>, phase, elapsedMs }`. The
+controller needs to know the requestId — the CS bridge holds a
+`Map<correlationId, requestId>` populated when the CS sends each
+`quiz-request` (the correlationId is already passed in the
+`QuizRequestEventDetail`).
+
+Wait — actually the CS does NOT today track correlation → request.
+The bridge needs that map. Alternative: pass `correlationId` straight
+through to the DOM event, and let `quiz-flow.ts` resolve back to the
+pending PendingApprove. The flow already has `pending` keyed by
+`requestId`; the cleaner shape is for the CS bridge to look up the
+in-flight quiz by correlationId.
+
+Decision: store a `correlationId → requestId` map inside
+`quiz-flow.ts`'s factory closure (populated in `sendQuizRequest` and
+`sendQuizResampleRequest`, drained on terminal reply / cancel).
+`onProgress` handler resolves correlationId to requestId before
+emitting the DOM event. This keeps the CS bridge unaware of
+quiz-flow internals and keeps correlationId out of the modal's API.
+
+**`extension` — `dom/dom-events.ts` (additions):**
+
+```ts
+export const DOM_EVENTS = {
+  // ...existing
+  quizProgress: "lgtm-buzzer:quiz-progress",
+};
+
+export const QuizProgressEventDetailSchema = z.object({
+  requestId: z.string().min(1),
+  phase: QuizProgressPhaseSchema, // imported from protocol
+  elapsedMs: z.number().int().min(0),
+});
+
+export type QuizProgressEventDetail = z.infer<typeof QuizProgressEventDetailSchema>;
+```
+
+**`extension` — `dom/quiz-flow.ts` (modifications):**
+
+- `Map<string, string>` `correlationToRequest` added to factory
+  closure. Populated in `sendQuizRequest` /
+  `sendQuizResampleRequest`; deleted in `handleQuizRequestReply`,
+  `handleQuizSubmitReply`, `onQuizCancel`, `onWillNavigate`.
+- New handler `onProgressFromSw(payload, correlationId)` resolves
+  to `requestId` and emits the DOM event with
+  `QuizProgressEventDetailSchema`-shaped detail.
+- The CS bridge in `content.ts` calls this handler via a
+  callback exposed on `QuizFlowController` (new method
+  `onProgressFrame(frame: QuizProgressFrame): void`).
+
+`QuizFlowController` gains:
+
+```ts
+readonly onProgressFrame: (frame: QuizProgressFrame) => void;
+```
+
+Hardcoded `questionPoolSize: 5` in `sendQuizRequest` and
+`sendQuizResampleRequest` is REMOVED. The router merges the stored
+value before sending; quiz-flow no longer sets the field.
+
+**`extension` — `dom/modal.ts` (modifications):**
+
+- New listener for `lgtm-buzzer:quiz-progress`.
+- In `generating` state: when a progress event arrives:
+  - Cancel the cached-median ETA-bar logic (set
+    `cachedMedianMs = null` for the current generation; CSS-only
+    indeterminate progress takes over via a new class on the
+    `<progress>` element).
+  - Update the loading-label text to phase copy:
+    - `fetching-diff` → "Fetching diff…"
+    - `generating-quiz` → "Generating quiz…"
+    - `parsing` → "Parsing response…"
+    - `caching` → "Almost ready…"
+  - Reset a `lastHeartbeatMs` timestamp.
+- Tick function (existing 250 ms `setInterval`) gains: when
+  `lastHeartbeatMs !== null && now() - lastHeartbeatMs > 10_000`,
+  revert to the static spinner copy "Preparing your quiz…" (host
+  may have stalled; do not lie to the user about progress).
+- On result frame (`quiz-ready` / `error`), `lastHeartbeatMs` is
+  cleared.
+
+**`extension` — `options/dom.ts` (modifications):**
+
+- New `<select id="lgtm-pool-size">` under a new "Quiz behavior" `<h2>`.
+- Options:
+  - `<option value="5">5 — Fastest first quiz, no retry cache</option>`
+  - `<option value="10" selected>10 — Balanced (recommended)</option>`
+  - `<option value="20">20 — Most retry variety, slower first quiz</option>`
+- Wait — the user specified default 5. Use:
+  - `<option value="5" selected>5 — Fastest first quiz, no retry cache</option>`
+  - `<option value="10">10 — Balanced (recommended)</option>`
+  - `<option value="20">20 — Most retry variety, slower first quiz</option>`
+- Hydrated from `StoredOptions.questionPoolSize ?? 5`.
+- Saved in the existing `saveBtn` handler alongside `llmAdapterId`.
+
+#### File layout
+
+**New:**
+
+- `packages/protocol/src/messages/quiz-progress.ts`
+- `packages/protocol/src/messages/quiz-progress.test.ts`
+- `packages/host/src/progress-emitter.ts`
+- `packages/host/src/progress-emitter.test.ts`
+- `packages/extension/src/lib/progress-map.ts`
+- `packages/extension/src/lib/progress-map.test.ts`
+
+**Modified:**
+
+- `packages/protocol/src/envelope.ts` — add
+  `QuizProgressFrameSchema` to `FrameSchema`.
+- `packages/protocol/src/envelope.test.ts` — round-trip test for
+  `quiz-progress`.
+- `packages/host/src/dispatcher.ts` — call sites for `progress.emit`
+  and `progress.startHeartbeat`; new `progress` field on
+  `DispatcherDeps`.
+- `packages/host/src/dispatcher.test.ts` — assert progress
+  emission at phase boundaries; heartbeat during LLM call.
+- `packages/host/src/cli.ts` — construct `createProgressEmitter`,
+  pass into `createDispatcher`.
+- `packages/extension/src/lib/correlation.ts` — add `peekById`;
+  relax `PendingRequest.timer` to mutable.
+- `packages/extension/src/lib/correlation.test.ts` — cover `peekById`.
+- `packages/extension/src/lib/port.ts` — handle `quiz-progress`
+  branch; reset timer; accept optional `progressMap` in deps.
+- `packages/extension/src/lib/port.test.ts` — assert
+  `quiz-progress` does not resolve pending; subscriber called;
+  timer re-armed; unknown subscriber logs warn.
+- `packages/extension/src/lib/router.ts` — subscribe/unsubscribe
+  to `progressMap`; forward via `chrome.tabs.sendMessage`.
+- `packages/extension/src/lib/router.test.ts` — assert
+  subscribe-on-send, unsubscribe-on-reply, tab forwarding.
+- `packages/extension/entrypoints/background.ts` — construct
+  `createProgressMap()`, wire into both `createPortClient` and
+  `createCSMessageHandler`.
+- `packages/extension/entrypoints/content.ts` — `onMessage`
+  branch for `kind: "quiz-progress"`; call
+  `controller.onProgressFrame(frame)`.
+- `packages/extension/src/lib/dom/dom-events.ts` — add
+  `quizProgress` event + schema.
+- `packages/extension/src/lib/dom/dom-events.test.ts` — schema
+  parse coverage.
+- `packages/extension/src/lib/dom/quiz-flow.ts` — `correlationToRequest`
+  map; `onProgressFrame` controller method; remove hardcoded
+  `questionPoolSize: 5`.
+- `packages/extension/src/lib/dom/quiz-flow.test.ts` — assert
+  progress event emission; assert no `questionPoolSize` in
+  outbound payload (router owns it now).
+- `packages/extension/src/lib/dom/modal.ts` — phase indicator,
+  heartbeat-driven ETA fallback, 10 s silence revert.
+- `packages/extension/src/lib/dom/modal.test.ts` — phase text,
+  10 s silence revert, indeterminate progress on first
+  heartbeat.
+- `packages/extension/src/lib/options/schema.ts` — bump to v3,
+  add `questionPoolSize`.
+- `packages/extension/src/lib/options/schema.test.ts` — assert
+  v3 parse; assert v2 read returns `absent`.
+- `packages/extension/src/lib/options/storage-reader.ts` — extend
+  `SwOptionsProjection` with `questionPoolSize`.
+- `packages/extension/src/lib/options/storage-reader.test.ts` —
+  cover the new field.
+- `packages/extension/src/lib/options/dom.ts` — new dropdown +
+  save/hydrate logic.
+- `packages/extension/src/lib/options/dom.test.ts` — cover
+  hydrate + change + save.
+- `packages/extension/src/lib/router.ts` — merge stored
+  `questionPoolSize` into `quiz-request` payload (alongside
+  existing `llmAdapterId` merge).
+
+#### Sequence
+
+**Heartbeat flow (cache-miss quiz-request, 20-question pool):**
+
+1. CS dispatches `quiz-request` DOM event → controller stores
+   `correlationToRequest[correlationId] = requestId`, calls
+   `sendFrame(frame)` via `browser.runtime.sendMessage`.
+2. SW router receives `send-frame`. Before calling `portClient.sendFrame`,
+   it calls
+   `progressMap.subscribe(correlationId, (frame) => chrome.tabs.sendMessage(tabId, { kind: "quiz-progress", payload: frame.payload, correlationId }))`.
+3. SW forwards merged `quiz-request` frame to host. Host fiber
+   begins.
+4. Host dispatcher fiber: emits `quiz-progress { phase: "fetching-diff", elapsedMs: 0 }`.
+5. SW `onMessage` sees `quiz-progress`. `progressMap.dispatch(frame)`
+   calls the subscriber, which calls
+   `chrome.tabs.sendMessage(tabId, { kind: "quiz-progress", ... })`.
+   `port.ts` also calls `map.peekById(correlationId)` and re-arms
+   the timer to `now + 180_000`.
+6. CS `onMessage` handler routes `quiz-progress` to
+   `controller.onProgressFrame(frame)`. Controller looks up
+   `correlationToRequest`, dispatches
+   `lgtm-buzzer:quiz-progress` DOM event with
+   `{ requestId, phase, elapsedMs }`.
+7. Modal listener sees the event. If `state.kind === "generating"`:
+   updates label to "Fetching diff…", sets `lastHeartbeatMs = now()`,
+   clears `cachedMedianMs` (switching the progress bar to
+   indeterminate via CSS).
+8. Host calls `vcs.fetchDiff`. ~1 s later, diff returns.
+9. Host emits `quiz-progress { phase: "generating-quiz", elapsedMs: ~1000 }`.
+   Modal label becomes "Generating quiz…".
+10. Host starts heartbeat. Every 5 s during the LLM call:
+    `quiz-progress { phase: "generating-quiz", elapsedMs: 6000, 11000, ... }`.
+    Each tick resets the SW timer.
+11. LLM returns (~60 s). Host stops heartbeat (via `try/finally`).
+12. Host emits `quiz-progress { phase: "parsing", elapsedMs: ~60_000 }`.
+13. Host emits `quiz-progress { phase: "caching", elapsedMs: ~60_200 }`.
+14. Host writes `quiz-response` frame.
+15. SW `onMessage` sees `quiz-response` — normal path: pending
+    `resolve(frame)`, `progressMap.unsubscribe(correlationId)`.
+    Router calls `sendResponse({ kind: "frame", frame })`.
+16. CS resolves `sendFrame` promise. Quiz flow proceeds with
+    `quiz-ready` outcome. Modal transitions `generating → ready`.
+
+**Pool-size flow:**
+
+1. User opens options page, picks "20 — Most retry variety…".
+2. Save → `store.write({ schemaVersion: 3, llmAdapterId: "claude-cli", questionPoolSize: 20 })`.
+3. User goes back to a PR, clicks Approve. CS sends
+   `quiz-request { questionCount: 5 }` (no `questionPoolSize`).
+4. SW router reads stored options. Projection returns
+   `{ llmAdapterId: "claude-cli", questionPoolSize: 20 }`. Merges
+   both into the outbound payload.
+5. Host receives `quiz-request { questionCount: 5, questionPoolSize: 20, ... }`.
+   Generates a 20-question pool, samples 5, replies.
+6. Subsequent "Try Again" → `quiz-resample-request` samples from
+   the cached 20-question pool. User sees variety.
+
+#### Error cases
+
+**Heartbeat:**
+
+- **Host write fails mid-heartbeat.** `progress-emitter.emit`'s
+  `safeWrite` logs a warning, swallows the `WriteError`. The fiber
+  keeps running. The next heartbeat tick may succeed (transient
+  stdout pressure) or fail (broken pipe). Either way, the fiber's
+  terminal frame write is what determines request success.
+- **Heartbeat timer leaks on dispatcher panic.** Guarded by
+  `try/finally` around the heartbeat span. Reviewer asserts via a
+  test that throws inside the `IO.lift` body and verifies
+  `clearInterval` was called.
+- **Heartbeat arrives after terminal reply.** Race: a heartbeat is
+  in `setInterval`'s queue when the LLM resolves and the dispatcher
+  writes `quiz-response`. The SW removes the entry from
+  `CorrelationMap` on the response, but `ProgressMap` still holds
+  a subscriber. Router unsubscribes on the response in the same
+  tick — late heartbeats find no subscriber, `dispatch` returns
+  `false`, `port.ts` logs warn. Benign.
+- **Heartbeat with unknown `correlationId`.** `progressMap.dispatch`
+  returns `false`, `port.ts` logs warn. Treated identically to
+  unknown-correlation replies today.
+- **Old host + new SW.** Host emits nothing; SW never sees
+  heartbeats; modal falls back to static spinner + cached-median
+  ETA — equivalent to today's behavior. No regression.
+- **New host + old SW.** Old SW (`port.ts` without the
+  `quiz-progress` branch) has updated `FrameSchema` (the schema is
+  monorepo-shared), so the frame parses, but the SW falls through
+  to "unknown correlationId" or "this isn't a kind I handle" and
+  drops with a warn. The SW's 180 s timeout still fires for the
+  request, so the host's terminal reply will be processed
+  normally — heartbeats are wasted but harmless. To avoid the warn
+  spam, the v3 SW explicitly recognises `quiz-progress` even when
+  `progressMap` is undefined (drop silently).
+- **CS tab closed mid-quiz.** `chrome.tabs.sendMessage` rejects.
+  Wrap in try/catch; log warn; the heartbeat sub stays registered
+  (the SW does not know the tab is gone). Cleaned up on terminal
+  reply or SW timeout.
+
+**Storage:**
+
+- **Stored `questionPoolSize` is not 5/10/20.** Zod literal union
+  rejects → schema parse fails → `Left<corrupt>` → DOM layer shows
+  banner and treats as defaults. SW projection returns `undefined`.
+  Host treats absent field as legacy (no pool).
+- **v2 storage still present.** v3 read against v2 key returns
+  `Left<absent>` (different `STORAGE_KEY`). DOM treats as
+  first-run defaults. v2 leftover is benign storage clutter.
+
+**No new error reasons.** `ErrorReason` enum unchanged. Heartbeat
+failures stay below the wire as logger warnings.
+
+#### Test strategy
+
+**Unit / contract (Vitest):**
+
+- `protocol/src/messages/quiz-progress.test.ts`:
+  - Round-trip parse for each phase value.
+  - Reject negative `elapsedMs`.
+  - Reject unknown phases.
+  - Confirm extra fields are stripped (or rejected) — assert the
+    diff-only invariant.
+- `protocol/src/envelope.test.ts`:
+  - `FrameSchema` parses a valid `quiz-progress` frame.
+  - `quiz-progress` is part of the discriminated union (TS-level).
+- `host/src/progress-emitter.test.ts`:
+  - `emit` writes a single well-formed frame via injected `write` fake.
+  - `startHeartbeat` writes immediately + on each fake timer tick.
+  - Stop function clears the interval (no further writes after stop).
+  - Write failure does NOT throw; warning logged.
+- `host/src/dispatcher.test.ts` (modifications):
+  - Pool path emits all four phase frames in order.
+  - Heartbeat ticks emitted during `llm.generateQuiz` (use a
+    delayed fake LLM and a controllable clock).
+  - Cancellation path clears the heartbeat (assert via the spy on
+    `clearInterval` or by counting `write` calls after cancel).
+  - `try/finally` guarantee: an LLM error stops the heartbeat
+    before the error frame is written.
+- `extension/src/lib/progress-map.test.ts`:
+  - `subscribe` + `dispatch` invokes the subscriber.
+  - `unsubscribe` drops the subscriber; subsequent `dispatch`
+    returns `false`.
+  - Duplicate subscribe replaces the prior subscriber (or throws —
+    pick one; the host invariant test will dictate which).
+- `extension/src/lib/correlation.test.ts`:
+  - `peekById` returns the entry without removing it.
+- `extension/src/lib/port.test.ts`:
+  - `quiz-progress` calls subscriber, does NOT resolve pending.
+  - `quiz-progress` re-arms the pending request's timer.
+  - `quiz-progress` with unknown subscriber logs warn (silent
+    drop, no error).
+- `extension/src/lib/router.test.ts`:
+  - On `send-frame quiz-request`, router calls
+    `progressMap.subscribe(correlationId, …)` BEFORE
+    `portClient.sendFrame`.
+  - On reply, router calls `progressMap.unsubscribe(correlationId)`.
+  - On send error, router still unsubscribes (no leaks).
+  - Router merges stored `questionPoolSize` into the outbound
+    payload; legacy storage without the field omits it.
+- `extension/src/lib/dom/quiz-flow.test.ts`:
+  - `onProgressFrame` dispatches a `lgtm-buzzer:quiz-progress` DOM
+    event with the right `requestId`.
+  - `correlationToRequest` is cleared on terminal reply, cancel,
+    navigation.
+  - Outbound `quiz-request` frame does NOT carry
+    `questionPoolSize` (router owns it).
+- `extension/src/lib/dom/modal.test.ts`:
+  - On `quiz-progress` in `generating` state, label updates to
+    phase copy.
+  - First heartbeat clears `cachedMedianMs` and switches the
+    progress bar to indeterminate.
+  - After 10 s of no heartbeat, label reverts to static.
+  - Heartbeat in non-generating state is a no-op (ignored).
+- `extension/src/lib/options/schema.test.ts`:
+  - v3 envelope parses with literal 5/10/20.
+  - v3 envelope rejects `questionPoolSize: 7`.
+  - v3 envelope parses without the field (optional).
+- `extension/src/lib/options/storage-reader.test.ts`:
+  - Projection returns `questionPoolSize` when present.
+  - Projection returns `undefined` on absent / corrupt.
+- `extension/src/lib/options/dom.test.ts`:
+  - Dropdown hydrates from stored value.
+  - Default-5 selection when storage absent.
+  - Save writes the selected value.
+
+**Contract (cross-workspace):**
+
+- A new test in `packages/host/src/dispatcher.test.ts` that runs
+  the full quiz-request fiber against a real `FrameWriter` stub
+  and asserts the frame log matches a golden sequence:
+  `[fetching-diff, generating-quiz, ...heartbeats..., parsing,
+  caching, quiz-response]`.
+
+**End-to-end (Playwright):**
+
+- Existing happy-path e2e remains unchanged — it doesn't exercise
+  long-running generation. A follow-up issue (not part of #125)
+  may add a slow-LLM stub scenario to validate the modal's phase
+  indicator end-to-end.
+
+**Manual verification fallback:**
+
+- Real LLM call timing (60–90 s for 20-question pool) cannot be
+  unit-tested. Reviewer runs the build against a real PR and
+  visually confirms the phase indicator advances and the modal
+  does not time out.
+
+### Consequences
+
+**Trade-offs:**
+
+- **Two maps in the SW.** `CorrelationMap` and `ProgressMap` carry
+  parallel entries for the same correlationId during an in-flight
+  quiz. The maps are added/removed in lock-step by the router, so
+  drift is bounded to "subscriber outlives pending" or vice versa —
+  both handled gracefully (warn + drop).
+- **Timer extension on every heartbeat.** A misbehaving host could
+  hold a connection indefinitely by emitting heartbeats forever.
+  Mitigation: SW timeout extension is bounded — each heartbeat
+  resets to the same `timeoutMs` (180 s), and the host's per-LLM
+  timeout (180 s in `spawnIO` for CLI adapters) caps the actual
+  subprocess lifetime. A heartbeat-forever attacker would also
+  hold a CLI process forever, which spawnIO bounds independently.
+- **Storage version bump to v3.** Users with v2 storage see
+  defaults on first load after upgrade and must re-save their
+  `llmAdapterId`. Mitigated by keeping defaults sane (host falls
+  back to claude-cli). Documented in release notes.
+- **Modal's static spinner stays as a fallback.** When no
+  heartbeat arrives for 10 s the modal reverts to the
+  pre-ADR-32 UI. This is intentional — heartbeat is a
+  best-effort signal, not a contract.
+
+**Future implications:**
+
+- A future ADR may add `expectedMs` based on a host-side heuristic
+  (diff size → estimated generation time). The field exists in the
+  schema already; the modal would consume it to draw a determinate
+  bar even without historical samples. Out of scope for v1.
+- A future ADR may add `quiz-cancel` (#96) — when implemented,
+  cancelling a heartbeat-bearing request must also tear down the
+  heartbeat. The `try/finally` guard already handles this on the
+  host side.
+- A future ADR may move the progress map's correlationId →
+  requestId resolution into the SW (so the CS doesn't need its
+  own map). For v1, keeping the resolution in the CS avoids
+  changing the existing CS → SW protocol shape.
+
+**Security considerations:**
+
+- Heartbeat frames carry NO diff-derived content. Schema enforces
+  the surface. Reviewer asserts via the schema test and by
+  grepping the host's `progress.emit` call sites for diff-typed
+  arguments.
+- `questionPoolSize` is a scalar number; not an LLM prompt input.
+  Diff-only invariant preserved.
+- Per-tab CS forwarding: `chrome.tabs.sendMessage` targets the
+  tab that originated the quiz-request (the router already tracks
+  `tabId` via `CorrelationMap.PendingRequest.tabId`). A heartbeat
+  for tab A is never sent to tab B.
+
+**Binding for reviewer:**
+
+- (a) `QuizProgressPayloadSchema` MUST NOT include any field that
+  could carry PR text or diff content. The four-field surface
+  (`phase`, `elapsedMs`, `expectedMs`) is fixed. Reviewer
+  asserts by code inspection of the schema file.
+- (b) `progress-emitter.ts` MUST NOT accept any diff-typed
+  parameter. Reviewer asserts by reading the emitter signature.
+- (c) Heartbeat MUST be cleared on success, error, AND
+  cancellation. Reviewer asserts via the dispatcher test that
+  forces cancellation mid-heartbeat and counts post-cancel write
+  calls (should be zero).
+- (d) `quiz-progress` MUST NOT resolve the pending request's
+  `Promise`. Reviewer asserts via `port.test.ts`.
+- (e) `quiz-progress` MUST re-arm the pending request's timer.
+  Reviewer asserts via `port.test.ts`.
+- (f) `questionPoolSize` in storage MUST be the literal union
+  `5 | 10 | 20`. Reviewer asserts via `schema.test.ts`.
+- (g) `quiz-flow.ts` MUST NOT hardcode `questionPoolSize`.
+  Reviewer asserts by grepping the file for the field name —
+  should only appear in router (merge) and dom-events / schema
+  (types).
+- (h) `chrome.tabs.sendMessage` heartbeat forwarding MUST use
+  the `tabId` from the original `quiz-request`. Reviewer asserts
+  via `router.test.ts`.
+
+---

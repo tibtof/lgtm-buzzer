@@ -1,5 +1,6 @@
 import { FrameSchema, type Frame } from "@lgtm-buzzer/protocol";
 import type { CorrelationMap } from "./correlation.js";
+import type { ProgressMap } from "./progress-map.js";
 
 // ---------------------------------------------------------------------------
 // Error marker strings (exported for use in error-classes.ts — ADR-24)
@@ -61,6 +62,19 @@ export type PortClientDeps = {
   readonly timeoutMs: number;
   /** Optional structured logger. */
   readonly logger?: PortLogger;
+  /**
+   * Optional progress-frame registry (ADR-32).
+   *
+   * When provided, incoming `quiz-progress` frames are dispatched here instead
+   * of being resolved as terminal replies. The pending correlation map entry
+   * is kept open; its timeout is re-armed on each heartbeat to give the host
+   * additional headroom beyond the static budget.
+   *
+   * When absent (e.g. in legacy tests), `quiz-progress` frames are dropped
+   * with a warning — the pending request stays alive until its original timer
+   * fires.
+   */
+  readonly progressMap?: ProgressMap;
 };
 
 /**
@@ -101,7 +115,7 @@ const makeErrorFrame = (
  * frames, and routes replies via the correlation map.
  */
 export const createPortClient = (deps: PortClientDeps): PortClient => {
-  const { connect, map, timeoutMs, logger } = deps;
+  const { connect, map, timeoutMs, logger, progressMap } = deps;
 
   let port: HostPort | null = null;
   let listenersAttached = false;
@@ -120,6 +134,35 @@ export const createPortClient = (deps: PortClientDeps): PortClient => {
       }
       const reply = parsed.data;
       const correlationId = reply.correlationId;
+
+      // ADR-32: quiz-progress is a one-way heartbeat. Route it to the
+      // ProgressMap and re-arm the pending request's timeout; do NOT resolve
+      // the pending Promise.
+      if (reply.kind === "quiz-progress") {
+        const dispatched = progressMap?.dispatch(reply) ?? false;
+        if (!dispatched) {
+          logger?.warn(
+            "[lgtm-buzzer:sw] quiz-progress with no subscriber — dropped",
+            { correlationId: correlationId ?? "(null)" },
+          );
+        }
+        // Re-arm the pending request's timeout so each heartbeat extends the
+        // 180s budget from now. A hung host (no heartbeat for 180s) still times out.
+        if (correlationId !== null) {
+          const pending = map.peekById(correlationId);
+          if (pending !== undefined) {
+            clearTimeout(pending.timer);
+            pending.timer = setTimeout(() => {
+              const p = map.takeById(correlationId);
+              if (p !== undefined) {
+                p.resolve(makeErrorFrame(correlationId, "host did not respond"));
+              }
+            }, timeoutMs);
+          }
+        }
+        return; // do NOT resolve the pending entry
+      }
+
       if (correlationId === null) {
         logger?.warn(
           "[lgtm-buzzer:sw] host reply has null correlationId — dropped",

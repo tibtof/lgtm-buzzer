@@ -1,0 +1,168 @@
+import { describe, it, expect } from "vitest";
+import {
+  QuizProgressPayloadSchema,
+  QuizProgressFrameSchema,
+  QuizProgressPhaseSchema,
+} from "./quiz-progress.js";
+
+describe("QuizProgressPhaseSchema", () => {
+  const validPhases = ["fetching-diff", "generating-quiz", "parsing", "caching"] as const;
+
+  for (const phase of validPhases) {
+    it(`accepts phase "${phase}"`, () => {
+      expect(QuizProgressPhaseSchema.safeParse(phase).success).toBe(true);
+    });
+  }
+
+  it("rejects unknown phase", () => {
+    expect(QuizProgressPhaseSchema.safeParse("unknown-phase").success).toBe(false);
+  });
+
+  it("rejects empty string", () => {
+    expect(QuizProgressPhaseSchema.safeParse("").success).toBe(false);
+  });
+});
+
+describe("QuizProgressPayloadSchema", () => {
+  it("accepts a valid payload with all fields", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "generating-quiz",
+      elapsedMs: 5000,
+      expectedMs: 60000,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.phase).toBe("generating-quiz");
+      expect(result.data.elapsedMs).toBe(5000);
+      expect(result.data.expectedMs).toBe(60000);
+    }
+  });
+
+  it("accepts a valid payload without optional expectedMs", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "fetching-diff",
+      elapsedMs: 0,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.expectedMs).toBeUndefined();
+    }
+  });
+
+  it("accepts elapsedMs = 0", () => {
+    expect(
+      QuizProgressPayloadSchema.safeParse({ phase: "parsing", elapsedMs: 0 }).success,
+    ).toBe(true);
+  });
+
+  it("rejects negative elapsedMs", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "caching",
+      elapsedMs: -1,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects non-integer elapsedMs", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "caching",
+      elapsedMs: 1.5,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects negative expectedMs", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "generating-quiz",
+      elapsedMs: 0,
+      expectedMs: -100,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("strips extra fields (diff-only invariant)", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "generating-quiz",
+      elapsedMs: 1000,
+      diffPreview: "some diff text — MUST be stripped",
+      questionsGenerated: 3,
+      prTitle: "My PR title — MUST be stripped",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as Record<string, unknown>;
+      expect(data["diffPreview"]).toBeUndefined();
+      expect(data["questionsGenerated"]).toBeUndefined();
+      expect(data["prTitle"]).toBeUndefined();
+    }
+  });
+
+  it("rejects missing phase", () => {
+    expect(
+      QuizProgressPayloadSchema.safeParse({ elapsedMs: 0 }).success,
+    ).toBe(false);
+  });
+
+  it("rejects missing elapsedMs", () => {
+    expect(
+      QuizProgressPayloadSchema.safeParse({ phase: "parsing" }).success,
+    ).toBe(false);
+  });
+});
+
+describe("QuizProgressFrameSchema", () => {
+  const validFrame = {
+    v: 1,
+    kind: "quiz-progress",
+    correlationId: "test-correlation-id",
+    payload: {
+      phase: "generating-quiz",
+      elapsedMs: 5000,
+    },
+  };
+
+  it("round-trips a valid frame", () => {
+    const result = QuizProgressFrameSchema.safeParse(validFrame);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.kind).toBe("quiz-progress");
+      expect(result.data.correlationId).toBe("test-correlation-id");
+      expect(result.data.payload.phase).toBe("generating-quiz");
+      expect(result.data.payload.elapsedMs).toBe(5000);
+    }
+  });
+
+  it("round-trips with null correlationId", () => {
+    const frame = { ...validFrame, correlationId: null };
+    const result = QuizProgressFrameSchema.safeParse(frame);
+    expect(result.success).toBe(true);
+  });
+
+  it("round-trips each valid phase", () => {
+    const phases: Array<string> = ["fetching-diff", "generating-quiz", "parsing", "caching"];
+    for (const phase of phases) {
+      const result = QuizProgressFrameSchema.safeParse({
+        ...validFrame,
+        payload: { phase, elapsedMs: 0 },
+      });
+      expect(result.success).toBe(true);
+    }
+  });
+
+  it("rejects wrong protocol version", () => {
+    const result = QuizProgressFrameSchema.safeParse({ ...validFrame, v: 2 });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects wrong kind", () => {
+    const result = QuizProgressFrameSchema.safeParse({ ...validFrame, kind: "quiz-request" });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects missing correlationId", () => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { correlationId: _cid, ...noCorr } = validFrame;
+    const result = QuizProgressFrameSchema.safeParse(noCorr);
+    expect(result.success).toBe(false);
+  });
+});

@@ -106,6 +106,8 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
   // ---------------------------------------------------------------------------
 
   let selectedLlm = "";
+  // ADR-32: pool size. Default 5 (matches the protocol default).
+  let selectedPoolSize: 5 | 10 | 20 = 5;
 
   // ---------------------------------------------------------------------------
   // Banner helpers
@@ -232,6 +234,33 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
 
     root.appendChild(adapterSection);
 
+    // ---- Quiz behavior section (ADR-32) ----------------------------------
+    const quizBehaviorSection = el(doc, "section", { "data-lgtm-section": "quiz-behavior" });
+    const quizBehaviorHeading = textEl(doc, "h2", "Quiz behavior");
+    quizBehaviorSection.appendChild(quizBehaviorHeading);
+
+    const poolGroup = el(doc, "div", { "data-lgtm-group": "pool-size" });
+    const poolLabel = textEl(doc, "label", "Question pool size", { for: "lgtm-pool-size" });
+    const poolSelect = el(doc, "select", {
+      id: "lgtm-pool-size",
+      "data-lgtm-select": "pool-size",
+    }) as HTMLSelectElement;
+
+    const poolOptions: Array<{ value: 5 | 10 | 20; label: string }> = [
+      { value: 5, label: "5 — Fastest first quiz, no retry cache" },
+      { value: 10, label: "10 — Balanced (recommended)" },
+      { value: 20, label: "20 — Most retry variety, slower first quiz" },
+    ];
+    for (const { value, label } of poolOptions) {
+      const opt = textEl(doc, "option", label, { value: String(value) });
+      poolSelect.appendChild(opt);
+    }
+
+    poolGroup.appendChild(poolLabel);
+    poolGroup.appendChild(poolSelect);
+    quizBehaviorSection.appendChild(poolGroup);
+    root.appendChild(quizBehaviorSection);
+
     // ---- Auth-status panel -----------------------------------------------
     const authPanel = el(doc, "section", { "data-lgtm-section": "auth-status" });
     const authHeading = textEl(doc, "h2", "Authentication status");
@@ -261,6 +290,7 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
 
     // ---- Read stored options ----------------------------------------------
     let storedLlm = "";
+    let storedPoolSize: 5 | 10 | 20 = 5;
 
     const storedResult = await store.read();
     storedResult.fold(
@@ -276,8 +306,13 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
       },
       (opts) => {
         storedLlm = opts.llmAdapterId ?? "";
+        storedPoolSize = opts.questionPoolSize ?? 5;
       },
     );
+
+    // Hydrate pool-size select from stored value.
+    poolSelect.value = String(storedPoolSize);
+    selectedPoolSize = storedPoolSize;
 
     // ---- Load adapter list from host -------------------------------------
     const catalogResult = await listAdapters();
@@ -320,6 +355,14 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
       selectedLlm = llmSelect.value;
     });
 
+    // ---- Pool-size dropdown change handler (ADR-32) ----------------------
+    poolSelect.addEventListener("change", () => {
+      const v = Number(poolSelect.value);
+      if (v === 5 || v === 10 || v === 20) {
+        selectedPoolSize = v;
+      }
+    });
+
     // ---- Auth-status initial load ----------------------------------------
     const loadAuthStatus = async (): Promise<void> => {
       const result = await checkAuth();
@@ -348,6 +391,8 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
         schemaVersion: SCHEMA_VERSION,
         llmAdapterId: selectedLlm !== "" ? selectedLlm : undefined,
         // ADR-29: vcsAdapterId and credentials are REMOVED from storage.
+        // ADR-32: persist the pool size preference.
+        questionPoolSize: selectedPoolSize,
       };
 
       const writeResult = await store.write(options);
@@ -399,6 +444,7 @@ export const createOptionsView = (deps: OptionsDOMDeps): OptionsView => {
   const unmount = (): void => {
     root.innerHTML = "";
     selectedLlm = "";
+    selectedPoolSize = 5;
   };
 
   return { mount, unmount };

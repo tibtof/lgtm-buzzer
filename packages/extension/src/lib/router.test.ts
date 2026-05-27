@@ -50,9 +50,10 @@ const makeFakePortClient = (reply: Frame): PortClient => ({
     .mockResolvedValue(reply),
 });
 
-// ADR-29: SwOptionsProjection now only has llmAdapterId
+// ADR-29/ADR-32: SwOptionsProjection has llmAdapterId + questionPoolSize
 const noopReadSwOptions = async (): Promise<SwOptionsProjection> => ({
   llmAdapterId: undefined,
+  questionPoolSize: undefined,
 });
 
 const noSender = { tab: { id: 7 } };
@@ -186,7 +187,7 @@ describe("createCSMessageHandler", () => {
     const portClient = makeFakePortClient(pongFrame("c-qr-gh"));
     const handler = createCSMessageHandler({
       portClient,
-      readSwOptions: async () => ({ llmAdapterId: undefined }),
+      readSwOptions: async () => ({ llmAdapterId: undefined, questionPoolSize: undefined }),
     });
     const sendResponse = vi.fn<(response: CSResponse) => void>();
 
@@ -213,7 +214,7 @@ describe("createCSMessageHandler", () => {
     const portClient = makeFakePortClient(pongFrame("c-qr-ado"));
     const handler = createCSMessageHandler({
       portClient,
-      readSwOptions: async () => ({ llmAdapterId: undefined }),
+      readSwOptions: async () => ({ llmAdapterId: undefined, questionPoolSize: undefined }),
     });
     const sendResponse = vi.fn<(response: CSResponse) => void>();
 
@@ -237,7 +238,7 @@ describe("createCSMessageHandler", () => {
     const portClient = makeFakePortClient(pongFrame("c-qr-llm"));
     const handler = createCSMessageHandler({
       portClient,
-      readSwOptions: async () => ({ llmAdapterId: "claude-api" }),
+      readSwOptions: async () => ({ llmAdapterId: "claude-api", questionPoolSize: undefined }),
     });
     const sendResponse = vi.fn<(response: CSResponse) => void>();
 
@@ -261,7 +262,7 @@ describe("createCSMessageHandler", () => {
     const portClient = makeFakePortClient(pongFrame("c-qr-stale"));
     const handler = createCSMessageHandler({
       portClient,
-      readSwOptions: async () => ({ llmAdapterId: undefined }),
+      readSwOptions: async () => ({ llmAdapterId: undefined, questionPoolSize: undefined }),
     });
     const sendResponse = vi.fn<(response: CSResponse) => void>();
 
@@ -299,7 +300,7 @@ describe("createCSMessageHandler", () => {
     const handler = createCSMessageHandler({
       portClient,
       // Storage has a stale vcsAdapterId — it should NOT be used (ADR-29)
-      readSwOptions: async () => ({ llmAdapterId: "codex-cli" }),
+      readSwOptions: async () => ({ llmAdapterId: "codex-cli", questionPoolSize: undefined }),
     });
     const sendResponse = vi.fn<(response: CSResponse) => void>();
 
@@ -325,6 +326,7 @@ describe("createCSMessageHandler", () => {
     const portClient = makeFakePortClient(pongFrame("c-ping"));
     const readSwOptions = vi.fn<() => Promise<SwOptionsProjection>>().mockResolvedValue({
       llmAdapterId: "should-not-appear",
+      questionPoolSize: undefined,
     });
 
     const handler = createCSMessageHandler({ portClient, readSwOptions });

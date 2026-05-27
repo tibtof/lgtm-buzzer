@@ -35,17 +35,18 @@ const makeCorruptStore = (): OptionsStore => {
 };
 
 // ---------------------------------------------------------------------------
-// Tests (ADR-29: slim projection — llmAdapterId only)
+// Tests (ADR-32: slim projection — llmAdapterId + questionPoolSize)
 // ---------------------------------------------------------------------------
 
-describe("readSwOptions — ADR-29 slim projection", () => {
-  it("empty storage → { llmAdapterId: undefined }", async () => {
+describe("readSwOptions — ADR-32 slim projection", () => {
+  it("empty storage → { llmAdapterId: undefined, questionPoolSize: undefined }", async () => {
     const store = makeEmptyStore();
     const read = readSwOptions({ store });
     const projection = await read();
     expect(projection.llmAdapterId).toBeUndefined();
+    expect(projection.questionPoolSize).toBeUndefined();
     // No vcsAdapterId or credentials on the type
-    expect(Object.keys(projection)).toEqual(["llmAdapterId"]);
+    expect(Object.keys(projection)).toEqual(["llmAdapterId", "questionPoolSize"]);
   });
 
   it("stored llmAdapterId: 'claude-api' → projection carries it", async () => {
@@ -68,17 +69,49 @@ describe("readSwOptions — ADR-29 slim projection", () => {
     expect(projection.llmAdapterId).toBe("claude-cli");
   });
 
-  it("corrupt storage → { llmAdapterId: undefined }, no throw", async () => {
+  it("corrupt storage → { llmAdapterId: undefined, questionPoolSize: undefined }, no throw", async () => {
     const store = makeCorruptStore();
     const read = readSwOptions({ store });
     const projection = await read();
     expect(projection.llmAdapterId).toBeUndefined();
+    expect(projection.questionPoolSize).toBeUndefined();
   });
 
-  it("storage with only schemaVersion → { llmAdapterId: undefined }", async () => {
+  it("storage with only schemaVersion → { llmAdapterId: undefined, questionPoolSize: undefined }", async () => {
     const store = makeStoreWithData({ schemaVersion: SCHEMA_VERSION });
     const read = readSwOptions({ store });
     const projection = await read();
     expect(projection.llmAdapterId).toBeUndefined();
+    expect(projection.questionPoolSize).toBeUndefined();
+  });
+
+  it("stored questionPoolSize: 10 → projection carries 10", async () => {
+    const store = makeStoreWithData({
+      schemaVersion: SCHEMA_VERSION,
+      questionPoolSize: 10,
+    });
+    const read = readSwOptions({ store });
+    const projection = await read();
+    expect(projection.questionPoolSize).toBe(10);
+  });
+
+  it("stored questionPoolSize: 20 → projection carries 20", async () => {
+    const store = makeStoreWithData({
+      schemaVersion: SCHEMA_VERSION,
+      questionPoolSize: 20,
+    });
+    const read = readSwOptions({ store });
+    const projection = await read();
+    expect(projection.questionPoolSize).toBe(20);
+  });
+
+  it("stored questionPoolSize: 5 → projection carries 5", async () => {
+    const store = makeStoreWithData({
+      schemaVersion: SCHEMA_VERSION,
+      questionPoolSize: 5,
+    });
+    const read = readSwOptions({ store });
+    const projection = await read();
+    expect(projection.questionPoolSize).toBe(5);
   });
 });

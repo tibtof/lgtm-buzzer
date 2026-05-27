@@ -22,6 +22,7 @@ import type { SessionStore } from "./session-store.js";
 import type { AdapterRegistry, RegistryError } from "./registry.js";
 import type { QuestionPoolCache, Pool, PoolQuestion } from "./question-pool-cache.js";
 import { hashDiff } from "./diff-hash.js";
+import type { ProgressEmitter } from "./progress-emitter.js";
 
 // ---------------------------------------------------------------------------
 // Defaults (ADR-22 §Backwards compatibility)
@@ -47,6 +48,12 @@ export type DispatcherDeps = {
    * from `cli.ts`. Tests may pass a custom implementation or the real one.
    */
   readonly cache: QuestionPoolCache;
+  /**
+   * Progress emitter (ADR-32). Fires `quiz-progress` heartbeat frames toward
+   * the SW during the quiz-request fiber. Optional: when absent, no heartbeats
+   * are emitted and behaviour is identical to pre-ADR-32.
+   */
+  readonly progress?: ProgressEmitter;
 };
 
 // ---------------------------------------------------------------------------
@@ -352,7 +359,7 @@ const handleQuizRequest = (
   correlationId: string | null,
   deps: DispatcherDeps,
 ): IO<never, void> => {
-  const { write, store, logger, registry, cache } = deps;
+  const { write, store, logger, registry, cache, progress } = deps;
   const log = logger.child({ correlationId: correlationId ?? "", kind: "quiz-request" });
 
   // Cross-field validation: poolSize must be >= questionCount when present.
@@ -380,96 +387,140 @@ const handleQuizRequest = (
         .buildLlm(llmAdapterId)
         .mapErr((e): WorkError => e)
         .flatMap((llm: LLMProvider): IO<WorkError, void> => {
-          return vcs
-            .fetchDiff(pr)
-            .mapErr((e): WorkError => e)
-            .flatMap((diff: Diff): IO<WorkError, void> => {
-              // Pool path (ADR-30): questionPoolSize present.
-              if (questionPoolSize !== undefined) {
-                return IO.lift<WorkError, void>(async () => {
-                  const diffHash = hashDiff(diff);
-                  const prCanonical = canonicalisePR(pr);
-                  const poolKey = cache.buildKey({
-                    prKind: pr.kind,
-                    llmAdapterId: llm.id,
-                    prCanonical,
-                    diffHash,
-                  });
-
-                  const cachedPool = cache.get(poolKey);
-                  const cacheHit = cachedPool !== undefined;
-
-                  let activePool: Pool;
-                  if (!cacheHit) {
-                    // Cache miss — generate the full pool.
-                    log.info("Cache miss — generating question pool", {
-                      llmId: llm.id,
-                      poolSize: questionPoolSize,
+          // ADR-32: emit fetching-diff phase before calling vcs.fetchDiff.
+          return IO.lift<WorkError, void>(async () => {
+            await progress?.emit(correlationId, "fetching-diff");
+          }).flatMap((): IO<WorkError, void> =>
+            vcs
+              .fetchDiff(pr)
+              .mapErr((e): WorkError => e)
+              .flatMap((diff: Diff): IO<WorkError, void> => {
+                // Pool path (ADR-30): questionPoolSize present.
+                if (questionPoolSize !== undefined) {
+                  return IO.lift<WorkError, void>(async () => {
+                    const diffHash = hashDiff(diff);
+                    const prCanonical = canonicalisePR(pr);
+                    const poolKey = cache.buildKey({
+                      prKind: pr.kind,
+                      llmAdapterId: llm.id,
+                      prCanonical,
+                      diffHash,
                     });
-                    const poolResult = await llm
-                      .generateQuiz({ diff, questionCount: questionPoolSize })
+
+                    const cachedPool = cache.get(poolKey);
+                    const cacheHit = cachedPool !== undefined;
+
+                    let activePool: Pool;
+                    if (!cacheHit) {
+                      // Cache miss — generate the full pool.
+                      log.info("Cache miss — generating question pool", {
+                        llmId: llm.id,
+                        poolSize: questionPoolSize,
+                      });
+
+                      // ADR-32: emit generating-quiz phase + start heartbeat.
+                      await progress?.emit(correlationId, "generating-quiz");
+                      const stopHeartbeat = progress?.startHeartbeat(correlationId, "generating-quiz") ?? (() => {});
+
+                      let poolResult;
+                      try {
+                        poolResult = await llm
+                          .generateQuiz({ diff, questionCount: questionPoolSize })
+                          .mapErr((e): WorkError => e)
+                          .unsafeRun();
+                      } finally {
+                        stopHeartbeat();
+                      }
+
+                      if (poolResult.type === "Err") {
+                        throw poolResult.error;
+                      }
+
+                      // ADR-32: emit parsing phase before quizToPool.
+                      await progress?.emit(correlationId, "parsing");
+
+                      activePool = quizToPool(poolResult.value, poolKey, llm.id);
+
+                      // ADR-32: emit caching phase before cache.put.
+                      await progress?.emit(correlationId, "caching");
+
+                      cache.put(activePool);
+                    } else {
+                      log.info("Cache hit — reusing question pool", {
+                        poolKey,
+                        poolSize: cachedPool.questions.length,
+                      });
+                      activePool = cachedPool;
+                    }
+
+                    const sampled = sampleFromPool(activePool.questions, questionCount);
+                    const sampleQuizId = crypto.randomUUID();
+
+                    const answerKey: Map<QuestionId, ChoiceId> = new Map(
+                      sampled.map((q) => [q.id, q.correctChoiceId]),
+                    );
+                    store.set(sampleQuizId as QuizId, answerKey);
+                    cache.putSampleMapping({
+                      sampleQuizId,
+                      poolKey,
+                      sampledQuestionIds: sampled.map((q) => q.id),
+                    });
+
+                    log.info("Quiz sampled from pool — answer key stored", {
+                      sampleQuizId,
+                      questionCount: sampled.length,
+                      cacheHit,
+                    });
+
+                    const responseFrame = buildPoolQuizResponseFrame(
+                      sampled,
+                      sampleQuizId,
+                      correlationId,
+                    );
+                    const writeResult = await write(responseFrame)
                       .mapErr((e): WorkError => e)
                       .unsafeRun();
-                    if (poolResult.type === "Err") {
-                      throw poolResult.error;
+                    if (writeResult.type === "Err") {
+                      throw writeResult.error;
                     }
-                    activePool = quizToPool(poolResult.value, poolKey, llm.id);
-                    cache.put(activePool);
-                  } else {
-                    log.info("Cache hit — reusing question pool", {
-                      poolKey,
-                      poolSize: cachedPool.questions.length,
-                    });
-                    activePool = cachedPool;
+                  });
+                }
+
+                // Legacy path: no questionPoolSize, no pool, no cache.
+                log.info("Generating quiz", { llmId: llm.id, questionCount });
+
+                // ADR-32: emit generating-quiz + heartbeat on legacy path too.
+                return IO.lift<WorkError, void>(async () => {
+                  await progress?.emit(correlationId, "generating-quiz");
+                  const stopHeartbeat = progress?.startHeartbeat(correlationId, "generating-quiz") ?? (() => {});
+
+                  let quizResult;
+                  try {
+                    quizResult = await llm
+                      .generateQuiz({ diff, questionCount })
+                      .mapErr((e): WorkError => e)
+                      .unsafeRun();
+                  } finally {
+                    stopHeartbeat();
                   }
 
-                  const sampled = sampleFromPool(activePool.questions, questionCount);
-                  const sampleQuizId = crypto.randomUUID();
-
-                  const answerKey: Map<QuestionId, ChoiceId> = new Map(
-                    sampled.map((q) => [q.id, q.correctChoiceId]),
-                  );
-                  store.set(sampleQuizId as QuizId, answerKey);
-                  cache.putSampleMapping({
-                    sampleQuizId,
-                    poolKey,
-                    sampledQuestionIds: sampled.map((q) => q.id),
-                  });
-
-                  log.info("Quiz sampled from pool — answer key stored", {
-                    sampleQuizId,
-                    questionCount: sampled.length,
-                    cacheHit,
-                  });
-
-                  const responseFrame = buildPoolQuizResponseFrame(
-                    sampled,
-                    sampleQuizId,
-                    correlationId,
-                  );
-                  const writeResult = await write(responseFrame)
-                    .mapErr((e): WorkError => e)
-                    .unsafeRun();
-                  if (writeResult.type === "Err") {
-                    throw writeResult.error;
+                  if (quizResult.type === "Err") {
+                    throw quizResult.error;
                   }
-                });
-              }
 
-              // Legacy path: no questionPoolSize, no pool, no cache.
-              log.info("Generating quiz", { llmId: llm.id, questionCount });
-              return llm
-                .generateQuiz({ diff, questionCount })
-                .mapErr((e): WorkError => e)
-                .flatMap((quiz): IO<WorkError, void> => {
+                  const quiz = quizResult.value;
                   const answerKey = pickCorrectAnswers(quiz);
                   store.set(quiz.id as QuizId, answerKey);
                   log.info("Quiz generated — answer key stored", { quizId: quiz.id });
 
                   const responseFrame = buildQuizResponseFrame(quiz, correlationId);
-                  return write(responseFrame).mapErr((e): WorkError => e);
+                  const writeResult = await write(responseFrame).mapErr((e): WorkError => e).unsafeRun();
+                  if (writeResult.type === "Err") {
+                    throw writeResult.error;
+                  }
                 });
-            });
+              }),
+          );
         }),
     );
 
@@ -946,8 +997,10 @@ export const createDispatcher = (deps: DispatcherDeps): DispatcherFactory => {
       case "quiz-response":
       case "quiz-result":
       case "list-adapters-response":
-      case "check-auth-response": {
-        // These are host→extension frame kinds; receiving them is unexpected.
+      case "check-auth-response":
+      case "quiz-progress": {
+        // These are host→extension frame kinds; receiving them from the extension
+        // is unexpected. quiz-progress in particular is strictly one-way.
         logger.warn("Received unexpected frame kind — replying with unknown-message", {
           kind: frame.kind,
           correlationId: frame.correlationId,

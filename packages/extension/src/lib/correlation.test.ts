@@ -111,4 +111,58 @@ describe("createCorrelationMap", () => {
     map.drainAll(makeErrorFrame);
     expect(resolve).toHaveBeenCalledOnce();
   });
+
+  // ADR-32: peekById tests
+  it("peekById returns the entry without removing it", () => {
+    const map = createCorrelationMap();
+    const resolve = vi.fn<(frame: Frame) => void>();
+    const pending = makePending("peek-test", resolve);
+    map.add(pending);
+
+    const peeked = map.peekById("peek-test");
+    expect(peeked).toBe(pending);
+    // Entry is still in the map.
+    expect(map.size()).toBe(1);
+    // takeById still works after a peek.
+    const taken = map.takeById("peek-test");
+    expect(taken).toBe(pending);
+    expect(map.size()).toBe(0);
+  });
+
+  it("peekById returns undefined for an absent id", () => {
+    const map = createCorrelationMap();
+    expect(map.peekById("does-not-exist")).toBeUndefined();
+  });
+
+  it("peekById does not affect subsequent drainAll", () => {
+    const map = createCorrelationMap();
+    const resolve = vi.fn<(frame: Frame) => void>();
+    map.add(makePending("drain-peek", resolve));
+
+    map.peekById("drain-peek"); // must be side-effect-free
+    map.drainAll(makeErrorFrame);
+
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(map.size()).toBe(0);
+  });
+
+  it("timer field on PendingRequest is mutable (ADR-32 timer re-arm)", () => {
+    const map = createCorrelationMap();
+    const pending = makePending("mutable-timer", vi.fn());
+    map.add(pending);
+
+    const peeked = map.peekById("mutable-timer");
+    expect(peeked).toBeDefined();
+    if (peeked !== undefined) {
+      // Re-arm: assign a new timer handle.
+      const oldTimer = peeked.timer;
+      clearTimeout(oldTimer);
+      peeked.timer = setTimeout(() => {}, 99_999);
+      expect(peeked.timer).not.toBe(oldTimer);
+    }
+
+    // Clean up.
+    const taken = map.takeById("mutable-timer");
+    if (taken !== undefined) clearTimeout(taken.timer);
+  });
 });
