@@ -12185,3 +12185,1310 @@ failures stay below the wire as logger warnings.
   via `router.test.ts`.
 
 ---
+
+## ADR-33 (2026-05-27): Lean into IO — composed dispatcher + host-side cancellation + IO.lift vs IO.cancellable audit
+**Date**: 2026-05-27
+**Issue**: #129 (supersedes / closes #96)
+**Status**: Accepted
+
+### Context
+
+The `monadyssey` author reviewed our usage and surfaced a real problem:
+ports return `IO<E, A>`, but every consumer immediately `.unsafeRun()`s
+and branches on `result.type`. We pay the IO complexity tax while
+benefiting from none of IO's defining features at the port boundary:
+- No cancellation propagation across ports.
+- No composition with `flatMap` / `foldM` / `Schedule`.
+- No fibers at the dispatcher level.
+
+Two concrete symptoms:
+
+1. **Dispatcher is sequential `await unsafeRun()` chains.** Today's
+   `handleQuizRequest` already forks a single fiber, but the body of
+   that fiber repeatedly drops out of IO via `await ...unsafeRun()` to
+   imperatively check `result.type === "Err"`. If the fiber is
+   cancelled mid-await, the next imperative step still runs because
+   each `unsafeRun()` is its own atomic Promise. Cancellation only
+   takes effect between `unsafeRun()` calls, not inside the larger
+   workflow.
+
+2. **No wire-format cancellation.** ADR-24 (modal a11y) shipped Option A
+   for Esc-during-generating: the modal closes locally, the SW drops
+   its pending entry, but the host fiber runs to completion and burns
+   LLM cycles. Issue #96 has tracked Option B (a wire frame +
+   host-side fiber cancellation) since M2 but has been deferred.
+
+The author also flagged the underlying primitive split inside IO:
+
+> For IOs created with `IO.lift`, cancellation is structural — checked
+> between frames. For IOs created with `IO.cancellable`, cancellation
+> is cooperative — the signal is passed to user code (e.g.,
+> `fetch(url, { signal })`), allowing the operation itself to abort.
+
+If an adapter wraps a long-running fetch / spawn / sleep inside
+`IO.lift`, an outer cancellation will not stop it — the Promise runs to
+completion, and only the NEXT IO frame sees the cancel. For network
+work and subprocess work this is the wrong primitive.
+
+The user authorised Path B: keep IO at port surfaces (the port type
+shape stays exactly as-is), but make IO actually pay for itself by
+composing ports through `flatMap` at the dispatcher, forking the
+composed work into a fiber, and wiring a cancel wire frame to the
+fiber's `.cancel()`. Audit every adapter for proper `IO.lift` vs
+`IO.cancellable` use, and refactor any cancellable operation that is
+currently wrapped in `IO.lift`.
+
+### Decision
+
+Three coordinated changes, one ADR, one issue, one PR:
+
+1. **Refactor `handleQuizRequest` to compose ports via `flatMap`.** A
+   single `IO<DispatcherError, void>` value describes the entire quiz
+   pipeline (resolve adapters → fetch diff → generate quiz → store
+   answer key → write reply). The dispatcher forks this value, holds
+   the resulting `Fiber` in a per-request map keyed by `correlationId`,
+   and only joins after dispatch returns. No nested `await
+   ...unsafeRun()` inside the work body.
+
+2. **Add `quiz-cancel-request` wire frame + host handler** (closes #96).
+   The frame carries a single `correlationId`. The host looks up the
+   fiber and calls `.cancel()`. Cancellation propagates structurally
+   through every `flatMap` and cooperatively through `IO.cancellable`
+   leaves (`spawnIO`, `monadyssey-fetch`). The extension's existing
+   Esc → `lgtm-buzzer:quiz-cancel` path is extended to also emit a
+   `quiz-cancel-request` frame.
+
+3. **Audit every adapter** for the correct `IO.lift` vs
+   `IO.cancellable` choice. Document the rule in this ADR. Refactor any
+   adapter that wraps a cancellable operation in `IO.lift`. Add focused
+   cancellation tests for each cancellable adapter that prove the
+   wrapped operation is actually aborted (not just structurally
+   skipped on the next frame).
+
+#### Affected workspaces
+
+This work touches `protocol`, `host`, `extension`, and `adapters/*`.
+`core` is unchanged — port type surfaces (`LLMProvider.generateQuiz`,
+`VCSProvider.fetchDiff`) keep their `IO<E, A>` shape. The
+dependency-direction rule is respected:
+
+```
+protocol  ←  core  ←  adapters  ←  host
+protocol  ←  core  ←  extension
+```
+
+- `protocol`: new `quiz-cancel-request` frame schema; new `"cancelled"`
+  variant on `ErrorReasonSchema`. Zero new runtime deps.
+- `core`: unchanged. The port interface in `core/src/ports/llm-provider.ts`
+  and `core/src/ports/vcs-provider.ts` stay byte-for-byte identical.
+- `adapters/*`: audit + targeted refactor. No new public types, no new
+  deps. Each adapter must use `IO.cancellable` (or transitively, via
+  `spawnIO`/`monadyssey-fetch`) for any operation that can itself
+  abort.
+- `host`: dispatcher refactor; new fiber registry; new
+  `quiz-cancel-request` handler. No new runtime deps.
+- `extension`: SW router emits `quiz-cancel-request` on Esc; new
+  schema bindings only.
+
+#### Types
+
+##### `packages/protocol/src/messages/quiz-cancel-request.ts` (NEW)
+
+```ts
+import { z } from "zod";
+import { EnvelopeBase } from "../base.js";
+
+/**
+ * Payload of a `quiz-cancel-request` frame.
+ *
+ * BINDING (diff-only invariant): this schema lists the EXACT allowed
+ * fields. No `reason`, no `partial`, no PR text. The host MUST NOT
+ * derive any prompt from this payload.
+ */
+export const QuizCancelRequestPayloadSchema = z.object({
+  /**
+   * Correlation id of the in-flight `quiz-request` to cancel. Must be
+   * the same `correlationId` that appears at the envelope level —
+   * embedding it in the payload makes the frame self-describing when
+   * read from logs or fixtures.
+   */
+  correlationId: z.string().min(1),
+});
+
+/** Payload of a `quiz-cancel-request` frame. */
+export type QuizCancelRequestPayload = z.infer<
+  typeof QuizCancelRequestPayloadSchema
+>;
+
+/**
+ * A one-way `quiz-cancel-request` frame (extension → host).
+ *
+ * The host MUST NOT reply to this frame with a `quiz-cancel-ack`. The
+ * originating `quiz-request` either:
+ *   (a) terminates with `ErrorFrame { reason: "cancelled" }` when the
+ *       fiber is cancelled before completion, or
+ *   (b) terminates normally if cancellation arrives after the work
+ *       finished (the cancel is a no-op).
+ *
+ * Either way, the SW maps the terminal frame back through the
+ * correlation map exactly once.
+ */
+export const QuizCancelRequestFrameSchema = z.object({
+  ...EnvelopeBase,
+  kind: z.literal("quiz-cancel-request"),
+  payload: QuizCancelRequestPayloadSchema,
+});
+
+export type QuizCancelRequestFrame = z.infer<
+  typeof QuizCancelRequestFrameSchema
+>;
+```
+
+Add to the union in `packages/protocol/src/envelope.ts`:
+
+```ts
+export const FrameSchema = z.discriminatedUnion("kind", [
+  // ...existing...
+  QuizCancelRequestFrameSchema,
+]);
+```
+
+##### `packages/protocol/src/messages/error.ts` (MODIFIED)
+
+Extend `ErrorReasonSchema` with a `"cancelled"` variant:
+
+```ts
+export const ErrorReasonSchema = z.enum([
+  "schema-violation",
+  "unknown-message",
+  "version-mismatch",
+  "internal",
+  "unknown-quiz-id",
+  "unsupported-llm-adapter",
+  "unsupported-vcs-adapter",
+  "missing-credentials",
+  "cancelled", // NEW (ADR-33)
+]);
+```
+
+The `"cancelled"` reason is reserved for error frames the host emits
+when a `quiz-request` fiber was cancelled BEFORE completion. The SW
+treats it as a terminal reply: resolves the pending entry, then the
+quiz-flow can decide whether to ignore it (the modal is already
+closed) or surface a message.
+
+##### `packages/host/src/dispatcher.ts` (MODIFIED)
+
+A composed work IO + a per-request fiber registry:
+
+```ts
+import type { Fiber } from "monadyssey";
+
+/** Internal error union for the composed quiz pipeline. */
+type DispatcherError =
+  | RegistryError
+  | VCSProviderError
+  | LLMProviderError
+  | WriteError;
+
+/**
+ * Per-request fiber registry, keyed by correlationId. Populated on
+ * quiz-request handler start; cleaned in the join `finally`. Used by
+ * the quiz-cancel-request handler to look up the fiber and cancel it.
+ *
+ * Module-scoped Map inside `createDispatcher` (closure-private). Not
+ * exported. No cross-request leakage by construction — each entry is
+ * removed in the same handler that created it.
+ */
+type FiberRegistry = Map<string, Fiber<DispatcherError, void>>;
+```
+
+The dispatcher closure constructs one `FiberRegistry` at factory time
+and passes it to both `handleQuizRequest` and
+`handleQuizCancelRequest`.
+
+##### `packages/extension/src/lib/cs-protocol.ts` and `dom/quiz-flow.ts` (MODIFIED)
+
+No new public types in `cs-protocol.ts`. The existing
+`lgtm-buzzer:quiz-cancel` DOM event already carries `{ requestId }`;
+the `onQuizCancel` handler in `quiz-flow.ts` is extended to also send
+a `quiz-cancel-request` frame to the SW via the existing `send-frame`
+CS-request kind, using the `correlationId` recorded for that
+`requestId` in `correlationToRequest` (already maintained for ADR-32
+progress routing).
+
+#### Functions and methods
+
+##### `handleQuizRequest` (rewritten)
+
+```ts
+const handleQuizRequest = (
+  pr: PRIdentifier,
+  questionCount: number,
+  questionPoolSize: number | undefined,
+  llmAdapterId: string,
+  vcsAdapterId: string,
+  correlationId: string | null,
+  deps: DispatcherDeps,
+  fibers: FiberRegistry,
+): IO<never, void> => {
+  // pre-validation unchanged — questionPoolSize >= questionCount
+
+  type W = DispatcherError;
+
+  // The work IO. Each step composes with the next via flatMap. The
+  // body never calls .unsafeRun() — cancellation propagates through
+  // every frame.
+  const work: IO<W, void> =
+    registry.buildVcs(vcsAdapterId).mapErr((e): W => e)
+      .flatMap((vcs) =>
+        registry.buildLlm(llmAdapterId).mapErr((e): W => e)
+          .flatMap((llm) =>
+            emitPhase(correlationId, "fetching-diff", progress)
+              .flatMap(() => vcs.fetchDiff(pr).mapErr((e): W => e))
+              .flatMap((diff) =>
+                questionPoolSize !== undefined
+                  ? runPoolPath(diff, llm, pr, questionCount, questionPoolSize, ...)
+                  : runLegacyPath(diff, llm, questionCount, ...)
+              )
+          )
+      );
+
+  // Fork. The fork itself is IO<never, Fiber<W, void>>; we lift the
+  // outcome into the never-fails outer IO that dispatch expects.
+  return work.fork().flatMap((fiber): IO<never, void> => {
+    if (correlationId !== null) fibers.set(correlationId, fiber);
+    return IO.lift<never, void>(async () => {
+      try {
+        const outcome = await fiber.join();
+        switch (outcome.type) {
+          case "Ok":
+            return; // frame already written inside `work`
+          case "Err":
+            await emitErrorFrame(outcome.error, correlationId, write, log).unsafeRun();
+            return;
+          case "Cancelled":
+            // ADR-33: emit `ErrorFrame { reason: "cancelled" }` so the SW
+            // can resolve the pending entry. Without this, the SW waits
+            // for its 180s timeout to fire.
+            await safeWrite(
+              write,
+              buildErrorFrame("cancelled", "quiz-request cancelled", correlationId),
+              log,
+            ).unsafeRun();
+            return;
+        }
+      } finally {
+        if (correlationId !== null) fibers.delete(correlationId);
+      }
+    });
+  });
+};
+```
+
+`runPoolPath` and `runLegacyPath` are extracted helpers that each
+return `IO<W, void>`. They internally compose `progress.emit(...)`
+heartbeat side-effects (already pure IO wrappers today) and
+`llm.generateQuiz(...)` via `.flatMap`, and write the response frame
+through `write(frame).mapErr((e): W => e)`. Importantly, neither
+helper calls `.unsafeRun()` — every step stays inside IO, so a fiber
+cancel between any two steps short-circuits the rest.
+
+The heartbeat `startHeartbeat(...)` returned closure must be stopped
+in a finalizer-shaped wrapper. Pattern:
+
+```ts
+const withHeartbeat = <E, A>(
+  cid: string | null,
+  phase: QuizProgressPhase,
+  inner: IO<E, A>,
+): IO<E, A> => {
+  let stop: (() => void) | undefined;
+  return IO.lift<never, void>(async () => {
+    await progress?.emit(cid, phase);
+    stop = progress?.startHeartbeat(cid, phase);
+  })
+    .flatMap(() => inner)
+    .ensuring(IO.lift<never, void>(() => { stop?.(); }));
+};
+```
+
+The `.ensuring(...)` finalizer runs on Ok, Err, AND Cancelled, so the
+heartbeat interval clears in every outcome. (If monadyssey@2.0.1 names
+this combinator differently, swap names — semantics are identical.)
+
+##### `handleQuizCancelRequest` (NEW)
+
+```ts
+const handleQuizCancelRequest = (
+  cancelCorrelationId: string,
+  deps: DispatcherDeps,
+  fibers: FiberRegistry,
+): IO<never, void> => {
+  const fiber = fibers.get(cancelCorrelationId);
+  if (fiber === undefined) {
+    // Cancel arrived after the work completed — no-op. The quiz-request
+    // either already replied or is about to.
+    deps.logger.info(
+      "quiz-cancel-request for unknown correlationId — no-op",
+      { correlationId: cancelCorrelationId },
+    );
+    return IO.pure(undefined);
+  }
+  // Idempotent per Fiber.cancel contract.
+  return IO.lift<never, void>(async () => {
+    await fiber.cancel();
+    deps.logger.info("quiz-request fiber cancelled", {
+      correlationId: cancelCorrelationId,
+    });
+  });
+};
+```
+
+No wire reply is emitted. The originating `quiz-request` fiber, on
+join, sees `Cancelled` and writes the `cancelled` error frame.
+
+##### `dispatch` switch (MODIFIED)
+
+Add a case for `"quiz-cancel-request"` that calls
+`handleQuizCancelRequest`. No new fall-through behaviour.
+
+##### `createDispatcher` (MODIFIED)
+
+The factory allocates one `FiberRegistry: Map<string, Fiber<...>>`
+in its closure and passes it to both `handleQuizRequest` and
+`handleQuizCancelRequest`. Not exported; not mutable from outside.
+
+##### `onQuizCancel` in `quiz-flow.ts` (MODIFIED)
+
+Extend the existing handler to look up the `correlationId` for the
+given `requestId` (via the existing `correlationToRequest` map,
+inverted on read) and send a `quiz-cancel-request` frame:
+
+```ts
+const onQuizCancel = (detail: { requestId: string }): void => {
+  // Find the in-flight correlationId for this requestId.
+  let inFlightCid: string | undefined;
+  for (const [cid, rid] of correlationToRequest) {
+    if (rid === detail.requestId) { inFlightCid = cid; break; }
+  }
+
+  // Drop local pending state (existing behaviour).
+  dropPending(detail.requestId);
+  generationStartTimes.delete(detail.requestId);
+  for (const [corrId, reqId] of correlationToRequest) {
+    if (reqId === detail.requestId) correlationToRequest.delete(corrId);
+  }
+
+  // ADR-33: signal the host to abort the running fiber.
+  if (inFlightCid !== undefined) {
+    sendCancelToSW(inFlightCid);
+  }
+};
+```
+
+`sendCancelToSW(correlationId)` wraps a `chrome.runtime.sendMessage`
+of `{ kind: "send-frame", frame: { v: 1, kind: "quiz-cancel-request",
+correlationId, payload: { correlationId } } }`. Fire-and-forget — the
+extension never awaits a reply, and the SW router does NOT subscribe
+to a progress entry for this frame.
+
+##### Router (MODIFIED)
+
+`packages/extension/src/lib/router.ts`: when the inbound
+`send-frame` request carries `frame.kind === "quiz-cancel-request"`,
+forward via `portClient.sendFrame` exactly like any other frame, but
+do NOT add a `progressMap` subscription. Reply synchronously with
+`{ kind: "frame", frame: <ack-or-not> }` — except there is no ack
+expected, so we resolve immediately after `postMessage`. To keep the
+existing `sendFrame` contract (always resolves), use a synthesised
+reply frame:
+
+```ts
+if (frame.kind === "quiz-cancel-request") {
+  void portClient.sendFrameOneWay(frame, tabId);
+  sendResponse({ kind: "frame", frame: makeAckFrame(frame.correlationId) });
+  return undefined; // synchronous response
+}
+```
+
+`portClient.sendFrameOneWay` is a NEW method on `PortClient`: it
+`postMessage`s the frame without registering a correlation entry, so
+nothing in the SW waits for a reply. Implementation is one
+`p.postMessage(frame)` inside a try/catch that swallows transport
+errors (cancel is best-effort).
+
+##### `PortClient.sendFrameOneWay` (NEW)
+
+```ts
+type PortClient = {
+  readonly sendFrame: (frame: Frame, tabId?: number) => Promise<Frame>;
+  readonly sendFrameOneWay: (frame: Frame) => void;   // NEW
+  readonly isConnected: () => boolean;
+};
+```
+
+The implementation reuses `ensureConnected()` and calls
+`p.postMessage(frame)` inside a try/catch. No correlation map entry,
+no timer, no Promise.
+
+#### File layout
+
+NEW files:
+- `packages/protocol/src/messages/quiz-cancel-request.ts`
+- `packages/protocol/src/messages/quiz-cancel-request.test.ts`
+
+MODIFIED files:
+- `packages/protocol/src/envelope.ts` — add `QuizCancelRequestFrameSchema` to the union.
+- `packages/protocol/src/messages/error.ts` — add `"cancelled"` to `ErrorReasonSchema`.
+- `packages/protocol/src/index.ts` — re-export the new types.
+- `packages/host/src/dispatcher.ts` — composed work IO + fiber registry + cancel handler.
+- `packages/host/src/dispatcher.test.ts` — new tests for composition, cancellation, race conditions.
+- `packages/host/src/cli.ts` — no functional change; the new fiber registry is created inside `createDispatcher`.
+- `packages/extension/src/lib/port.ts` — add `sendFrameOneWay` to `PortClient`.
+- `packages/extension/src/lib/port.test.ts` — test for the new method.
+- `packages/extension/src/lib/router.ts` — forward `quiz-cancel-request` via `sendFrameOneWay`.
+- `packages/extension/src/lib/router.test.ts` — test the cancel path.
+- `packages/extension/src/lib/dom/quiz-flow.ts` — extend `onQuizCancel` to emit the cancel frame.
+- `packages/extension/src/lib/dom/quiz-flow.test.ts` — test Esc → cancel-frame emission.
+- `packages/extension/e2e/quiz-cancel-host-side.spec.ts` — new e2e covering modal Esc → host cancel.
+
+AUDIT-only (verify, no functional change expected — see audit below):
+- `packages/adapters/_shared/src/spawn-io.ts` — already uses `IO.cancellable`. **PASS**.
+- `packages/adapters/claude-cli/src/provider.ts` — composes `spawnIO` (cancellable) via `flatMap`. **PASS**.
+- `packages/adapters/codex-cli/src/provider.ts` — same. **PASS**.
+- `packages/adapters/copilot-cli/src/provider.ts` — same. **PASS**.
+- `packages/adapters/claude-api/src/provider.ts` — `monadyssey-fetch` is `IO.cancellable` internally. **VERIFY** the retry policy (`Schedule.retryIf`) actually aborts on cancellation rather than scheduling the next retry. If not, refactor or document.
+- `packages/adapters/github/src/provider.ts` — `monadyssey-fetch` cancellable; one `IO.lift` reads `response.text()`. **VERIFY** that `Response.text()` aborts when the wrapping IO is cancelled (it should — Fetch's body stream honours the original `AbortSignal`); if not, refactor to `IO.cancellable` that passes the signal through.
+- `packages/adapters/ado/src/provider.ts` — v1 stub; nothing to abort. **N/A**.
+- `packages/host/src/credentials/resolver.ts` — uses `spawnIO` + `io.timeout()`. Already cancellable through `spawnIO`. **PASS**.
+
+#### Sequence
+
+##### Cancel-during-generating, host-side
+
+1. User presses Esc. `modal.ts` emits `lgtm-buzzer:quiz-cancel` with
+   `{ requestId }`.
+2. `quiz-flow.ts`'s `onQuizCancel`:
+   a. Looks up `correlationId` for `requestId` in
+      `correlationToRequest`.
+   b. Calls `dropPending(requestId)` + clears `generationStartTimes` +
+      drains `correlationToRequest` (existing behaviour).
+   c. Calls `sendCancelToSW(correlationId)`.
+3. `sendCancelToSW` calls `chrome.runtime.sendMessage({ kind:
+   "send-frame", frame: <quiz-cancel-request> })`.
+4. SW router validates via `CSRequestSchema`, sees
+   `frame.kind === "quiz-cancel-request"`, calls
+   `portClient.sendFrameOneWay(frame)`.
+5. `sendFrameOneWay` writes the frame to the native port and returns.
+   No correlation map entry created.
+6. Host's `createFrameReader` decodes the frame; the dispatcher
+   switch dispatches to `handleQuizCancelRequest`.
+7. `handleQuizCancelRequest` reads
+   `fibers.get(payload.correlationId)`:
+   - **Hit**: calls `await fiber.cancel()`.
+   - **Miss**: logs at info and returns. Common race: cancel arrived
+     after the work completed; the original `quiz-response` is
+     already on the wire or imminently will be.
+8. The cancelled fiber's `IO.cancellable` leaves react:
+   - `spawnIO`: AbortSignal fires → SIGTERM → 5s grace → SIGKILL.
+   - `monadyssey-fetch`: AbortSignal fires → in-flight HTTP request
+     aborts → any pending retry is short-circuited by the fiber
+     cancellation.
+9. The fiber's `join()` resolves with `Cancelled`. The handler's
+   `IO.lift` wrapper emits an `ErrorFrame { reason: "cancelled" }` and
+   removes the registry entry in `finally`.
+10. SW receives the `ErrorFrame { reason: "cancelled" }`, matches it
+    by `correlationId`, resolves the pending entry. The router
+    `sendResponse({ kind: "frame", frame: <cancelled-error> })`.
+11. The CS receives the reply via `cs-protocol`. The
+    `handleQuizRequestReply` path notices the entry was already
+    dropped (step 2b) and logs "reply arrived after cancel — dropped"
+    (existing behaviour). The modal is already closed.
+
+##### Cancel arrives AFTER completion (race)
+
+1. Steps 1–6 above.
+2. `fibers.get(correlationId)` returns `undefined` (the original
+   handler's `finally` already deleted it).
+3. `handleQuizCancelRequest` logs at info; no wire reply.
+4. The original `quiz-response` or `ErrorFrame` was already written
+   by the now-completed handler. SW resolves on that frame as usual.
+
+##### Cancel while a retry is pending (claude-api)
+
+1. Steps 1–7. The fiber is currently sleeping between attempts inside
+   `Schedule.retryIf`.
+2. `fiber.cancel()` aborts the schedule's wait via the same
+   `AbortSignal` the fiber carries (monadyssey threads this through;
+   verify in the audit test).
+3. No further attempts fire; fiber resolves `Cancelled`.
+
+#### Error cases
+
+- **`registry.buildVcs` / `registry.buildLlm` fails**: lifted to
+  `DispatcherError = RegistryError | ...`; surfaces as
+  `unsupported-{llm,vcs}-adapter` or `missing-credentials` error
+  frames — same wire format as today.
+- **`vcs.fetchDiff` fails**: `VCSProviderError` → mapped to
+  `ErrorFrame { reason: "internal", message: "quiz-request failed:
+  transport: ..." }` — same as today.
+- **`llm.generateQuiz` fails**: `LLMProviderError` → same wire shape
+  as today.
+- **`store.put` or `write(frame)` fails**: `WriteError` lifts into
+  the same error union; surfaces as `ErrorFrame { reason: "internal" }`.
+- **Fiber cancelled**: NEW. `Cancelled` outcome → `ErrorFrame {
+  reason: "cancelled" }`. The SW treats this as terminal and resolves
+  the pending entry. The quiz-flow ignores it (the modal is closed).
+- **Cancel for an unknown `correlationId`**: NO error frame. Log at
+  info. The most common cause is a race where the cancel beat the
+  cleanup or vice versa.
+- **`sendFrameOneWay` transport failure**: swallowed inside the port
+  client. The extension's view is best-effort: the modal is already
+  closed; the worst case is the host completes the work, replies, the
+  SW drops the unmatched reply, and one LLM call's worth of cycles is
+  burned. Same as ADR-24's Option A behaviour for that one edge case
+  only.
+- **Old host without `quiz-cancel-request` handler**: zod rejects the
+  frame inside `FrameSchema.safeParse`, the dispatcher's decode-error
+  path writes `ErrorFrame { reason: "schema-violation" }`. The SW
+  drops it because it has no correlation entry (one-way). No user
+  impact beyond a log warning.
+- **New host receiving cancel-request without an in-flight fiber**:
+  registry miss → log at info. No error frame.
+
+#### Test strategy
+
+##### Unit tests — `packages/host/src/dispatcher.test.ts`
+
+1. **Composition smoke**: VCS port fails → no LLM call happens; the
+   IO error channel carries the VCS error; one error frame written.
+   Replace the LLM provider with a spy that fails the test if called.
+2. **Composition error unification**: parametrise the failing port
+   (vcs / llm / store / write) and assert the wire frame matches the
+   expected reason.
+3. **Fiber cancellation — happy path**:
+   - LLM provider returns an IO that sleeps for 10s via
+     `IO.cancellable(signal => new Promise(resolve =>
+     setTimeout(resolve, 10_000)))`.
+   - Dispatcher receives the quiz-request, then immediately a
+     `quiz-cancel-request` for the same correlationId.
+   - Assert: the sleep IO's signal was aborted (spy on the signal).
+   - Assert: one `ErrorFrame { reason: "cancelled" }` was written.
+   - Assert: the LLM provider's `generateQuiz` does NOT produce a
+     `Quiz` (the IO never completes).
+4. **Cancel arrives after completion**: send the cancel after the
+   quiz-response was written. Assert: no second frame is written;
+   handler logs at info; no exception.
+5. **Cancel during VCS fetch**: VCS provider's `fetchDiff` is an
+   `IO.cancellable` that sleeps; cancel; assert the LLM provider's
+   `generateQuiz` is never called.
+6. **Cancel for unknown correlationId**: no fiber registered; assert
+   no frame written, info log only.
+7. **Two in-flight quiz-requests, one cancel**: distinct
+   correlationIds; cancel only one; assert the other completes
+   normally and writes its quiz-response.
+
+##### Cancellation audit tests (one per cancellable adapter)
+
+8. **`spawnIO` cancellation aborts the child** — exists; ensure
+   coverage extends to the composed-IO call site by running a
+   `claude-cli` provider IO under fiber cancel and asserting SIGTERM
+   was sent (test hook already exists via `__spawnIO_testHooks`).
+9. **`claude-api` cancellation aborts the fetch + retry** — fork the
+   IO; trigger cancel mid-retry-delay; assert the underlying
+   HttpClient was called once (not retried after cancel), and the
+   AbortSignal was aborted.
+10. **`github` cancellation aborts the fetch** — fork the IO; cancel
+    while the HttpClient is awaiting `Response.text()`; assert the
+    fetch was aborted (HttpClient spy sees its signal aborted).
+
+For each cancellation test the assertion shape is: the wrapped
+operation's `AbortSignal` reaches `aborted: true` synchronously after
+`fiber.cancel()` resolves. A pure-structural cancellation (the
+operation completes anyway and the IO drops the result on the next
+frame) is a FAIL for these tests — that is the bug-shape ADR-33 is
+designed to prevent.
+
+##### Protocol tests — `packages/protocol/src/messages/quiz-cancel-request.test.ts`
+
+- Round-trip parse/serialize.
+- Reject payloads with empty / missing `correlationId`.
+- Discriminated union test: `FrameSchema.safeParse` succeeds on a
+  well-formed frame and rejects unknown payload fields per zod's
+  default strict behaviour for object literals.
+
+##### Extension tests
+
+- `port.test.ts`: `sendFrameOneWay` writes the frame, returns
+  synchronously, does not register a correlation entry, swallows
+  transport errors.
+- `router.test.ts`: incoming `send-frame` with a `quiz-cancel-request`
+  frame is forwarded via `sendFrameOneWay`, replies synchronously
+  with a synthesised ack, does NOT subscribe to a progressMap entry.
+- `quiz-flow.test.ts`: Esc fires `lgtm-buzzer:quiz-cancel`; the
+  handler emits a `quiz-cancel-request` frame with the correct
+  `correlationId`, then drops local pending state. If no in-flight
+  `correlationId` is registered (already cleared), no cancel frame is
+  sent — defensive.
+
+##### End-to-end — `packages/extension/e2e/quiz-cancel-host-side.spec.ts`
+
+- Page object: trigger a quiz on the fixture PR.
+- The SW-stub records the inbound `quiz-cancel-request` frame.
+- Press Esc during `generating` state.
+- Assert: modal closes immediately (existing behaviour).
+- Assert: the SW-stub received a `quiz-cancel-request` with the
+  in-flight correlationId. (Verifies the host-side cancel signal
+  actually reached the host wire; the stub stands in for a real
+  host.)
+
+##### Gap
+
+A true end-to-end "host fiber actually aborted" assertion would
+require a real host process under Playwright control. We do not have
+that infrastructure today. The unit + contract tests in `host`
+fill this gap as far as the SUT is concerned: a slow `IO.cancellable`
+LLM fake under fiber cancel either aborts (PASS) or doesn't
+(FAIL). The e2e spec only proves the wire frame reaches the host.
+
+#### `IO.lift` vs `IO.cancellable` rule (binding)
+
+**Use `IO.cancellable`** when the wrapped async operation can itself
+abort given an `AbortSignal`. Pass the signal through to the
+underlying call site:
+- `fetch(url, { signal })`.
+- `child_process.spawn(...)` + `signal.addEventListener("abort",
+  () => child.kill("SIGTERM"))`.
+- Any library API that documents an `AbortSignal` parameter.
+
+When `IO.cancellable` is used correctly, an outer fiber cancel
+propagates cooperatively: the underlying operation aborts mid-flight,
+and the IO error channel never sees a stale success.
+
+**Use `IO.lift`** for:
+- Synchronous transforms (parse, hash, validate).
+- Async operations that genuinely cannot be aborted (in-memory work,
+  a `Promise<T>` whose underlying primitive does not accept a signal).
+- Pure-FP wrappers around already-computed values
+  (`IO.lift(() => parsed.value)`).
+
+`IO.lift` of an unstoppable async operation is fine — cancellation
+will skip subsequent frames structurally. The bug-shape this ADR
+guards against is wrapping a STOPPABLE long-running async operation
+in `IO.lift` and assuming cancel will help. Example anti-pattern:
+
+```ts
+// ANTI-PATTERN: cancellation will NOT abort this fetch.
+IO.lift(() => fetch(url));
+
+// CORRECT: cancellation aborts the fetch.
+IO.cancellable((signal) => fetch(url, { signal }), liftErr);
+```
+
+#### Out of scope
+
+- Concurrent `quiz-request` frames with the SAME `correlationId`.
+  The fiber registry keys on `correlationId`; a second concurrent
+  request for the same id would overwrite the first map entry and
+  leak the first fiber. The SW correlation map already requires
+  unique `correlationId`s per inflight request and allocates fresh
+  ids via `newCorrelationId()`, so this cannot happen in practice.
+  Documented for completeness; not fixed.
+- `quiz-cancel-ack` reply frame (originally suggested in #96). We
+  intentionally make `quiz-cancel-request` one-way. The originating
+  `quiz-request` is the single source of truth for the terminal
+  reply — either its normal response or an `ErrorFrame { reason:
+  "cancelled" }`.
+- `IO.race` / `IO.par` introduction at the dispatcher. The current
+  pipeline is strictly sequential (fetch → generate → write); there
+  is no parallel work to compose. Revisit when conceptual-quiz +
+  diff-quiz parallel generation lands (#121).
+- Cancelling a `quiz-resample-request`. Resample is a fast
+  in-memory operation; no fiber, no LLM call. Not needed.
+
+### Consequences
+
+**Positive**:
+- IO finally earns its keep at the dispatcher boundary: cancellation
+  works end-to-end, composition removes the `await unsafeRun()`
+  ladder, and adding a fourth pipeline step (e.g., a pre-flight
+  diff-size check) becomes one more `.flatMap`.
+- Cancelled quiz generations stop consuming LLM cycles, which
+  matters for paid API adapters (`claude-api`) and locally for
+  metered LLM CLIs.
+- The `IO.lift` vs `IO.cancellable` rule is now documented; reviewer
+  enforces it on new adapter PRs.
+- Closes #96 with a wider scope than originally framed.
+
+**Negative / trade-offs**:
+- `handleQuizRequest` becomes a larger composed expression. Extracted
+  helpers (`runPoolPath`, `runLegacyPath`, `withHeartbeat`) keep each
+  function readable, but reviewers will want to verify the composed
+  IO matches the prose sequence.
+- One new wire frame, one new `ErrorReason`. Both are
+  forward-compatible (zod rejects unknowns; new error reason is just
+  another enum value).
+- `PortClient` grows a third method (`sendFrameOneWay`); the type
+  surface widens slightly.
+
+**Security**:
+- The cancel frame carries ONLY a `correlationId`. No PR text, no
+  diff bytes, no prompt content. Diff-only invariant unaffected.
+- A malicious extension that floods `quiz-cancel-request` frames
+  with random correlationIds finds nothing in the registry → info
+  logs only. No DoS surface beyond log volume (log level is `info`,
+  controlled by `LGTM_BUZZER_LOG_LEVEL`).
+- `Fiber.cancel()` is idempotent per the monadyssey contract; double
+  cancel is safe.
+- The fiber registry is keyed by `correlationId` (untrusted bytes
+  from the wire). Used only as a Map key for lookup — no eval, no
+  string interpolation into shell commands, no log injection
+  (logger uses structured fields).
+
+**Reviewer-enforced bindings**:
+- (a) The composed `work` IO in `handleQuizRequest` MUST NOT contain
+  any `.unsafeRun()` call inside its `.flatMap` chain. Reviewer
+  greps the file.
+- (b) Every adapter that wraps a network or subprocess operation
+  MUST use `IO.cancellable` and pass the `signal` through. Reviewer
+  inspects each provider.ts.
+- (c) The `quiz-cancel-request` payload schema MUST NOT include
+  any field beyond `correlationId`. Reviewer asserts via the
+  protocol test.
+- (d) `quiz-cancel-request` MUST be one-way: the host MUST NOT emit
+  any reply frame for it. Reviewer asserts via the dispatcher test
+  that no `write` call happens inside `handleQuizCancelRequest`
+  beyond log lines.
+- (e) The fiber registry MUST be cleaned in a `finally` after
+  `fiber.join()`. Reviewer asserts via the dispatcher test that a
+  failed handler does not leak a registry entry.
+
+---
+
+## ADR-34 (2026-06-04): ADO multi-call diff orchestration + hand-rolled unified-diff generator
+**Date**: 2026-06-04
+**Issue**: #92 (follow-up to #47 / PR #91)
+**Status**: Accepted
+
+### Context
+
+PR #91 shipped the ADO adapter's structural shell (URL builder, Basic-auth
+HTTP client, error mapper, wrong-VCS guard, httptape scaffold, 5 skipped
+contract tests) but `fetchDiff` returns
+`malformed-response { detail: "ado-multi-call-not-yet-implemented" }` for
+every ADO PR. The reason: unlike GitHub — which serves a ready-made unified
+diff via `Accept: application/vnd.github.v3.diff` (ADR-15) — Azure DevOps
+exposes **no single endpoint that returns unified-diff text**. ADO's diff
+surface is a JSON change-list plus per-item content endpoints. Producing the
+`Diff` value the rest of the system expects (a branded string that passes the
+`looksLikeUnifiedDiff` sniff in ADR-15) therefore requires (1) a multi-call
+orchestration and (2) synthesizing unified-diff text ourselves.
+
+This ADR designs both, composed as a **single cancellable `IO`** per ADR-33
+(host-side cancellation now exists; a multi-call diff fetch is precisely the
+slow operation a user cancels by closing the modal).
+
+#### CRITICAL CONSTRAINT — no live Azure DevOps instance
+
+We have **no ADO org, no PAT, and cannot record real httptape fixtures** the
+way GitHub did (ADR-15 §7). This adapter is therefore designed against the
+**documented Azure DevOps REST API 7.1 response shapes** and validated with
+**synthetic, hand-authored fixtures** modelled on those documented shapes.
+
+Consequences of this constraint, binding on the dev and reviewer:
+
+- The acceptance-criteria line "httptape fixtures recorded" is **replaced**
+  with "synthetic fixtures hand-authored from the documented API response
+  shapes." No `record:ado` run is expected; the `record:ado` script stays in
+  `package.json` for the day a live instance exists.
+- The adapter ships marked **"implemented, pending live-instance
+  validation."** Every assumption that could only be confirmed against a live
+  org (binary-detection signal §5, exact field names on `iterations` /
+  `changes` / `items`) is called out inline in the source as
+  `// ASSUMPTION (ADR-34, unverified against live ADO): …` and aggregated in
+  the adapter README's "Pending live validation" section.
+- Contract tests run against httptape replaying **synthetic** fixtures, not
+  recorded ones. They become the de-facto shape contract for ADO 7.1 until a
+  live instance is available.
+
+### Decision
+
+A five-leg multi-call chain, a pure unified-diff generator in
+`adapters/_shared`, an incremental 2 MiB cap, all-or-nothing per-file failure,
+binary-stub emission without content download, and a single composed
+cancellable `IO`. Each numbered open question from #92 is answered below.
+
+#### 1 — Endpoint chain (ADO REST API 7.1)
+
+All calls go through the existing Basic-auth `HttpClient` from `http.ts`. The
+base is `https://dev.azure.com` (or `<org>.visualstudio.com` via `baseUrl`).
+`{org}/{project}/{repo}` are taken from the `PRIdentifier` (`kind: "ado"`),
+percent-encoded exactly as `buildPullDiffUrl` already does.
+
+**Leg 1 — list iterations, pick the latest.**
+```
+GET /{org}/{project}/_apis/git/repositories/{repo}/pullRequests/{id}/iterations?api-version=7.1
+```
+Response `{ value: [{ id, ... }], count }`. Pick the iteration with the
+**maximum `id`** (latest iteration = current head of the PR). Empty `value`
+→ `malformed-response { detail: "ado-no-iterations" }`. This is the URL
+`buildPullDiffUrl` already produces.
+
+**Leg 2 — list changes for the latest iteration.**
+```
+GET /{org}/{project}/_apis/git/repositories/{repo}/pullRequests/{id}/iterations/{iterId}/changes?api-version=7.1&$top=10000&$compareTo=0
+```
+Response `{ changeEntries: [ { changeType, item: { path, objectId,
+originalObjectId?, gitObjectType?, isFolder?, contentMetadata? }, ... } ] }`.
+(ADO returns `changeEntries` on the iteration-changes endpoint; the
+`diffs/commits` endpoint uses `changes`. The dev validates against the
+synthetic fixture which mirrors the documented `changeEntries` shape.)
+`$compareTo=0` diffs against the base (iteration 0), giving the full PR diff.
+We filter to file entries: skip `item.isFolder === true` and entries whose
+`gitObjectType` is `"tree"`. `changeType` is a comma-or-flag value containing
+one or more of `add | edit | delete | rename | edit, rename`.
+
+**Leg 3 — per changed file, fetch old + new blob content by object id.**
+Use the **blob/items-by-objectId** endpoint, which is the fewest-call path
+that returns raw file content (one call per blob, no diff post-processing on
+the server, no need to resolve commit ids for a `versionDescriptor`):
+```
+GET /{org}/{project}/_apis/git/repositories/{repo}/blobs/{objectId}?api-version=7.1&$format=text
+```
+- **New content** uses `item.objectId`.
+- **Old content** uses `item.originalObjectId` (present on `edit` / `delete`).
+- `add` → no old blob (old content = `""`); `delete` → no new blob (new
+  content = `""`); `edit` → both.
+- An all-zero / absent `objectId` (`0000…`) means "no blob on that side";
+  treat as empty string, do not issue the call.
+
+Rationale for blobs-by-objectId over `items?path=…&versionDescriptor=…`:
+the change list already hands us both object ids, so we skip the extra
+commit-id resolution round-trip per file and avoid path-encoding ambiguity
+for renames. `$format=text` returns the raw bytes as the response body (read
+via `response.text()`), not a JSON envelope.
+
+**Leg count**: `2 + (up to 2 × number-of-non-binary-changed-files)` HTTP
+calls. Binary files (§5) and pure adds/deletes (§5 stub or one-sided) reduce
+the per-file count. All calls are diff-derived only (§7 allowlist).
+
+#### 2 — Unified-diff format — Option (a): hand-rolled pure generator
+
+**Decision: Option (a)** — a zero-dependency, pure unified-diff generator in
+`packages/adapters/_shared/src/unified-diff.ts`, shared and independently
+tested. Option (b) (add a diff dep) is rejected: it would need a separate dep
+ADR + license check for a problem solvable in ~200 lines of pure code.
+Option (c) (make `Diff` format-agnostic) is rejected: it touches `core`, the
+prompt, and the github adapter — far too invasive for one adapter's need.
+
+`_shared` already depends only on `core`, `protocol`, `monadyssey`, `zod`
+(all pure / non-I/O), so the helper introduces **no new runtime dependency**
+and keeps `_shared` import-clean. The ADO adapter gains a dependency on
+`@lgtm-buzzer/adapter-shared` (it does not have one today).
+
+##### Algorithm
+
+Line-level LCS (Hunt–McIlroy / dynamic-programming longest-common-
+subsequence over lines), then emit hunks with git's default **3 lines of
+context**. LCS (not full Myers) is chosen deliberately: it is simpler to
+write correctly, fully deterministic, and the quiz LLM does not need
+minimal-edit-script optimality — it needs a faithful, readable unified diff.
+Inputs are split on `\n`; a trailing-newline flag is tracked so a missing
+final newline emits git's `\ No newline at end of file` marker.
+
+##### Signatures (all pure, all exported, no `Result` needed — total functions)
+
+```ts
+// packages/adapters/_shared/src/unified-diff.ts
+
+/** Context lines emitted around each change block. Matches git's default. */
+export const DEFAULT_CONTEXT_LINES = 3;
+
+/** One changed file's inputs for unified-diff rendering. */
+export type DiffFile = {
+  /** Repo-relative path WITHOUT leading slash, e.g. "src/foo.ts". */
+  readonly path: string;
+  /** Full old-side content. Empty string for an added file. */
+  readonly oldContent: string;
+  /** Full new-side content. Empty string for a deleted file. */
+  readonly newContent: string;
+  /** Change classification — drives the header lines emitted. */
+  readonly changeType: "add" | "edit" | "delete" | "rename";
+  /** Old path when changeType === "rename"; otherwise omitted. */
+  readonly oldPath?: string;
+  /** When true, emit the binary stub line and ignore content. */
+  readonly isBinary: boolean;
+};
+
+/**
+ * Renders one file's unified-diff section (the `diff --git` header plus
+ * hunks, or the binary stub). Pure and total. Never throws.
+ */
+export const renderFileDiff = (
+  file: DiffFile,
+  contextLines?: number,
+): string;
+
+/**
+ * Concatenates per-file sections into a single unified-diff document.
+ * Pure and total. The order of `files` is preserved.
+ */
+export const renderUnifiedDiff = (
+  files: readonly DiffFile[],
+  contextLines?: number,
+): string;
+```
+
+##### Per-file output shape (git-compatible)
+
+Header (always, so the ADR-15 `looksLikeUnifiedDiff` sniff passes — it
+matches `^diff --git ` or `^--- `):
+```
+diff --git a/<oldPath|path> b/<path>
+```
+Plus mode/index lines are **omitted** (not available from the change API and
+not needed for the quiz). Then, by change type:
+- `add`:    `--- /dev/null` / `+++ b/<path>`
+- `delete`: `--- a/<path>`   / `+++ /dev/null`
+- `edit`:   `--- a/<path>`   / `+++ b/<path>`
+- `rename`: `--- a/<oldPath>`/ `+++ b/<path>` (content hunks follow if
+  content also changed; pure rename with identical content emits header
+  only — no hunks).
+- `isBinary` (any type): emit exactly
+  `Binary files a/<oldPath|path> and b/<path> differ` and **no hunks**.
+
+Hunks: each hunk header is `@@ -<oldStart>,<oldLen> +<newStart>,<newLen> @@`
+computed from the LCS alignment, with `DEFAULT_CONTEXT_LINES` of unchanged
+context on each side, adjacent change blocks within `2 × context` merged into
+one hunk (git's coalescing rule). Single-line ranges may omit the `,<len>`
+per git convention, but emitting the explicit `,1` is also accepted (the
+sniff and the LLM tolerate both); the dev picks one and tests it.
+`oldStart`/`newStart` are **1-based**; a zero-length side uses start `0`
+(e.g. a pure addition hunk `@@ -0,0 +1,5 @@`).
+
+The helper's correctness is the load-bearing risk; §Test strategy mandates
+fixture-based golden tests including add / delete / edit / rename / binary /
+no-trailing-newline / empty-file / multi-hunk cases.
+
+#### 3 — 2 MiB cap — incremental, short-circuit mid-chain
+
+The cap is `config.maxBytes` (default `2 * 1024 * 1024`, already in
+`AdoAdapterConfig`). It is applied **incrementally as the diff string
+accumulates**, never "fetch everything then measure":
+
+1. Maintain a running `accumulatedBytes` (a `Ref<number>` or fold
+   accumulator) as each file's rendered section is appended.
+2. **Check point**: immediately after `renderFileDiff` for file *i*, add
+   `Buffer.byteLength(section, "utf8")` to the running total. If the total
+   `> maxBytes`, short-circuit the remaining `flatMap` chain with
+   `malformed-response { detail: "diff-too-large: <accumulatedBytes>" }` —
+   matching ADR-15's variant exactly. No further blobs are fetched.
+
+`VCSProviderError` has **no `payload-too-large` variant** (verified against
+`core/src/ports/vcs-provider.ts`); ADR-15 already uses
+`malformed-response { detail: "diff-too-large: <n>" }` for the github size
+ceiling, so ADO reuses the same shape for consistency. (#92's wording
+"payload-too-large" is corrected to this existing variant in the issue.)
+
+#### 4 — Per-file failure — all-or-nothing `transport` error
+
+If any leg fails — iterations list, changes list, or **any single blob
+fetch** mid-chain — `fetchDiff` fails the **whole** operation. No partial
+diff is ever returned. Returning a partial diff would let a reviewer pass the
+quiz on an incomplete change, which violates the gate's integrity (CLAUDE.md
+§Key differentiator).
+
+Mapping: HTTP failures flow through the existing `mapHttpError` →
+`transport { status?, detail }`. The blob read body failure (non-HTTP, e.g.
+`response.text()` rejects) maps to
+`transport { detail: "failed to read blob body: …" }` (mirrors ADR-15 step 2).
+Because the chain is composed with `flatMap` (§6), the first `Err` aborts the
+rest automatically — no in-flight blob fetches are even issued after a
+failure.
+
+#### 5 — Binary / large-file handling — detect from metadata, emit stub, no download
+
+ADO change items carry content metadata we can inspect **without** fetching
+the blob. Detection signal, in priority order:
+
+1. `item.contentMetadata.isBinary === true` when present (documented on
+   `GitItem`).  // ASSUMPTION (ADR-34, unverified against live ADO): the
+   iteration-changes payload includes `contentMetadata`; if it does not, the
+   adapter falls back to signal 2.
+2. Heuristic fallback: a NUL byte (` `) in the fetched new-side content
+   within the first 8 KiB. This requires the content to have been fetched, so
+   it is a *defence-in-depth* check inside `renderFileDiff`'s caller, not the
+   primary signal. When triggered, the already-fetched content is discarded
+   and the binary stub is emitted.
+3. Extension allowlist is **not** used (too brittle).
+
+For a file detected binary via signal 1, the adapter **does not issue the
+blob calls** and emits `Binary files a/<path> and b/<path> differ` directly.
+This is git's convention and keeps binary blobs out of the LLM prompt and out
+of the 2 MiB budget (the stub line's bytes still count toward the cap).
+
+Because we cannot validate signal 1 against a live org, the synthetic fixture
+set includes a `contentMetadata.isBinary: true` entry, and the source marks
+the field read as an unverified assumption. If live validation later shows
+the field is absent on the changes endpoint, only the `isBinary` extraction
+in `changes.ts` changes — the generator and orchestration are unaffected.
+
+#### 6 — Cancellation — one composed cancellable `IO` (ADR-33)
+
+The entire chain is a **single** `IO<VCSProviderError, Diff>` built by
+`flatMap`-composing every leg. It is returned from `fetchDiff` and run by the
+host dispatcher's forked fiber (ADR-33). There is **no** intermediate
+`unsafeRun()` inside the orchestration body.
+
+Per the ADR-33 audit rule:
+- Every HTTP leg is `client.get(...)` from `monadyssey-fetch`, which is
+  `IO.cancellable` internally (passes the fiber's `AbortSignal` into
+  `fetch`). An in-flight blob fetch is therefore **aborted** on
+  `fiber.cancel()`, not merely skipped on the next frame.
+- The only `IO.lift` uses are the **synchronous, instantaneous** steps:
+  `JSON.parse` of an already-read body, the pure `renderFileDiff` /
+  `renderUnifiedDiff` calls, and the `… as Diff` brand. These are structural-
+  cancellation-safe by construction (they complete in microseconds; the
+  cancel is observed at the next `flatMap` boundary).
+- `response.text()` reads (legs 2 & 3 bodies) follow ADR-15's pattern:
+  `IO.lift(() => response.text(), …)`. Per the ADR-33 github audit note, the
+  Fetch body stream honours the original `AbortSignal`, so this is acceptable;
+  the dev adds the same focused cancellation test ADR-33 mandates (assert that
+  cancelling mid-chain aborts the in-flight `get` and the final `Diff` is
+  never produced).
+
+Sequencing detail: legs are chained with `flatMap`; the per-file blob pairs
+are sequenced (not raced) so the incremental cap (§3) and all-or-nothing
+failure (§4) are deterministic. v1 does **not** parallelise blob fetches —
+sequential keeps cap accounting and cancellation reasoning simple. (A future
+ADR may bound-concurrency this if latency demands it.)
+
+#### 7 — Diff-only invariant — exact endpoint allowlist (BINDING #2)
+
+The adapter calls **only** these three endpoint families, in this order:
+
+1. `…/pullRequests/{id}/iterations` (leg 1)
+2. `…/pullRequests/{id}/iterations/{iterId}/changes` (leg 2)
+3. `…/repositories/{repo}/blobs/{objectId}` (leg 3, repeated per blob)
+
+**Forbidden — never reached on any path**: `…/threads`, `…/comments`,
+`…/workitems`, `…/reviewers`, `…/votes`, `…/policy*`, the PR root
+`…/pullRequests/{id}` (which carries description/title), and
+`…/diffs/commits`. No PR description, title, commit message, or comment text
+ever enters the orchestration — the only PR-derived input to the eventual LLM
+prompt is the constructed diff.
+
+The **BINDING #2 test** asserts the **exact recorded call list** against this
+allowlist (an allowlist match, not merely "forbidden endpoint absent"): every
+recorded `.get()` URI must match one of the three families above, and the
+first two must each appear exactly once. This upgrades the github-style
+"no forbidden endpoint" assertion to a positive allowlist per #92's AC.
+
+#### Affected workspaces
+
+`packages/adapters/ado/` (orchestration + tests) and
+`packages/adapters/_shared/` (new pure `unified-diff.ts` + tests). Dependency
+direction respected:
+
+```
+protocol  ←  core  ←  adapters  ←  host
+```
+
+- `adapters/_shared`: gains `unified-diff.ts`, exported from its `index.ts`.
+  No new dep (pure helper). `_shared` keeps importing only `core`/`protocol`/
+  `monadyssey`/`zod`.
+- `adapters/ado`: gains a `@lgtm-buzzer/adapter-shared` dependency (new in its
+  `package.json`), plus orchestration modules. No new third-party dep.
+- `core`, `protocol`, `host`, `extension`: **unchanged**. The `VCSProvider`
+  port and `Diff`/`VCSProviderError` types are byte-for-byte identical.
+
+#### Types
+
+All in `adapters/_shared` (`DiffFile`, plus the `renderFileDiff` /
+`renderUnifiedDiff` signatures above) and `adapters/ado` (zod schemas for the
+two JSON responses — required by CLAUDE.md idiom #7, JSON.parse output is
+untrusted):
+
+```ts
+// packages/adapters/ado/src/schemas.ts  (NEW)
+import { z } from "zod";
+
+export const AdoIterationSchema = z.object({ id: z.number() });
+export const AdoIterationsResponseSchema = z.object({
+  value: z.array(AdoIterationSchema),
+  count: z.number().optional(),
+});
+
+export const AdoChangeItemSchema = z.object({
+  path: z.string().optional(),
+  objectId: z.string().optional(),
+  originalObjectId: z.string().optional(),
+  gitObjectType: z.string().optional(),
+  isFolder: z.boolean().optional(),
+  contentMetadata: z.object({ isBinary: z.boolean().optional() }).optional(),
+});
+export const AdoChangeEntrySchema = z.object({
+  changeType: z.string(),
+  item: AdoChangeItemSchema,
+  originalPath: z.string().optional(), // present on renames
+});
+export const AdoChangesResponseSchema = z.object({
+  changeEntries: z.array(AdoChangeEntrySchema),
+});
+
+export type AdoChangesResponse = z.infer<typeof AdoChangesResponseSchema>;
+export type AdoIterationsResponse = z.infer<typeof AdoIterationsResponseSchema>;
+```
+Each schema is `safeParse`d at its boundary; a parse failure →
+`malformed-response { detail: "ado-bad-<iterations|changes>-response", raw }`
+(`raw` clipped to 8 KiB via `_shared`'s `clipRaw`).
+
+#### Functions and methods
+
+```ts
+// packages/adapters/ado/src/url.ts  (extend)
+export const buildIterationsUrl: (baseUrl: string, pr: AdoPR) => string; // existing buildPullDiffUrl, renamed/aliased
+export const buildChangesUrl:    (baseUrl: string, pr: AdoPR, iterationId: number) => string;
+export const buildBlobUrl:       (baseUrl: string, pr: AdoPR, objectId: string) => string;
+
+// packages/adapters/ado/src/changes.ts  (NEW — pure mapping)
+/** Maps a validated changes response to the generator's DiffFile inputs (no I/O). */
+export const toDiffFiles: (res: AdoChangesResponse) => readonly PlannedFile[];
+// PlannedFile carries path, changeType, newObjectId?, oldObjectId?, isBinary, oldPath?
+
+// packages/adapters/ado/src/provider.ts  (replace stub body)
+const fetchDiff: (input: PRIdentifier) => IO<VCSProviderError, Diff>;
+// composes buildIterationsUrl → pickLatestIteration → buildChangesUrl →
+// toDiffFiles → (per file) buildBlobUrl×2 → renderFileDiff (incremental cap)
+// → renderUnifiedDiff → brand as Diff, all via flatMap.
+```
+`AdoPR` = `Extract<PRIdentifier, { kind: "ado" }>`. `buildPullDiffUrl` is kept
+as an alias of `buildIterationsUrl` for backward-compat with existing tests.
+
+#### Sequence
+
+1. Content script intercepts the ADO Vote/Approve button (ADR-21); SW routes
+   a `quiz-request` frame over native messaging.
+2. Host dispatcher (ADR-33) resolves the ADO `VCSProvider`, forks a fiber
+   running `vcs.fetchDiff(adoPR)` — the single composed `IO` of this ADR.
+3. **Leg 1**: `GET …/iterations` → zod-validate → pick max `id`.
+4. **Leg 2**: `GET …/iterations/{iterId}/changes?$compareTo=0` → zod-validate
+   → `toDiffFiles` → list of planned files.
+5. **Per file** (sequential `flatMap`): if `isBinary`, emit stub (no fetch);
+   else `GET …/blobs/{newObjectId}` and `…/blobs/{oldObjectId}` as needed →
+   `response.text()` → `renderFileDiff` → append to accumulator →
+   **incremental cap check** (§3); over budget → fail fast.
+6. `renderUnifiedDiff` joins sections; brand `as Diff`; `Ok(diff)`.
+7. Dispatcher feeds the `Diff` to `llm.generateQuiz` (diff is the only
+   PR-derived prompt input) and returns the quiz frame, exactly as today.
+8. If the user closes the modal mid-fetch, the SW sends
+   `quiz-cancel-request` (ADR-33); the host cancels the fiber; the in-flight
+   `get` aborts; no `Diff` is produced.
+
+#### Error cases (all `Err<VCSProviderError>`, never throw)
+
+- Wrong VCS (`kind !== "ado"`) → `transport { detail: "wrong-vcs" }`, no HTTP.
+- Any HTTP non-2xx (401/403/404/429/5xx) → `transport { status, detail }`
+  via `mapHttpError`. Network/TLS (status 0) → `transport { detail }`.
+- Empty `iterations.value` → `malformed-response { detail: "ado-no-iterations" }`.
+- iterations/changes body fails zod → `malformed-response
+  { detail: "ado-bad-iterations-response" | "ado-bad-changes-response", raw }`.
+- Blob `response.text()` read fails → `transport { detail: "failed to read
+  blob body: …" }`.
+- Accumulated diff `> maxBytes` → `malformed-response
+  { detail: "diff-too-large: <bytes>" }` (incremental, mid-chain).
+- Constructed diff fails `looksLikeUnifiedDiff` sniff (defence-in-depth, e.g.
+  all files binary → all stubs → still passes via `diff --git`/`---`; an empty
+  PR → empty string → legal) → `malformed-response { detail: "not-unified-diff",
+  raw }`. Reuses ADR-15's sniff helper (copy into ado or export from _shared).
+- PAT never appears in any `detail` / `raw` (reviewer-binding, tested).
+- Cancellation → `Cancelled` runtime outcome (ADR-10/ADR-33); **never**
+  manufactured into `Err<… cancelled>`.
+
+#### Test strategy
+
+**`_shared/src/unified-diff.test.ts`** (pure, golden-fixture, ≥12; ~95%
+coverage target on the helper):
+- add / delete / edit / rename / pure-rename(no content change) / binary
+  stub.
+- multi-hunk file (two distant change blocks → two hunks).
+- adjacent change blocks within `2×context` → coalesced single hunk.
+- no-trailing-newline → `\ No newline at end of file` marker.
+- empty old (add) → `@@ -0,0 +1,n @@`; empty new (delete) → `@@ -1,n +0,0 @@`.
+- empty-both / identical content → header only, no hunks.
+- `renderUnifiedDiff` preserves file order and concatenates sections.
+- every rendered non-empty output satisfies ADR-15's `looksLikeUnifiedDiff`.
+
+**`ado/src/changes.test.ts`** (pure): `toDiffFiles` maps each `changeType`
+correctly, extracts `isBinary` from `contentMetadata`, handles renames
+(`originalPath` → `oldPath`), and zeroes object ids → empty-side.
+
+**`ado/src/url.test.ts`** (extend): `buildChangesUrl`, `buildBlobUrl`
+encoding + `api-version=7.1` + `$compareTo=0`.
+
+**`ado/src/provider.test.ts`** with a fake `HttpClient` recording the call
+list (≥10):
+1. Happy multi-file path → `Ok(Diff)`; assert the diff contains a changed
+   file's content and a `@@` hunk header.
+2. **BINDING #2 — exact allowlist**: recorded `.get()` URIs match ONLY
+   iterations / changes / blobs; iterations + changes each exactly once; no
+   threads/comments/workitems/reviewers/votes/policy/PR-root/diffs-commits.
+3. **No token in error payload** on a simulated 401 across the multi-call
+   paths.
+4. 404/401/429/5xx on each leg → `transport { status }`.
+5. Network failure (status 0) → `transport` without status.
+6. Empty iterations → `malformed-response { detail: "ado-no-iterations" }`.
+7. **2 MiB cap**: oversize blob contents → `malformed-response
+   { detail: "diff-too-large: <bytes>" }`, and assert the chain
+   **short-circuits** (no blob fetch beyond the file that tips the budget).
+8. **Per-file failure**: blob #2 of file #2 returns 500 → whole `fetchDiff`
+   fails `transport`; assert NO partial diff and that later files' blobs are
+   never fetched.
+9. Binary file (`contentMetadata.isBinary`) → stub line, and assert its
+   blob URLs are NOT in the recorded call list.
+10. Wrong-VCS guard (no HTTP); `provider.id === "ado"`.
+11. **Cancellation** (ADR-33): cancel mid-chain → the in-flight `get` is
+    aborted and no `Diff` is produced (`Cancelled`, not `Err`).
+
+**`ado/src/contract.test.ts`** (httptape replaying **synthetic** fixtures —
+not recorded): the 5 currently-skipped tests are rewritten to the implemented
+behaviour: happy path returns `Ok` with a unified diff, 404 → `transport`,
+`provider.id === "ado"`, wrong-VCS guard, token-not-in-errors. The fixture
+directory is hand-authored from the documented 7.1 shapes; the
+`ado-multi-call-not-yet-implemented` assertion is deleted.
+
+Coverage: 80% on the adapter; ≥95% on `unified-diff.ts`.
+
+### Consequences
+
+- ADO becomes a real `VCSProvider`, second after github, completing M3's ADO
+  line — but explicitly **pending live-instance validation** (see constraint).
+  The README's "Pending live validation" section enumerates every unverified
+  field assumption so the first live run is a focused checklist, not a
+  rediscovery.
+- A reusable, dependency-free unified-diff generator lands in `_shared`,
+  available to any future content-based VCS adapter (GitLab, ADO Server,
+  Bitbucket) that lacks a server-rendered diff endpoint.
+- **No new third-party runtime dependency** anywhere; no dep ADR needed. The
+  ADO adapter gains an intra-monorepo dep on `@lgtm-buzzer/adapter-shared`.
+- More HTTP round-trips than github (one per blob). The 2 MiB incremental cap
+  bounds worst-case work; sequential fetching keeps cap + cancellation simple
+  at a latency cost we accept for v1.
+- **Diff-only integrity strengthened**: the positive allowlist test (BINDING
+  #2) is stricter than github's "no forbidden endpoint" check — it pins the
+  exact call set, closing the door on a future refactor silently adding a
+  PR-description fetch.
+- **Reviewer-binding**: (a) exact endpoint allowlist (test #2); (b) no token
+  in detail/raw across multi-call paths (test #3); (c) all-or-nothing failure,
+  no partial diff (test #8); (d) incremental 2 MiB cap short-circuits
+  (test #7); (e) binary stub without blob fetch (test #9); (f) cancellation
+  aborts in-flight `get`, never manufactured into `Err` (test #11); (g) every
+  JSON boundary zod-validated (CLAUDE.md idiom #7); (h) the unified-diff
+  generator's golden fixtures match git's hunk format.
+- **Risk acknowledged**: the unified-diff generator's hunk-header math and the
+  `contentMetadata.isBinary` field name are the two correctness hotspots. The
+  former is covered by golden tests; the latter is an unverified assumption
+  isolated to `changes.ts` so a live-validation fix is a one-file change.
+
+---
