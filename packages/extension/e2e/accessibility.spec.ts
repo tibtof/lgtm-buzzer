@@ -14,6 +14,19 @@ import { PRPage } from "./pages/pr-page.js";
 import { QuizModal } from "./pages/quiz-modal.js";
 
 test("focus trap: Tab wraps through focusable elements in the panel", async () => {
+  // This test verifies the wrap invariant of the focus trap:
+  //   - Tab from the last focusable element wraps focus back to the first.
+  //   - Shift+Tab from the first focusable element wraps focus to the last.
+  //
+  // Approach: press Tab exactly `focusableCount` times — one full cycle —
+  // waiting for focus to settle inside the shadow root after each press before
+  // firing the next one. This eliminates the race where a rapid back-to-back
+  // Tab press fires before the trap's synchronous keydown handler has re-homed
+  // focus, which caused the previous implementation to flake intermittently
+  // under xvfb/headless Chrome. We only check the end-state of the cycle
+  // (focus returns to the first element), so a single shadow-root poll per
+  // press is sufficient and timing-stable.
+
   const { context, cleanup } = await launchExtensionContext({
     scenario: { kind: "happy", quiz: CANONICAL_QUIZ, correctAnswers: CANONICAL_CORRECT },
   });
@@ -30,35 +43,44 @@ test("focus trap: Tab wraps through focusable elements in the panel", async () =
     const pr = new PRPage(page, "github");
     const modal = new QuizModal(page);
 
-    // Open modal and wait for ready state.
+    // Open modal and wait for ready state (progress indicator is present).
     await pr.clickApprove();
     await modal.waitForOpen();
     await page.waitForSelector(
       "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-progress']",
     );
 
-    // Focus the panel by clicking the Cancel button (a known focusable element).
-    await page.click(
-      "css=[data-testid='lgtm-buzzer-quiz-modal'] >> css=[data-testid='lgtm-buzzer-quiz-cancel']",
-    );
+    // The focus trap activates automatically when the modal enters ready state
+    // and moves focus to the first focusable element (index 0 in the panel).
+    // Wait for focus to be inside the shadow panel before proceeding.
+    await modal.waitForFocusInPanel();
 
-    // Pressing Tab multiple times should cycle focus within the shadow DOM panel.
-    // We cannot easily read the shadowRoot focused element from outside, so we
-    // assert that pressing Tab many times does NOT throw and does NOT move focus
-    // outside the modal (body should not receive focus).
-    for (let i = 0; i < 6; i++) {
-      await page.keyboard.press("Tab");
+    // Discover the actual Tab-stop cycle by pressing Tab until focus returns to
+    // index 0. We use focusable-list indices as stable element identifiers.
+    // Radio inputs in the same group share one Tab stop (Tab skips the rest of
+    // the group), so the number of real Tab stops can be fewer than the
+    // selector count. Discovering the cycle length is more robust than
+    // hard-coding it.
+    const visited: number[] = [0];
+    let currentIndex = 0;
+    for (let i = 0; i < 20; i++) {
+      // Safety cap: a modal with more than 20 Tab stops is pathological.
+      currentIndex = await modal.pressTabSettled({ currentIndex });
+      if (currentIndex === 0) break;
+      visited.push(currentIndex);
     }
+    // The cycle must have wrapped: the last pressTabSettled returned index 0.
+    expect(currentIndex).toBe(0);
+    // There must be at least one Tab stop beyond the starting element.
+    expect(visited.length).toBeGreaterThan(1);
 
-    // The modal should still be in the DOM (focus trap prevented accidental close).
-    // The host element has no visible bounding box (shadow root has fixed positioning),
-    // so we check attachment via waitForSelector with state: "attached".
-    await modal.waitForOpen();
-    // Also verify via DOM evaluate that the host is present.
-    const attached = await page.evaluate(() =>
-      document.querySelector("[data-testid='lgtm-buzzer-quiz-modal']") !== null,
-    );
-    expect(attached).toBe(true);
+    // Verify the Shift+Tab wrap from index 0: one Shift+Tab from the first
+    // element must wrap to the last element in the Tab-stop cycle.
+    // "Last" is the element that precedes index 0 in the cycle (i.e., the
+    // element that Tab-wrap landed on last).
+    const lastTabStop = visited[visited.length - 1]!;
+    const shiftIdx = await modal.pressTabSettled({ shift: true, currentIndex: 0 });
+    expect(shiftIdx).toBe(lastTabStop);
   } finally {
     await cleanup();
   }

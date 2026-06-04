@@ -355,6 +355,10 @@ export class QuizModal {
    *
    * Used to walk the focus trap in accessibility tests.
    *
+   * NOTE: presses are fired back-to-back without an inter-press settle. For
+   * focus-trap cycle assertions — where the trap's keydown handler must
+   * re-home focus before the next press — prefer `pressTabSettled` instead.
+   *
    * @param count - Number of Tab presses.
    * @param opts.shift - If true, use Shift+Tab.
    */
@@ -376,6 +380,135 @@ export class QuizModal {
       const testid = el.getAttribute("data-testid");
       if (testid !== null) return testid;
       return (el.textContent ?? "").trim() || null;
+    });
+  }
+
+  /**
+   * Presses Tab (or Shift+Tab) once and waits for focus inside the modal's
+   * shadow panel to settle on an element at a **different index** in the
+   * focusable list before returning that index.
+   *
+   * This method is the stable alternative to rapid back-to-back
+   * `page.keyboard.press("Tab")` calls: the focus-trap's `keydown` handler
+   * runs synchronously in the browser but the Playwright CDP round-trip means
+   * a subsequent press can fire before the handler re-homes focus, producing
+   * a transient wrong `activeElement`. Waiting for focus to settle after each
+   * press eliminates that race.
+   *
+   * Using the focusable-list **index** (rather than `data-testid` or text)
+   * as the stable identifier avoids ambiguity with radio inputs and other
+   * elements that carry neither a testid nor meaningful textContent.
+   *
+   * @param opts.shift - If true, use Shift+Tab.
+   * @param opts.currentIndex - Index of the element focus is on **before**
+   *   the press, within the shadow panel's focusable list. Pass `-1` when
+   *   focus is not yet inside the panel.
+   * @returns The index of the newly-focused element in the focusable list,
+   *   or `-1` if focus left the panel.
+   */
+  async pressTabSettled(opts?: {
+    readonly shift?: boolean;
+    readonly currentIndex?: number;
+  }): Promise<number> {
+    const key = opts?.shift === true ? "Shift+Tab" : "Tab";
+    const previousIndex = opts?.currentIndex ?? -1;
+
+    await this.page.keyboard.press(key);
+
+    // Mirror the FOCUSABLE_SELECTOR from focus-trap.ts.
+    const FOCUSABLE_SELECTOR = [
+      "a[href]",
+      "button:not([disabled])",
+      "input:not([disabled])",
+      "select:not([disabled])",
+      "textarea:not([disabled])",
+      "[tabindex]:not([tabindex='-1'])",
+    ].join(",");
+
+    // Poll until focus inside the shadow panel moves to a different index.
+    // The focus-trap handler re-homes focus synchronously inside the browser,
+    // but the CDP round-trip means we must observe that mutation via evaluate.
+    //
+    // IMPORTANT: we return `idx + 1` (never 0) so that index 0 does not
+    // produce a falsy value — `waitForFunction` only stops polling when the
+    // callback returns a truthy value, and `0` would keep it spinning.
+    const result = await this.page.waitForFunction(
+      ([prevIdx, sel]: [number, string]) => {
+        const host = document.querySelector(
+          "[data-testid='lgtm-buzzer-quiz-modal']",
+        );
+        if (host === null) return null;
+        const shadow = host.shadowRoot;
+        if (shadow === null) return null;
+        const panel =
+          (shadow.querySelector(".panel") as HTMLElement | null) ?? shadow;
+        const focusable = Array.from(
+          panel.querySelectorAll<HTMLElement>(sel),
+        );
+        const focused = shadow.activeElement as HTMLElement | null;
+        if (focused === null) return null;
+        const idx = focusable.indexOf(focused);
+        // Keep polling until focus has settled on a different slot.
+        if (idx === -1) return null;
+        if (idx === prevIdx) return null;
+        // Return idx + 1 so that index 0 is encoded as 1 (truthy).
+        return idx + 1;
+      },
+      [previousIndex, FOCUSABLE_SELECTOR] as [number, string],
+      { timeout: 2_000 },
+    );
+
+    // Decode: subtract 1 from the encoded value.
+    const encoded = await result.jsonValue();
+    return encoded !== null ? encoded - 1 : -1;
+  }
+
+  /**
+   * Waits until the focus trap has placed focus on an element inside the modal
+   * shadow panel. Used after a state transition (e.g., modal open in `ready`
+   * state) to ensure the trap has fired before Tab presses begin.
+   */
+  async waitForFocusInPanel(timeout = 3_000): Promise<void> {
+    await this.page.waitForFunction(
+      () => {
+        const host = document.querySelector(
+          "[data-testid='lgtm-buzzer-quiz-modal']",
+        );
+        if (host === null) return false;
+        const shadow = host.shadowRoot;
+        if (shadow === null) return false;
+        return shadow.activeElement !== null;
+      },
+      undefined,
+      { timeout },
+    );
+  }
+
+  /**
+   * Returns the count of focusable elements inside the modal shadow panel.
+   *
+   * Mirrors the FOCUSABLE_SELECTOR from `focus-trap.ts` so the test can
+   * determine how many Tab presses complete one full cycle.
+   */
+  async focusableCount(): Promise<number> {
+    return this.page.evaluate(() => {
+      const FOCUSABLE_SELECTOR = [
+        "a[href]",
+        "button:not([disabled])",
+        "input:not([disabled])",
+        "select:not([disabled])",
+        "textarea:not([disabled])",
+        "[tabindex]:not([tabindex='-1'])",
+      ].join(",");
+      const host = document.querySelector(
+        "[data-testid='lgtm-buzzer-quiz-modal']",
+      );
+      if (host === null) return 0;
+      const shadow = host.shadowRoot;
+      if (shadow === null) return 0;
+      const panel =
+        (shadow.querySelector(".panel") as HTMLElement | null) ?? shadow;
+      return panel.querySelectorAll(FOCUSABLE_SELECTOR).length;
     });
   }
 
