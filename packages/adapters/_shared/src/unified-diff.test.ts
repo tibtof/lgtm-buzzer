@@ -309,6 +309,84 @@ describe("renderFileDiff — context-line correctness", () => {
   });
 });
 
+describe("renderFileDiff — hunk-start line numbers (regression #92)", () => {
+  // Reviewer-identified bug: start line was emitted as 0 when the hunk began
+  // with a deletion (wrong newStart) or insertion (wrong oldStart). The fix
+  // scans forward to find the first position each side contributes.
+
+  it("delete first line of 5-line file → @@ -1,4 +1,3 @@ (not +0,3)", () => {
+    // git diff: @@ -1,4 +1,3 @@
+    const f = file({
+      path: "del-first.ts",
+      changeType: "edit",
+      oldContent: "line1\nline2\nline3\nline4\nline5\n",
+      newContent: "line2\nline3\nline4\nline5\n",
+    });
+    const result = renderFileDiff(f);
+    expect(result).toContain("@@ -1,4 +1,3 @@");
+  });
+
+  it("change at line 1 of 8-line file → @@ -1,4 +1,4 @@ (not -1,4 +0,4)", () => {
+    // git diff: @@ -1,4 +1,4 @@
+    const f = file({
+      path: "chg-first.ts",
+      changeType: "edit",
+      oldContent: "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n",
+      newContent: "LINE1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n",
+    });
+    const result = renderFileDiff(f);
+    expect(result).toContain("@@ -1,4 +1,4 @@");
+  });
+
+  it("insert a line at top of 5-line file → @@ -1,3 +1,4 @@ (not -0,3)", () => {
+    // git diff: @@ -1,3 +1,4 @@
+    const f = file({
+      path: "ins-top.ts",
+      changeType: "edit",
+      oldContent: "line1\nline2\nline3\nline4\nline5\n",
+      newContent: "NEW_LINE\nline1\nline2\nline3\nline4\nline5\n",
+    });
+    const result = renderFileDiff(f);
+    expect(result).toContain("@@ -1,3 +1,4 @@");
+  });
+
+  it("pure new file still emits @@ -0,0 +1,N @@ (0 is correct here)", () => {
+    // git diff: @@ -0,0 +1,3 @@  — 0 is correct because old side has no lines
+    const f = file({
+      path: "new-file.ts",
+      changeType: "add",
+      oldContent: "",
+      newContent: "a\nb\nc\n",
+    });
+    const result = renderFileDiff(f);
+    expect(result).toContain("@@ -0,0 +1,3 @@");
+  });
+
+  it("pure deleted file still emits @@ -1,N +0,0 @@ (0 is correct here)", () => {
+    // git diff: @@ -1,3 +0,0 @@  — 0 is correct because new side has no lines
+    const f = file({
+      path: "del-file.ts",
+      changeType: "delete",
+      oldContent: "a\nb\nc\n",
+      newContent: "",
+    });
+    const result = renderFileDiff(f);
+    expect(result).toContain("@@ -1,3 +0,0 @@");
+  });
+
+  it("delete lines 3-4 of 6-line file → @@ -1,6 +1,4 @@", () => {
+    // git diff: @@ -1,6 +1,4 @@  — context from line 1 covers the whole file
+    const f = file({
+      path: "del-mid.ts",
+      changeType: "edit",
+      oldContent: "line1\nline2\nline3\nline4\nline5\nline6\n",
+      newContent: "line1\nline2\nline5\nline6\n",
+    });
+    const result = renderFileDiff(f);
+    expect(result).toContain("@@ -1,6 +1,4 @@");
+  });
+});
+
 describe("renderUnifiedDiff", () => {
   it("returns empty string for zero files", () => {
     expect(renderUnifiedDiff([])).toBe("");

@@ -196,21 +196,26 @@ const buildHunks = (ops: readonly EditOp[], contextLines: number): Hunk[] => {
   const hunks: Hunk[] = [];
   for (const win of windows) {
     const lines: string[] = [];
-    let hunkOldStart = 0;
-    let hunkNewStart = 0;
     let hunkOldLen = 0;
     let hunkNewLen = 0;
 
+    // Derive start line numbers by scanning for the first position in the
+    // window that contributes to each side. A position contributes to the old
+    // side when oldLine > 0 (context or delete), and to the new side when
+    // newLine > 0 (context or insert). Per git's rule: start is 0 only when
+    // the hunk has zero lines on that side (pure-add → old 0,0; pure-delete →
+    // new 0,0). Whenever at least one line exists on a side, start ≥ 1.
+    let hunkOldStart = 0;
+    let hunkNewStart = 0;
+    for (let i = win.start; i <= win.end; i++) {
+      const pos = positions[i]!;
+      if (hunkOldStart === 0 && pos.oldLine > 0) hunkOldStart = pos.oldLine;
+      if (hunkNewStart === 0 && pos.newLine > 0) hunkNewStart = pos.newLine;
+      if (hunkOldStart > 0 && hunkNewStart > 0) break;
+    }
+
     for (let i = win.start; i <= win.end; i++) {
       const op = ops[i]!;
-      const pos = positions[i]!;
-
-      if (i === win.start) {
-        // Record the start line numbers for the hunk header.
-        // For a pure addition at the very start (old side empty), oldStart=0.
-        hunkOldStart = pos.oldLine > 0 ? pos.oldLine : (pos.newLine > 0 ? 0 : 1);
-        hunkNewStart = pos.newLine > 0 ? pos.newLine : (pos.oldLine > 0 ? 0 : 1);
-      }
 
       switch (op.kind) {
         case "context":
