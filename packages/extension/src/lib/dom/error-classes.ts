@@ -49,7 +49,9 @@ export type DisplayErrorClass =
   | { readonly kind: "unknown-quiz-id" }
   | { readonly kind: "unsupported-llm-adapter" }
   | { readonly kind: "unsupported-vcs-adapter" }
-  | { readonly kind: "missing-credentials" };
+  | { readonly kind: "missing-credentials" }
+  // ADR-33: emitted when a quiz-request fiber was cancelled by the user (Esc).
+  | { readonly kind: "cancelled" };
 
 /** The action a CTA button performs. */
 export type ErrorCTAAction =
@@ -245,6 +247,15 @@ export const errorClassToUI = (cls: DisplayErrorClass): ErrorUISpec => {
         title: "Credentials required",
         body: "This adapter needs credentials. Add them in extension options.",
         cta: { label: "Open options", action: { kind: "open-options" } },
+      };
+
+    case "cancelled":
+      // ADR-33: quiz was cancelled by the user (Esc). The modal is already
+      // closed when this error arrives, so this copy is rarely shown.
+      return {
+        title: "Quiz cancelled",
+        body: "The quiz generation was cancelled.",
+        cta: { label: "Try again", action: { kind: "retry" } },
       };
   }
 };

@@ -641,7 +641,40 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
   // Quiz-cancel handler (modal → CS)
   // ---------------------------------------------------------------------------
 
+  /**
+   * Send a one-way `quiz-cancel-request` to the SW so the host can abort the
+   * in-flight fiber (ADR-33).
+   *
+   * Fire-and-forget: no reply is awaited. If the sendMessage call rejects, the
+   * error is swallowed — the modal is already closed and the worst case is one
+   * wasted LLM call on the host.
+   */
+  const sendCancelToSW = (cancelCorrelationId: string): void => {
+    const cancelFrame: Frame = {
+      v: 1,
+      kind: "quiz-cancel-request",
+      correlationId: cancelCorrelationId,
+      payload: { correlationId: cancelCorrelationId },
+    };
+    try {
+      void sendFrame(cancelFrame);
+    } catch {
+      // Swallow — cancel is best-effort.
+    }
+  };
+
   const onQuizCancel = (detail: { requestId: string }): void => {
+    // ADR-33: find the in-flight correlationId for this requestId BEFORE
+    // draining the map, so we can forward the cancel to the host.
+    let inFlightCid: string | undefined;
+    for (const [cid, rid] of correlationToRequest) {
+      if (rid === detail.requestId) {
+        inFlightCid = cid;
+        break;
+      }
+    }
+
+    // Drop local pending state (existing behaviour).
     dropPending(detail.requestId);
     generationStartTimes.delete(detail.requestId);
     // ADR-32: drain any correlationId → requestId entries for this requestId.
@@ -650,7 +683,13 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
         correlationToRequest.delete(corrId);
       }
     }
-    // SW's 180s timeout cleans the host side (ADR-18 §Decision 5 / ADR-30).
+
+    // ADR-33: signal the host to abort the running fiber.
+    if (inFlightCid !== undefined) {
+      sendCancelToSW(inFlightCid);
+    }
+    // SW's 180s timeout also cleans the host side for backward compat
+    // (ADR-18 §Decision 5 / ADR-30).
   };
 
   // ---------------------------------------------------------------------------

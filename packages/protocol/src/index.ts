@@ -127,4 +127,11 @@ export {
   type QuizProgressFrame,
 } from "./messages/quiz-progress.js";
 
+export {
+  QuizCancelRequestPayloadSchema,
+  QuizCancelRequestFrameSchema,
+  type QuizCancelRequestPayload,
+  type QuizCancelRequestFrame,
+} from "./messages/quiz-cancel-request.js";
+
 export { parseFrame } from "./parse.js";

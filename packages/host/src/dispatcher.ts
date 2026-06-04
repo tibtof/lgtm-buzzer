@@ -1,4 +1,5 @@
 import { IO } from "monadyssey";
+import type { Fiber } from "monadyssey";
 import type {
   LLMProvider,
   VCSProvider,
@@ -56,6 +57,25 @@ export type DispatcherDeps = {
   readonly progress?: ProgressEmitter;
 };
 
+/**
+ * Internal error union for the composed quiz pipeline (ADR-33).
+ *
+ * Every port error variant is widened into this union via `.mapErr` so the
+ * composed `IO` has a single, flat error channel.
+ */
+type DispatcherError = RegistryError | VCSProviderError | LLMProviderError | WriteError;
+
+/**
+ * Per-request fiber registry, keyed by correlationId (ADR-33).
+ *
+ * Populated on quiz-request handler start; cleaned in the join `finally`.
+ * Used by `handleQuizCancelRequest` to look up the fiber and call
+ * `fiber.cancel()`.
+ *
+ * Module-private inside `createDispatcher` closure. Not exported.
+ */
+type FiberRegistry = Map<string, Fiber<DispatcherError, void>>;
+
 // ---------------------------------------------------------------------------
 // Internal: build wire error frame
 // ---------------------------------------------------------------------------
@@ -77,7 +97,8 @@ export const buildErrorFrame = (
     | "unknown-message"
     | "unsupported-llm-adapter"
     | "unsupported-vcs-adapter"
-    | "missing-credentials",
+    | "missing-credentials"
+    | "cancelled",
   message: string,
   correlationId: string | null,
   details?: unknown,
@@ -320,284 +341,6 @@ const handleCheckAuthRequest = (
 };
 
 // ---------------------------------------------------------------------------
-// quiz-request handler
-// ---------------------------------------------------------------------------
-
-/**
- * Handle a `quiz-request` frame.
- *
- * Sequence (ADR-16 §Sequence binding, updated by ADR-29):
- * 1. Resolve adapter IDs (defaults applied when absent).
- * 2. Build VCS + LLM providers via registry (resolves credentials from host env).
- * 3. Fetch diff from VCS adapter (IO).
- * 4. Generate quiz from LLM adapter (IO).
- * 5. `pickCorrectAnswers` + store answer key.
- * 6. Build `quiz-response` frame (no `correctChoiceId`).
- * 7. Write frame to extension.
- *
- * As of ADR-29, step 2 is IO-bearing (credential resolution). The
- * `credentials` parameter is REMOVED — credentials come from the host env.
- *
- * All IO work is forked into a per-request Fiber so it can be cancelled
- * independently. Cancellation → log at info, no wire frame.
- * Errors → typed `ErrorFrame` matching the failure kind.
- *
- * @param pr - The PR identifier from the quiz-request payload.
- * @param questionCount - Number of questions requested.
- * @param llmAdapterId - Requested LLM adapter ID (defaults to "claude-cli").
- * @param vcsAdapterId - Requested VCS adapter ID (defaults to "github").
- * @param correlationId - Frame correlation ID.
- * @param deps - Injected dependencies.
- * @returns `IO<never, void>` — the outer IO never fails.
- */
-const handleQuizRequest = (
-  pr: PRIdentifier,
-  questionCount: number,
-  questionPoolSize: number | undefined,
-  llmAdapterId: string,
-  vcsAdapterId: string,
-  correlationId: string | null,
-  deps: DispatcherDeps,
-): IO<never, void> => {
-  const { write, store, logger, registry, cache, progress } = deps;
-  const log = logger.child({ correlationId: correlationId ?? "", kind: "quiz-request" });
-
-  // Cross-field validation: poolSize must be >= questionCount when present.
-  if (questionPoolSize !== undefined && questionPoolSize < questionCount) {
-    log.warn("questionPoolSize < questionCount — rejecting", {
-      questionPoolSize,
-      questionCount,
-    });
-    const errFrame = buildErrorFrame(
-      "internal",
-      "questionPoolSize must be >= questionCount",
-      correlationId,
-    );
-    return safeWrite(write, errFrame, log);
-  }
-
-  type WorkError = RegistryError | VCSProviderError | LLMProviderError | WriteError;
-
-  // Step 1–7: resolve adapters, fetch diff, generate or cache quiz, write response.
-  const work: IO<WorkError, void> = registry
-    .buildVcs(vcsAdapterId)
-    .mapErr((e): WorkError => e)
-    .flatMap((vcs: VCSProvider): IO<WorkError, void> =>
-      registry
-        .buildLlm(llmAdapterId)
-        .mapErr((e): WorkError => e)
-        .flatMap((llm: LLMProvider): IO<WorkError, void> => {
-          // ADR-32: emit fetching-diff phase before calling vcs.fetchDiff.
-          return IO.lift<WorkError, void>(async () => {
-            await progress?.emit(correlationId, "fetching-diff");
-          }).flatMap((): IO<WorkError, void> =>
-            vcs
-              .fetchDiff(pr)
-              .mapErr((e): WorkError => e)
-              .flatMap((diff: Diff): IO<WorkError, void> => {
-                // Pool path (ADR-30): questionPoolSize present.
-                if (questionPoolSize !== undefined) {
-                  return IO.lift<WorkError, void>(async () => {
-                    const diffHash = hashDiff(diff);
-                    const prCanonical = canonicalisePR(pr);
-                    const poolKey = cache.buildKey({
-                      prKind: pr.kind,
-                      llmAdapterId: llm.id,
-                      prCanonical,
-                      diffHash,
-                    });
-
-                    const cachedPool = cache.get(poolKey);
-                    const cacheHit = cachedPool !== undefined;
-
-                    let activePool: Pool;
-                    if (!cacheHit) {
-                      // Cache miss — generate the full pool.
-                      log.info("Cache miss — generating question pool", {
-                        llmId: llm.id,
-                        poolSize: questionPoolSize,
-                      });
-
-                      // ADR-32: emit generating-quiz phase + start heartbeat.
-                      await progress?.emit(correlationId, "generating-quiz");
-                      const stopHeartbeat = progress?.startHeartbeat(correlationId, "generating-quiz") ?? (() => {});
-
-                      let poolResult;
-                      try {
-                        poolResult = await llm
-                          .generateQuiz({ diff, questionCount: questionPoolSize })
-                          .mapErr((e): WorkError => e)
-                          .unsafeRun();
-                      } finally {
-                        stopHeartbeat();
-                      }
-
-                      if (poolResult.type === "Err") {
-                        throw poolResult.error;
-                      }
-
-                      // ADR-32: emit parsing phase before quizToPool.
-                      await progress?.emit(correlationId, "parsing");
-
-                      activePool = quizToPool(poolResult.value, poolKey, llm.id);
-
-                      // ADR-32: emit caching phase before cache.put.
-                      await progress?.emit(correlationId, "caching");
-
-                      cache.put(activePool);
-                    } else {
-                      log.info("Cache hit — reusing question pool", {
-                        poolKey,
-                        poolSize: cachedPool.questions.length,
-                      });
-                      activePool = cachedPool;
-                    }
-
-                    const sampled = sampleFromPool(activePool.questions, questionCount);
-                    const sampleQuizId = crypto.randomUUID();
-
-                    const answerKey: Map<QuestionId, ChoiceId> = new Map(
-                      sampled.map((q) => [q.id, q.correctChoiceId]),
-                    );
-                    store.set(sampleQuizId as QuizId, answerKey);
-                    cache.putSampleMapping({
-                      sampleQuizId,
-                      poolKey,
-                      sampledQuestionIds: sampled.map((q) => q.id),
-                    });
-
-                    log.info("Quiz sampled from pool — answer key stored", {
-                      sampleQuizId,
-                      questionCount: sampled.length,
-                      cacheHit,
-                    });
-
-                    const responseFrame = buildPoolQuizResponseFrame(
-                      sampled,
-                      sampleQuizId,
-                      correlationId,
-                    );
-                    const writeResult = await write(responseFrame)
-                      .mapErr((e): WorkError => e)
-                      .unsafeRun();
-                    if (writeResult.type === "Err") {
-                      throw writeResult.error;
-                    }
-                  });
-                }
-
-                // Legacy path: no questionPoolSize, no pool, no cache.
-                log.info("Generating quiz", { llmId: llm.id, questionCount });
-
-                // ADR-32: emit generating-quiz + heartbeat on legacy path too.
-                return IO.lift<WorkError, void>(async () => {
-                  await progress?.emit(correlationId, "generating-quiz");
-                  const stopHeartbeat = progress?.startHeartbeat(correlationId, "generating-quiz") ?? (() => {});
-
-                  let quizResult;
-                  try {
-                    quizResult = await llm
-                      .generateQuiz({ diff, questionCount })
-                      .mapErr((e): WorkError => e)
-                      .unsafeRun();
-                  } finally {
-                    stopHeartbeat();
-                  }
-
-                  if (quizResult.type === "Err") {
-                    throw quizResult.error;
-                  }
-
-                  const quiz = quizResult.value;
-                  const answerKey = pickCorrectAnswers(quiz);
-                  store.set(quiz.id as QuizId, answerKey);
-                  log.info("Quiz generated — answer key stored", { quizId: quiz.id });
-
-                  const responseFrame = buildQuizResponseFrame(quiz, correlationId);
-                  const writeResult = await write(responseFrame).mapErr((e): WorkError => e).unsafeRun();
-                  if (writeResult.type === "Err") {
-                    throw writeResult.error;
-                  }
-                });
-              }),
-          );
-        }),
-    );
-
-  // Fork into a per-request fiber. Join and handle all three outcomes.
-  return work.fork().flatMap((fiber) =>
-    IO.lift<never, void>(async () => {
-      const outcome = await fiber.join();
-      switch (outcome.type) {
-        case "Ok":
-          // Success — frame was already written inside work.
-          break;
-
-        case "Err": {
-          const e = outcome.error;
-          // Registry errors get a specific error reason; all others are "internal".
-          if (
-            e.kind === "unsupported-llm-adapter" ||
-            e.kind === "unsupported-vcs-adapter" ||
-            e.kind === "missing-credentials"
-          ) {
-            log.warn("Adapter construction failed", { kind: e.kind });
-            const errFrame = buildRegistryErrorFrame(e as RegistryError, correlationId);
-            await safeWrite(write, errFrame, log).unsafeRun();
-          } else {
-            // Best-effort detail extraction so the modal can show something
-            // more useful than \"quiz-request failed: subprocess\". For LLM
-            // subprocess errors we surface the trimmed stderr tail; for VCS
-            // we surface status + detail. Tokens are not present in any of
-            // these fields by construction (REDACT_PATHS in logger.ts covers
-            // *.token/*.pat/*.apiKey paths for log output; wire fields stay
-            // tokenless because adapters never embed creds in errors).
-            const eAny = e as unknown as {
-              kind?: string;
-              reason?: string;
-              detail?: string;
-              stderr?: string;
-              exitCode?: number;
-              status?: number;
-            };
-            const tail = (s: string, max = 240): string =>
-              s.length <= max ? s : `…${s.slice(s.length - max)}`;
-            const subDetail =
-              eAny.stderr !== undefined && eAny.stderr.trim() !== ""
-                ? tail(eAny.stderr.trim())
-                : eAny.detail;
-            const reason = eAny.reason ? `[${eAny.reason}] ` : "";
-            const exitInfo =
-              eAny.exitCode !== undefined ? ` (exit ${eAny.exitCode})` : "";
-            const detail = subDetail ? `: ${reason}${subDetail}${exitInfo}` : "";
-            log.error("quiz-request failed", {
-              kind: e.kind,
-              reason: eAny.reason,
-              exitCode: eAny.exitCode,
-              detail: subDetail,
-            });
-            const errFrame = buildErrorFrame(
-              "internal",
-              `quiz-request failed: ${e.kind}${detail}`,
-              correlationId,
-            );
-            await safeWrite(write, errFrame, log).unsafeRun();
-          }
-          break;
-        }
-
-        case "Cancelled":
-          // Per spec: log at info, do NOT send a wire frame.
-          log.info("quiz-request cancelled by caller", {
-            correlationId: correlationId ?? "",
-          });
-          break;
-      }
-    }),
-  );
-};
-
-// ---------------------------------------------------------------------------
 // Pool helpers (ADR-30)
 // ---------------------------------------------------------------------------
 
@@ -716,6 +459,388 @@ const quizToPool = (quiz: Quiz, poolKey: string, llmAdapterId: string): Pool => 
     ...(q.explanation !== undefined ? { explanation: q.explanation } : {}),
   })),
 });
+
+// ---------------------------------------------------------------------------
+// quiz-request: pool path IO helper (ADR-30 + ADR-33)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the pool-path IO: cache lookup, optional LLM call, sample, store,
+ * write response. Never calls `.unsafeRun()` — every step stays inside IO.
+ */
+const runPoolPath = (
+  diff: Diff,
+  llm: LLMProvider,
+  vcs: VCSProvider,
+  pr: PRIdentifier,
+  questionCount: number,
+  questionPoolSize: number,
+  correlationId: string | null,
+  deps: DispatcherDeps,
+  log: Logger,
+): IO<DispatcherError, void> => {
+  const { write, store, cache, progress } = deps;
+
+  const diffHash = hashDiff(diff);
+  const prCanonical = canonicalisePR(pr);
+  const poolKey = cache.buildKey({
+    prKind: pr.kind,
+    llmAdapterId: llm.id,
+    prCanonical,
+    diffHash,
+  });
+
+  const cachedPool = cache.get(poolKey);
+  const cacheHit = cachedPool !== undefined;
+
+  // Pool generation path (cache miss): emit heartbeat + generate.
+  const getPool: IO<DispatcherError, Pool> = cacheHit
+    ? IO.pure(cachedPool)
+    : (() => {
+        log.info("Cache miss — generating question pool", {
+          llmId: llm.id,
+          poolSize: questionPoolSize,
+        });
+        // ADR-32 + ADR-33: heartbeat for generating-quiz phase.
+        // startHeartbeat is a side-effectful setInterval call; wire it via
+        // IO.bracket so the stop function is guaranteed to run on Ok/Err/Cancelled.
+        const heartbeatIO: IO<DispatcherError, Quiz> = IO.bracket<DispatcherError, (() => void), Quiz>(
+          IO.lift<DispatcherError, () => void>(async () => {
+            await progress?.emit(correlationId, "generating-quiz");
+            return progress?.startHeartbeat(correlationId, "generating-quiz") ?? (() => {});
+          }),
+          // use: run the LLM call (stop function held for release phase).
+          (): IO<DispatcherError, Quiz> =>
+            llm.generateQuiz({ diff, questionCount: questionPoolSize }).mapErr((e): DispatcherError => e),
+          (stop): IO<never, void> => IO.lift<never, void>(() => { stop(); }),
+        );
+
+        return heartbeatIO
+          .flatMap((quiz): IO<DispatcherError, Pool> => {
+            // ADR-32: parsing phase.
+            return IO.lift<DispatcherError, void>(async () => {
+              await progress?.emit(correlationId, "parsing");
+            }).flatMap((): IO<DispatcherError, Pool> => {
+              const pool = quizToPool(quiz, poolKey, llm.id);
+              // ADR-32: caching phase.
+              return IO.lift<DispatcherError, Pool>(async () => {
+                await progress?.emit(correlationId, "caching");
+                cache.put(pool);
+                return pool;
+              });
+            });
+          });
+      })();
+
+  return getPool.flatMap((activePool): IO<DispatcherError, void> => {
+    if (cacheHit) {
+      log.info("Cache hit — reusing question pool", {
+        poolKey,
+        poolSize: activePool.questions.length,
+      });
+    }
+
+    const sampled = sampleFromPool(activePool.questions, questionCount);
+    const sampleQuizId = crypto.randomUUID();
+
+    const answerKey: Map<QuestionId, ChoiceId> = new Map(
+      sampled.map((q) => [q.id, q.correctChoiceId]),
+    );
+    store.set(sampleQuizId as QuizId, answerKey);
+    cache.putSampleMapping({
+      sampleQuizId,
+      poolKey,
+      sampledQuestionIds: sampled.map((q) => q.id),
+    });
+
+    log.info("Quiz sampled from pool — answer key stored", {
+      sampleQuizId,
+      questionCount: sampled.length,
+      cacheHit,
+    });
+
+    const responseFrame = buildPoolQuizResponseFrame(sampled, sampleQuizId, correlationId);
+    return write(responseFrame).mapErr((e): DispatcherError => e);
+  });
+
+  // vcs is declared but not directly used in this helper — it flows through
+  // via the vcs.fetchDiff call in the parent chain. Keep the parameter to
+  // match the signature expected by the caller.
+  void vcs;
+};
+
+// ---------------------------------------------------------------------------
+// quiz-request: legacy path IO helper (ADR-33)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the legacy-path IO: generate quiz, store answer key, write response.
+ * Never calls `.unsafeRun()`.
+ */
+const runLegacyPath = (
+  diff: Diff,
+  llm: LLMProvider,
+  questionCount: number,
+  correlationId: string | null,
+  deps: DispatcherDeps,
+  log: Logger,
+): IO<DispatcherError, void> => {
+  const { write, store, progress } = deps;
+
+  log.info("Generating quiz", { llmId: llm.id, questionCount });
+
+  // ADR-32 + ADR-33: wrap generate in bracket so the heartbeat stop is
+  // guaranteed to run on Ok/Err/Cancelled.
+  return IO.bracket<DispatcherError, (() => void), Quiz>(
+    IO.lift<DispatcherError, () => void>(async () => {
+      await progress?.emit(correlationId, "generating-quiz");
+      return progress?.startHeartbeat(correlationId, "generating-quiz") ?? (() => {});
+    }),
+    // use: run the LLM call (stop function held for release phase).
+    (): IO<DispatcherError, Quiz> =>
+      llm.generateQuiz({ diff, questionCount }).mapErr((e): DispatcherError => e),
+    (stop): IO<never, void> => IO.lift<never, void>(() => { stop(); }),
+  ).flatMap((quiz): IO<DispatcherError, void> => {
+    const answerKey = pickCorrectAnswers(quiz);
+    store.set(quiz.id as QuizId, answerKey);
+    log.info("Quiz generated — answer key stored", { quizId: quiz.id });
+
+    const responseFrame = buildQuizResponseFrame(quiz, correlationId);
+    return write(responseFrame).mapErr((e): DispatcherError => e);
+  });
+};
+
+// ---------------------------------------------------------------------------
+// quiz-request handler (ADR-33 refactor)
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a `DispatcherError` to a wire error frame.
+ *
+ * BINDING: `details` MUST NOT include credential bytes.
+ *
+ * @param e - The dispatcher error.
+ * @param correlationId - Correlation ID from the originating request.
+ * @returns A well-formed error Frame.
+ */
+const buildDispatcherErrorFrame = (
+  e: DispatcherError,
+  correlationId: string | null,
+): Frame => {
+  if (
+    e.kind === "unsupported-llm-adapter" ||
+    e.kind === "unsupported-vcs-adapter" ||
+    e.kind === "missing-credentials"
+  ) {
+    return buildRegistryErrorFrame(e as RegistryError, correlationId);
+  }
+
+  const eAny = e as unknown as {
+    kind?: string;
+    reason?: string;
+    detail?: string;
+    stderr?: string;
+    exitCode?: number;
+    status?: number;
+  };
+  const tail = (s: string, max = 240): string =>
+    s.length <= max ? s : `…${s.slice(s.length - max)}`;
+  const subDetail =
+    eAny.stderr !== undefined && eAny.stderr.trim() !== ""
+      ? tail(eAny.stderr.trim())
+      : eAny.detail;
+  const reason = eAny.reason ? `[${eAny.reason}] ` : "";
+  const exitInfo =
+    eAny.exitCode !== undefined ? ` (exit ${eAny.exitCode})` : "";
+  const detail = subDetail ? `: ${reason}${subDetail}${exitInfo}` : "";
+
+  return buildErrorFrame(
+    "internal",
+    `quiz-request failed: ${e.kind}${detail}`,
+    correlationId,
+  );
+};
+
+/**
+ * Handle a `quiz-request` frame.
+ *
+ * Sequence (ADR-16 §Sequence binding, updated by ADR-29 + ADR-33):
+ * 1. Resolve adapter IDs (defaults applied when absent).
+ * 2. Build VCS + LLM providers via registry (resolves credentials from host env).
+ * 3. Fetch diff from VCS adapter (IO).
+ * 4. Generate quiz from LLM adapter (IO).
+ * 5. `pickCorrectAnswers` + store answer key.
+ * 6. Build `quiz-response` frame (no `correctChoiceId`).
+ * 7. Write frame to extension.
+ *
+ * ADR-33: The entire work pipeline is a single composed `IO<DispatcherError, void>`
+ * built via `flatMap`. NO `.unsafeRun()` inside the work body. The composed IO
+ * is `fork()`ed once; the resulting `Fiber` is stored in `fibers` so
+ * `handleQuizCancelRequest` can call `fiber.cancel()`.
+ *
+ * @param pr - The PR identifier from the quiz-request payload.
+ * @param questionCount - Number of questions requested.
+ * @param questionPoolSize - Optional pool size (ADR-30).
+ * @param llmAdapterId - Requested LLM adapter ID.
+ * @param vcsAdapterId - Requested VCS adapter ID.
+ * @param correlationId - Frame correlation ID.
+ * @param deps - Injected dependencies.
+ * @param fibers - Per-request fiber registry (ADR-33).
+ * @returns `IO<never, void>` — the outer IO never fails.
+ */
+const handleQuizRequest = (
+  pr: PRIdentifier,
+  questionCount: number,
+  questionPoolSize: number | undefined,
+  llmAdapterId: string,
+  vcsAdapterId: string,
+  correlationId: string | null,
+  deps: DispatcherDeps,
+  fibers: FiberRegistry,
+): IO<never, void> => {
+  const { write, logger, registry, progress } = deps;
+  const log = logger.child({ correlationId: correlationId ?? "", kind: "quiz-request" });
+
+  // Cross-field validation: poolSize must be >= questionCount when present.
+  if (questionPoolSize !== undefined && questionPoolSize < questionCount) {
+    log.warn("questionPoolSize < questionCount — rejecting", {
+      questionPoolSize,
+      questionCount,
+    });
+    const errFrame = buildErrorFrame(
+      "internal",
+      "questionPoolSize must be >= questionCount",
+      correlationId,
+    );
+    return safeWrite(write, errFrame, log);
+  }
+
+  // ADR-33: the work IO. Each step composes with the next via flatMap. The
+  // body MUST NOT call .unsafeRun() — cancellation propagates through every
+  // frame. (Reviewer-enforced binding (a) from ADR-33.)
+  const work: IO<DispatcherError, void> = registry
+    .buildVcs(vcsAdapterId)
+    .mapErr((e): DispatcherError => e)
+    .flatMap((vcs: VCSProvider): IO<DispatcherError, void> =>
+      registry
+        .buildLlm(llmAdapterId)
+        .mapErr((e): DispatcherError => e)
+        .flatMap((llm: LLMProvider): IO<DispatcherError, void> =>
+          IO.lift<DispatcherError, void>(async () => {
+            // ADR-32: emit fetching-diff phase before calling vcs.fetchDiff.
+            await progress?.emit(correlationId, "fetching-diff");
+          }).flatMap((): IO<DispatcherError, void> =>
+            vcs
+              .fetchDiff(pr)
+              .mapErr((e): DispatcherError => e)
+              .flatMap((diff: Diff): IO<DispatcherError, void> => {
+                if (questionPoolSize !== undefined) {
+                  return runPoolPath(
+                    diff,
+                    llm,
+                    vcs,
+                    pr,
+                    questionCount,
+                    questionPoolSize,
+                    correlationId,
+                    deps,
+                    log,
+                  );
+                }
+                return runLegacyPath(diff, llm, questionCount, correlationId, deps, log);
+              }),
+          ),
+        ),
+    );
+
+  // ADR-33: fork the work IO once. The fork returns IO<never, Fiber<...>>.
+  // The outer IO never fails — all errors surface via safeWrite.
+  return work.fork().flatMap((fiber): IO<never, void> => {
+    // Register fiber so quiz-cancel-request can call fiber.cancel().
+    if (correlationId !== null) fibers.set(correlationId, fiber);
+
+    return IO.lift<never, void>(async () => {
+      try {
+        const outcome = await fiber.join();
+        switch (outcome.type) {
+          case "Ok":
+            // Success — response frame already written inside work.
+            break;
+
+          case "Err": {
+            const e = outcome.error;
+            log.error("quiz-request failed", {
+              kind: e.kind,
+              reason: (e as unknown as { reason?: string }).reason,
+              exitCode: (e as unknown as { exitCode?: number }).exitCode,
+              detail: (e as unknown as { detail?: string }).detail,
+            });
+            const errFrame = buildDispatcherErrorFrame(e, correlationId);
+            await safeWrite(write, errFrame, log).unsafeRun();
+            break;
+          }
+
+          case "Cancelled":
+            // ADR-33: emit `ErrorFrame { reason: "cancelled" }` so the SW can
+            // resolve the pending entry. Without this the SW waits for its
+            // 180s timeout to fire.
+            log.info("quiz-request fiber cancelled", {
+              correlationId: correlationId ?? "",
+            });
+            await safeWrite(
+              write,
+              buildErrorFrame("cancelled", "quiz-request cancelled", correlationId),
+              log,
+            ).unsafeRun();
+            break;
+        }
+      } finally {
+        // ADR-33 binding (e): registry entry MUST be cleaned in finally.
+        if (correlationId !== null) fibers.delete(correlationId);
+      }
+    });
+  });
+};
+
+// ---------------------------------------------------------------------------
+// quiz-cancel-request handler (ADR-33 NEW)
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle a `quiz-cancel-request` frame (ADR-33).
+ *
+ * Looks up the fiber by `cancelCorrelationId` and calls `fiber.cancel()`.
+ * If no fiber is registered (cancel arrived after completion), logs at info
+ * and returns — no error frame is emitted (ADR-33 binding (d)).
+ *
+ * BINDING (d): MUST NOT emit any reply frame.
+ *
+ * @param cancelCorrelationId - The correlationId from the payload.
+ * @param deps - Injected dependencies.
+ * @param fibers - Per-request fiber registry.
+ * @returns `IO<never, void>` — never fails.
+ */
+const handleQuizCancelRequest = (
+  cancelCorrelationId: string,
+  deps: DispatcherDeps,
+  fibers: FiberRegistry,
+): IO<never, void> => {
+  const fiber = fibers.get(cancelCorrelationId);
+  if (fiber === undefined) {
+    // Cancel arrived after the work completed — no-op.
+    deps.logger.info("quiz-cancel-request for unknown correlationId — no-op", {
+      correlationId: cancelCorrelationId,
+    });
+    return IO.pure(undefined);
+  }
+  // Idempotent per Fiber.cancel contract.
+  return IO.lift<never, void>(async () => {
+    await fiber.cancel();
+    deps.logger.info("quiz-request fiber cancelled", {
+      correlationId: cancelCorrelationId,
+    });
+  });
+};
 
 // ---------------------------------------------------------------------------
 // quiz-resample-request handler (ADR-30)
@@ -917,15 +1042,23 @@ export type DispatcherFactory = {
 /**
  * Create the frame dispatcher.
  *
- * Handles `quiz-request`, `quiz-submit`, `list-adapters-request`,
- * `check-auth-request`, `error` (log + ignore), and unexpected kinds
- * (reply with `ErrorFrame { reason: "unknown-message" }`).
+ * Handles `quiz-request`, `quiz-cancel-request`, `quiz-submit`,
+ * `list-adapters-request`, `check-auth-request`, `error` (log + ignore),
+ * and unexpected kinds (reply with `ErrorFrame { reason: "unknown-message" }`).
+ *
+ * ADR-33: allocates one `FiberRegistry` in its closure and passes it to both
+ * `handleQuizRequest` and `handleQuizCancelRequest`.
  *
  * @param deps - Injected dependencies (write, store, logger, registry).
  * @returns A `DispatcherFactory` with a single `dispatch` method.
  */
 export const createDispatcher = (deps: DispatcherDeps): DispatcherFactory => {
   const { write, logger } = deps;
+
+  // ADR-33: per-request fiber registry, keyed by correlationId.
+  // Allocated once at factory time; shared by handleQuizRequest and
+  // handleQuizCancelRequest via closure.
+  const fibers: FiberRegistry = new Map();
 
   const dispatch = (frame: Frame): IO<never, void> => {
     logger.info("Dispatching frame", {
@@ -974,8 +1107,17 @@ export const createDispatcher = (deps: DispatcherDeps): DispatcherFactory => {
           vcsAdapterId,
           frame.correlationId,
           deps,
+          fibers,
         );
       }
+
+      case "quiz-cancel-request":
+        // ADR-33: look up fiber by payload.correlationId and call fiber.cancel().
+        return handleQuizCancelRequest(
+          frame.payload.correlationId,
+          deps,
+          fibers,
+        );
 
       case "quiz-resample-request":
         return handleQuizResampleRequest(

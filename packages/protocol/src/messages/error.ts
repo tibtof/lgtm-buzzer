@@ -22,6 +22,8 @@ export const ErrorReasonSchema = z.enum([
   "unsupported-vcs-adapter",
   // REMOVED (ADR-29): "bad-credentials" — no wire credential bag to validate.
   "missing-credentials",
+  // ADR-33: emitted when a quiz-request fiber was cancelled before completion.
+  "cancelled",
 ]);
 
 /** Discriminated reason for a wire-level error. */

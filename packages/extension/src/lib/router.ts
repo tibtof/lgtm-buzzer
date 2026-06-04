@@ -125,6 +125,21 @@ export const createCSMessageHandler = (deps: RouterDeps): CSMessageHandler => {
     // From here, request.kind === "send-frame".
     const { frame } = request;
 
+    // ADR-33: quiz-cancel-request is one-way — forward via sendFrameOneWay,
+    // synthesise an immediate ack, and return synchronously (no correlation entry).
+    if (frame.kind === "quiz-cancel-request") {
+      portClient.sendFrameOneWay(frame);
+      // Synthesise an immediate ack so the CS sendMessage resolves.
+      const ackFrame: Frame = {
+        v: 1,
+        kind: "pong",
+        correlationId: frame.correlationId,
+        payload: {},
+      };
+      sendResponse({ kind: "frame", frame: ackFrame });
+      return undefined; // synchronous response — do NOT return true
+    }
+
     // Merge storage projection into quiz-request frames only.
     if (frame.kind === "quiz-request") {
       void (async () => {

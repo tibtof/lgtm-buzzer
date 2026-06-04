@@ -15,6 +15,8 @@ import type {
   AnswerKey,
   LLMProvider,
   VCSProvider,
+  VCSProviderError,
+  LLMProviderError,
   Diff,
 } from "@lgtm-buzzer/core";
 import type { AdapterRegistry, RegistryError } from "./registry.js";
@@ -1200,5 +1202,446 @@ describe("dispatcher — diff not included in wire frames (audit)", () => {
     };
     expect("diff" in wirePayload).toBe(false);
     expect("diff" in wirePayload.quiz).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: ADR-33 — IO-composed dispatcher + fiber cancellation
+// ---------------------------------------------------------------------------
+
+describe("dispatcher — ADR-33: composition: VCS error short-circuits LLM call", () => {
+  it("VCS port fails → no LLM call; one error frame written", async () => {
+    const vcsErr: VCSProviderError = { kind: "transport", detail: "connection refused" };
+
+    let generateQuizCalled = false;
+    const spyLlm: LLMProvider = {
+      id: "claude-cli",
+      generateQuiz: () => {
+        generateQuizCalled = true;
+        return IO.lift(() => makeQuiz("x"));
+      },
+    };
+
+    const registry: AdapterRegistry = {
+      listLlm: () => ["claude-cli"],
+      listVcs: () => ["github"],
+      buildLlm: () => IO.pure(spyLlm),
+      buildVcs: () =>
+        IO.pure({
+          id: "github",
+          fetchDiff: () => IO.fail<VCSProviderError, Diff>(vcsErr),
+        }),
+    };
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
+
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "corr-vcs-err",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 3,
+      },
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // LLM must NOT have been called.
+    expect(generateQuizCalled).toBe(false);
+    // One error frame.
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.kind).toBe("error");
+  });
+
+  it("LLM error → error frame; store not populated", async () => {
+    const llmErr: LLMProviderError = { kind: "subprocess", reason: "process-failed", exitCode: 1, stderr: "oops", detail: "oops" };
+
+    const registry: AdapterRegistry = {
+      listLlm: () => ["claude-cli"],
+      listVcs: () => ["github"],
+      buildLlm: () =>
+        IO.pure<LLMProvider>({
+          id: "claude-cli",
+          generateQuiz: () => IO.fail<LLMProviderError, Quiz>(llmErr),
+        }),
+      buildVcs: () =>
+        IO.pure({
+          id: "github",
+          fetchDiff: () => IO.lift<VCSProviderError, Diff>(() => "diff --git" as Diff),
+        }),
+    };
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
+
+    const frame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "corr-llm-err",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 3,
+      },
+    };
+
+    await dispatcher.dispatch(frame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.kind).toBe("error");
+    // Store must remain empty — no answer key registered.
+    expect(store.size()).toBe(0);
+  });
+});
+
+describe("dispatcher — ADR-33: quiz-cancel-request", () => {
+  it("cancel for unknown correlationId → no frame written, info log only", async () => {
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const infoSpy = vi.spyOn(logger, "info");
+
+    const dispatcher = createDispatcher({
+      write: writer,
+      store,
+      logger,
+      registry: makeFakeRegistry(),
+      cache: createQuestionPoolCache(),
+    });
+
+    const cancelFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-unknown",
+      payload: { correlationId: "cid-unknown" },
+    };
+
+    await dispatcher.dispatch(cancelFrame).unsafeRun();
+
+    expect(frames).toHaveLength(0);
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("no-op"),
+      expect.objectContaining({ correlationId: "cid-unknown" }),
+    );
+  });
+
+  it("cancel after completion → no second frame (registry already cleaned)", async () => {
+    const quiz = makeQuiz("quiz-cancel-race");
+    const llm = makeFakeLlm("claude-cli", quiz);
+    const vcs = makeFakeVcs("github", "diff --git a/foo.ts");
+    const registry = makeFakeRegistry(llm, vcs);
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
+
+    // First run the quiz-request to completion.
+    const quizFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "cid-race",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 3,
+      },
+    };
+    await dispatcher.dispatch(quizFrame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // At this point the fiber has completed and registry entry cleaned.
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.kind).toBe("quiz-response");
+
+    // Now send cancel for the already-completed request.
+    const cancelFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-race",
+      payload: { correlationId: "cid-race" },
+    };
+    await dispatcher.dispatch(cancelFrame).unsafeRun();
+
+    // No additional frame.
+    expect(frames).toHaveLength(1);
+  });
+
+  it("cancel mid-flight slow LLM → cancelled error frame emitted", async () => {
+    // LLM IO that sleeps until aborted via IO.cancellable.
+    // The Promise resolves when abort fires so the test doesn't time out.
+    let signalAborted = false;
+    const slowLlm: LLMProvider = {
+      id: "claude-cli",
+      generateQuiz: () =>
+        IO.cancellable<LLMProviderError, Quiz>((signal) => {
+          return new Promise<Quiz>((resolve) => {
+            const t = setTimeout(() => resolve(makeQuiz("slow")), 10_000);
+            signal.addEventListener("abort", () => {
+              signalAborted = true;
+              clearTimeout(t);
+              // Resolve with a dummy value — monadyssey sees signal.aborted = true
+              // on the next interpreter tick and returns Cancelled regardless.
+              resolve(makeQuiz("aborted"));
+            });
+          });
+        }),
+    };
+
+    const registry: AdapterRegistry = {
+      listLlm: () => ["claude-cli"],
+      listVcs: () => ["github"],
+      buildLlm: () => IO.pure(slowLlm),
+      buildVcs: () =>
+        IO.pure({ id: "github", fetchDiff: () => IO.lift<VCSProviderError, Diff>(() => "diff --git" as Diff) }),
+    };
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
+
+    // Send quiz-request — fiber starts.
+    const quizFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "cid-cancel-mid",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 3,
+      },
+    };
+    // Fire-and-forget: dispatch blocks until fiber completes, so don't await.
+    void dispatcher.dispatch(quizFrame).unsafeRun();
+
+    // Give fiber a tick to reach the LLM call.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Send cancel.
+    const cancelFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-cancel-mid",
+      payload: { correlationId: "cid-cancel-mid" },
+    };
+    await dispatcher.dispatch(cancelFrame).unsafeRun();
+
+    // Wait for the cancelled outcome to be processed.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // The AbortSignal must have been fired (cooperative cancellation).
+    expect(signalAborted).toBe(true);
+
+    // One error frame with reason "cancelled".
+    expect(frames).toHaveLength(1);
+    const errorFrame = frames[0]!;
+    expect(errorFrame.kind).toBe("error");
+    if (errorFrame.kind === "error") {
+      expect(errorFrame.payload.reason).toBe("cancelled");
+      expect(errorFrame.correlationId).toBe("cid-cancel-mid");
+    }
+
+    // Store must remain empty — quiz was never completed.
+    expect(store.size()).toBe(0);
+  });
+
+  it("cancel mid-flight VCS fetch → LLM never called", async () => {
+    let generateQuizCalled = false;
+    const spyLlm: LLMProvider = {
+      id: "claude-cli",
+      generateQuiz: () => {
+        generateQuizCalled = true;
+        return IO.lift(() => makeQuiz("y"));
+      },
+    };
+
+    let vcsSignalAborted = false;
+    const slowVcs: VCSProvider = {
+      id: "github",
+      fetchDiff: () =>
+        IO.cancellable<VCSProviderError, Diff>((signal) => {
+          return new Promise<Diff>((resolve) => {
+            const t = setTimeout(() => resolve("diff --git" as Diff), 10_000);
+            signal.addEventListener("abort", () => {
+              vcsSignalAborted = true;
+              clearTimeout(t);
+              // Resolve with dummy — monadyssey sees signal.aborted and returns Cancelled.
+              resolve("" as Diff);
+            });
+          });
+        }),
+    };
+
+    const registry: AdapterRegistry = {
+      listLlm: () => ["claude-cli"],
+      listVcs: () => ["github"],
+      buildLlm: () => IO.pure(spyLlm),
+      buildVcs: () => IO.pure(slowVcs),
+    };
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
+
+    const quizFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "cid-cancel-vcs",
+      payload: {
+        pr: { kind: "github", owner: "o", repo: "r", number: 1 },
+        questionCount: 3,
+      },
+    };
+    // Fire-and-forget — dispatch awaits fiber.join() internally.
+    void dispatcher.dispatch(quizFrame).unsafeRun();
+    // Give the fiber time to reach the VCS fetch.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const cancelFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-cancel-vcs",
+      payload: { correlationId: "cid-cancel-vcs" },
+    };
+    await dispatcher.dispatch(cancelFrame).unsafeRun();
+    // Wait for the cancelled outcome to propagate.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // AbortSignal must have been fired on the VCS IO.
+    expect(vcsSignalAborted).toBe(true);
+    // LLM never called — VCS step was still in flight when cancel arrived.
+    expect(generateQuizCalled).toBe(false);
+    // One cancelled error frame.
+    expect(frames).toHaveLength(1);
+    if (frames[0]!.kind === "error") {
+      expect(frames[0]!.payload.reason).toBe("cancelled");
+    }
+  });
+
+  it("two in-flight requests, cancel one → the other completes normally", async () => {
+    // Slow LLM: long timer, reacts to abort to avoid test timeout.
+    const slowLlm: LLMProvider = {
+      id: "claude-cli",
+      generateQuiz: () =>
+        IO.cancellable<LLMProviderError, Quiz>((signal) => {
+          return new Promise<Quiz>((resolve) => {
+            const t = setTimeout(() => resolve(makeQuiz("concurrent")), 10_000);
+            signal.addEventListener("abort", () => {
+              clearTimeout(t);
+              // Resolve immediately; monadyssey checks signal.aborted → Cancelled.
+              resolve(makeQuiz("aborted"));
+            });
+          });
+        }),
+    };
+    const fastLlm: LLMProvider = {
+      id: "claude-cli",
+      generateQuiz: () => IO.lift(() => makeQuiz("fast")),
+    };
+
+    let callCount = 0;
+    const registry: AdapterRegistry = {
+      listLlm: () => ["claude-cli"],
+      listVcs: () => ["github"],
+      buildLlm: () => {
+        callCount++;
+        return callCount === 1 ? IO.pure(slowLlm) : IO.pure(fastLlm);
+      },
+      buildVcs: () =>
+        IO.pure({ id: "github", fetchDiff: () => IO.lift<VCSProviderError, Diff>(() => "diff --git" as Diff) }),
+    };
+
+    const store = createSessionStore();
+    const { writer, frames } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
+
+    // Start slow quiz (fire-and-forget — dispatch awaits fiber.join() internally).
+    const slowFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "cid-slow",
+      payload: { pr: { kind: "github", owner: "o", repo: "r", number: 1 }, questionCount: 3 },
+    };
+    void dispatcher.dispatch(slowFrame).unsafeRun();
+
+    // Start fast quiz (also fire-and-forget; it completes quickly).
+    const fastFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "cid-fast",
+      payload: { pr: { kind: "github", owner: "o", repo: "r", number: 2 }, questionCount: 3 },
+    };
+    void dispatcher.dispatch(fastFrame).unsafeRun();
+
+    // Give both fibers a tick to start, then cancel only the slow one.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const cancelFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-slow",
+      payload: { correlationId: "cid-slow" },
+    };
+    await dispatcher.dispatch(cancelFrame).unsafeRun();
+
+    // Wait for the cancel outcome + fast quiz to both settle.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // Fast quiz completed → quiz-response.
+    // Slow quiz cancelled → error with reason "cancelled".
+    const responses = frames.filter((f) => f.kind === "quiz-response");
+    const errors = frames.filter((f) => f.kind === "error");
+
+    expect(responses).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+    if (errors[0]!.kind === "error") {
+      expect(errors[0]!.payload.reason).toBe("cancelled");
+      expect(errors[0]!.correlationId).toBe("cid-slow");
+    }
+  });
+
+  it("fiber registry is cleaned after completion (no leak)", async () => {
+    const quiz = makeQuiz("quiz-clean");
+    const registry = makeFakeRegistry(
+      makeFakeLlm("claude-cli", quiz),
+      makeFakeVcs("github", "diff --git a/foo.ts"),
+    );
+
+    const store = createSessionStore();
+    const { writer } = makeCapturingWriter();
+    const logger = makeNoopLogger();
+    const dispatcher = createDispatcher({ write: writer, store, logger, registry, cache: createQuestionPoolCache() });
+
+    const quizFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-request",
+      correlationId: "cid-clean",
+      payload: { pr: { kind: "github", owner: "o", repo: "r", number: 1 }, questionCount: 3 },
+    };
+    await dispatcher.dispatch(quizFrame).unsafeRun();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Cancel should be a no-op (registry was cleaned).
+    const infoSpy = vi.spyOn(logger, "info");
+    const cancelFrame: Frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-clean",
+      payload: { correlationId: "cid-clean" },
+    };
+    await dispatcher.dispatch(cancelFrame).unsafeRun();
+
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("no-op"),
+      expect.anything(),
+    );
   });
 });
