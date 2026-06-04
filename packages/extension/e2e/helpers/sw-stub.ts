@@ -39,7 +39,7 @@ export type WireErrorReason =
   | "unsupported-vcs-adapter";
 
 /**
- * The six scenario kinds the stub knows how to play (ADR-25 §2).
+ * The seven scenario kinds the stub knows how to play (ADR-25 §2, extended by ADR-33).
  *
  * - `happy` — quiz-request → quiz-response; quiz-submit → quiz-result (scored).
  * - `wrong-then-right` — first quiz-submit always fails; second is scored normally.
@@ -48,6 +48,10 @@ export type WireErrorReason =
  * - `list-adapters-then-happy` — list-adapters succeeds; quiz flow also works.
  * - `probe-missing-credentials` — list-adapters succeeds; ping → ErrorFrame missing-credentials.
  *   ADR-29: `probe-bad-credentials` removed; replaced by `probe-missing-credentials`.
+ * - `slow-then-never` — quiz-request is intentionally never answered (simulates a
+ *   slow/hung LLM generation); quiz-cancel-request is recorded in
+ *   `globalThis.__LGTM_CANCEL_FRAME__` for assertion by the test.
+ *   Added for ADR-33 quiz-cancel-host-side e2e spec.
  */
 export type StubScenario =
   | {
@@ -81,6 +85,17 @@ export type StubScenario =
       readonly kind: "probe-missing-credentials";
       readonly llm: readonly string[];
       readonly vcs: readonly string[];
+    }
+  | {
+      /**
+       * Scenario for testing host-side cancellation (ADR-33).
+       *
+       * The stub never replies to `quiz-request` (simulating a slow LLM).
+       * When `quiz-cancel-request` arrives it is recorded in
+       * `globalThis.__LGTM_CANCEL_FRAME__` so the spec can read it via
+       * `sw.evaluate(...)` and assert the correct correlationId.
+       */
+      readonly kind: "slow-then-never";
     };
 
 /**
@@ -331,6 +346,35 @@ export const buildSwStubScript = (scenario: StubScenario): string => {
                 payload: { llm: LLM_ADAPTERS, vcs: VCS_ADAPTERS } };
             case 'ping':
               return makeErrorFrame(cid, 'missing-credentials', 'Run gh auth login');
+            default:
+              return makeErrorFrame(cid, 'internal', 'SW stub: scenario does not handle this kind');
+          }
+        }
+      `);
+    }
+
+    case "slow-then-never": {
+      // ADR-33: The stub never replies to quiz-request (simulates a slow/hung LLM).
+      // quiz-cancel-request is recorded in globalThis.__LGTM_CANCEL_FRAME__ so the
+      // spec can assert the correct correlationId arrived.
+      return makeStubScript(scenario.kind, PROTOCOL_VERSION, `
+        function handleFrame(frame) {
+          if (!frame || typeof frame.kind !== 'string') {
+            return makeErrorFrame(null, 'schema-violation', 'SW stub: invalid frame');
+          }
+          var cid = frame.correlationId != null ? frame.correlationId : null;
+          switch (frame.kind) {
+            case 'ping':
+              return { v: PROTOCOL_VERSION, kind: 'pong', correlationId: cid,
+                payload: { nonce: (frame.payload && frame.payload.nonce) ? frame.payload.nonce : null } };
+            case 'quiz-request':
+              // Never reply — simulates a slow/hung LLM so the modal stays in 'generating'.
+              return null;
+            case 'quiz-cancel-request':
+              // Record the cancel frame for test assertion via sw.evaluate().
+              globalThis.__LGTM_CANCEL_FRAME__ = frame;
+              // One-way frame — no reply expected.
+              return null;
             default:
               return makeErrorFrame(cid, 'internal', 'SW stub: scenario does not handle this kind');
           }
