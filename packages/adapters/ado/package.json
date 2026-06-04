@@ -22,6 +22,7 @@
     "record:ado": "httptape record --upstream https://dev.azure.com --fixtures ./fixtures --config ./httptape.sanitize.json"
   },
   "dependencies": {
+    "@lgtm-buzzer/adapter-shared": "*",
     "@lgtm-buzzer/core": "*",
     "@lgtm-buzzer/protocol": "*",
     "monadyssey": "2.0.1",

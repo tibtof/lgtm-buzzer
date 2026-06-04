@@ -10,14 +10,36 @@
  * });
  * ```
  *
- * Note (v1): `fetchDiff` returns
- * `malformed-response { detail: "ado-multi-call-not-yet-implemented" }` for all
- * ADO PRs. Multi-call orchestration is deferred to a future ADR. The wrong-VCS
- * guard, PAT-not-in-errors, and all structural invariants are fully enforced.
+ * Status: IMPLEMENTED, PENDING LIVE-INSTANCE VALIDATION (ADR-34).
+ * The adapter orchestrates five legs — iterations, changes, and per-file
+ * blobs — to produce a unified-diff string. All assumptions about the ADO
+ * REST API 7.1 response shapes are documented in the adapter README.
  */
 export { createAdoVcsProvider, ADAPTER_ID } from "./provider.js";
 export type { AdoAdapterConfig, AdoAdapterDeps } from "./provider.js";
-export { buildPullDiffUrl } from "./url.js";
+export {
+  buildPullDiffUrl,
+  buildIterationsUrl,
+  buildChangesUrl,
+  buildBlobUrl,
+} from "./url.js";
+export type { AdoPR } from "./url.js";
 export { mapHttpError } from "./errors.js";
 export { createAdoHttpClient } from "./http.js";
 export type { HttpClientConfig } from "./http.js";
+export { toDiffFiles } from "./changes.js";
+export type { PlannedFile } from "./changes.js";
+export {
+  AdoIterationSchema,
+  AdoIterationsResponseSchema,
+  AdoChangeItemSchema,
+  AdoChangeEntrySchema,
+  AdoChangesResponseSchema,
+} from "./schemas.js";
+export type {
+  AdoIteration,
+  AdoIterationsResponse,
+  AdoChangeItem,
+  AdoChangeEntry,
+  AdoChangesResponse,
+} from "./schemas.js";

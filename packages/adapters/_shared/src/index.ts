@@ -12,3 +12,9 @@ export {
   clipRaw,
   parseQuizFromText,
 } from "./quiz-from-text.js";
+export {
+  DEFAULT_CONTEXT_LINES,
+  renderFileDiff,
+  renderUnifiedDiff,
+} from "./unified-diff.js";
+export type { DiffFile } from "./unified-diff.js";
