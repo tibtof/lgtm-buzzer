@@ -34,7 +34,8 @@ describe("spawnIO", () => {
         expect(result.value.exitCode).toBe(0);
       }
     },
-    500,
+    // 5s budget: real subprocess spawn under full-suite CPU contention can exceed a tight budget; this asserts correctness, not latency.
+    5000,
   );
 
   it(
@@ -50,7 +51,8 @@ describe("spawnIO", () => {
         }
       }
     },
-    500,
+    // 5s budget: real subprocess spawn under full-suite CPU contention can exceed a tight budget; this asserts correctness, not latency.
+    5000,
   );
 
   it(
@@ -70,7 +72,8 @@ describe("spawnIO", () => {
         }
       }
     },
-    500,
+    // 5s budget: real subprocess spawn under full-suite CPU contention can exceed a tight budget; this asserts correctness, not latency.
+    5000,
   );
 
   it(
@@ -89,7 +92,8 @@ describe("spawnIO", () => {
         }
       }
     },
-    500,
+    // 5s budget: real subprocess spawn under full-suite CPU contention can exceed a tight budget; this asserts correctness, not latency.
+    5000,
   );
 
   it(
@@ -224,7 +228,8 @@ describe("spawnIO", () => {
         expect(result.value.exitCode).toBe(0);
       }
     },
-    500,
+    // 5s budget: real subprocess spawn under full-suite CPU contention can exceed a tight budget; this asserts correctness, not latency.
+    5000,
   );
 
   it(
@@ -248,6 +253,7 @@ describe("spawnIO", () => {
         expect(result.value.exitCode).toBe(0);
       }
     },
-    500,
+    // 5s budget: real subprocess spawn under full-suite CPU contention can exceed a tight budget; this asserts correctness, not latency.
+    5000,
   );
 });
