@@ -88,6 +88,41 @@ describe("buildMessagesPayload", () => {
     expect(payload.system[0]?.text).toBe(SYSTEM_PROMPT);
   });
 
+  // ADR-31 canary tests: ban-list phrases, few-shot markers, sweet-spot sentence
+  it("ban-list: DO NOT section mentions line numbers", () => {
+    expect(SYSTEM_PROMPT).toContain("Specific line numbers");
+  });
+
+  it("ban-list: DO NOT section mentions exact identifier names", () => {
+    expect(SYSTEM_PROMPT).toContain("exact new name of a function");
+  });
+
+  it("ban-list: DO NOT section mentions file paths", () => {
+    expect(SYSTEM_PROMPT).toContain("File paths or directory structure");
+  });
+
+  it("ban-list: DO NOT section mentions unchanged context", () => {
+    expect(SYSTEM_PROMPT).toContain("unchanged function");
+  });
+
+  it("few-shot: BAD marker is present", () => {
+    expect(SYSTEM_PROMPT).toContain("// BAD");
+  });
+
+  it("few-shot: GOOD marker is present", () => {
+    expect(SYSTEM_PROMPT).toContain("// GOOD");
+  });
+
+  it("sweet-spot: teammate test sentence is present", () => {
+    expect(SYSTEM_PROMPT).toContain("teammate who has read");
+  });
+
+  it("length sanity: SYSTEM_PROMPT is at least 1 KB and at most 8 KB", () => {
+    const bytes = Buffer.byteLength(SYSTEM_PROMPT, "utf8");
+    expect(bytes).toBeGreaterThan(1000);
+    expect(bytes).toBeLessThan(8000);
+  });
+
   it("all AnthropicModel values are accepted without error", () => {
     const models: AnthropicModel[] = ["claude-sonnet-4-7", "claude-opus-4-7", "claude-haiku-4-5"];
     for (const m of models) {
