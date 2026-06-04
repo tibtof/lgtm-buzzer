@@ -1390,3 +1390,119 @@ describe("createQuizFlowController", () => {
     expect(generationCalls).toHaveLength(prevCount);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests: ADR-33 — quiz-cancel sends quiz-cancel-request to SW
+// ---------------------------------------------------------------------------
+
+describe("createQuizFlowController — ADR-33: Esc sends quiz-cancel-request", () => {
+  let controller: QuizFlowController;
+  let form: HTMLFormElement;
+  const originalHref = window.location.href;
+
+  beforeEach(() => {
+    Object.defineProperty(window, "location", {
+      value: { ...window.location, href: "https://github.com/tibtof/lgtm-buzzer/pull/42" },
+      writable: true,
+      configurable: true,
+    });
+    form = makeApproveForm();
+  });
+
+  afterEach(() => {
+    controller?.stop();
+    form?.remove();
+    Object.defineProperty(window, "location", {
+      value: { ...window.location, href: originalHref },
+      writable: true,
+      configurable: true,
+    });
+  });
+
+  it("Esc fires quiz-cancel-request frame with correct correlationId", async () => {
+    const sentFrames: Frame[] = [];
+    let resolveQuizRequest: ((f: Frame) => void) | undefined;
+
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      sentFrames.push(frame);
+      if (frame.kind === "quiz-request") {
+        // Hold the quiz-request so we can cancel mid-flight.
+        return new Promise<Frame>((resolve) => {
+          resolveQuizRequest = resolve;
+        });
+      }
+      if (frame.kind === "quiz-cancel-request") {
+        // One-way frame — resolve with a pong ack immediately.
+        return { v: 1, kind: "pong", correlationId: frame.correlationId, payload: {} };
+      }
+      return makeErrorFrame(frame.correlationId ?? "null");
+    });
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    // Trigger Approve → quiz-request is in flight.
+    fireSubmit(form);
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    // At this point quiz-request is pending (sendFrame is blocking).
+    // Find the correlationId used.
+    const quizReqFrame = sentFrames.find((f) => f.kind === "quiz-request");
+    expect(quizReqFrame).toBeDefined();
+    const expectedCid = quizReqFrame!.correlationId;
+    expect(expectedCid).toBeDefined();
+
+    // Simulate Esc → modal fires lgtm-buzzer:quiz-cancel.
+    document.dispatchEvent(
+      new CustomEvent(DOM_EVENTS.quizCancel, { detail: { requestId: "req-1" } }),
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    // quiz-cancel-request must have been sent with matching correlationId.
+    const cancelFrame = sentFrames.find((f) => f.kind === "quiz-cancel-request");
+    expect(cancelFrame).toBeDefined();
+    expect(cancelFrame?.correlationId).toBe(expectedCid);
+    if (cancelFrame?.kind === "quiz-cancel-request") {
+      expect(cancelFrame.payload.correlationId).toBe(expectedCid);
+    }
+
+    // Clean up — resolve the pending quiz-request.
+    resolveQuizRequest?.(makeErrorFrame(expectedCid ?? "null", "cancelled"));
+  });
+
+  it("Esc with no in-flight correlationId does not send quiz-cancel-request", async () => {
+    const sentFrames: Frame[] = [];
+
+    const sendFrame = vi.fn(async (frame: Frame): Promise<Frame> => {
+      sentFrames.push(frame);
+      return makeErrorFrame(frame.correlationId ?? "null");
+    });
+
+    controller = createQuizFlowController({
+      doc: document,
+      sendFrame,
+      newCorrelationId: makeCounter("corr"),
+      newRequestId: makeCounter("req"),
+      setupInterceptor: makeGitHubInterceptorFactory(),
+      navigationWatcher: makeNoOpNavigationWatcher(),
+    });
+    controller.start();
+
+    // No Approve click — fire quiz-cancel directly with a requestId that was never created.
+    document.dispatchEvent(
+      new CustomEvent(DOM_EVENTS.quizCancel, { detail: { requestId: "req-never-existed" } }),
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    // No cancel frame should have been sent.
+    const cancelFrame = sentFrames.find((f) => f.kind === "quiz-cancel-request");
+    expect(cancelFrame).toBeUndefined();
+  });
+});

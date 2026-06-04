@@ -48,6 +48,7 @@ const makeFakePortClient = (reply: Frame): PortClient => ({
   sendFrame: vi
     .fn<(frame: Frame, tabId?: number) => Promise<Frame>>()
     .mockResolvedValue(reply),
+  sendFrameOneWay: vi.fn<(frame: Frame) => void>(),
 });
 
 // ADR-29/ADR-32: SwOptionsProjection has llmAdapterId + questionPoolSize
@@ -367,5 +368,97 @@ describe("createCSMessageHandler", () => {
 
     expect(openOptionsPage).toHaveBeenCalledOnce();
     expect(portClient.sendFrame).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: ADR-33 — quiz-cancel-request routing
+// ---------------------------------------------------------------------------
+
+describe("createCSMessageHandler — quiz-cancel-request routing (ADR-33)", () => {
+  it("forwards quiz-cancel-request via sendFrameOneWay and responds synchronously", () => {
+    const oneWaySpy = vi.fn<(frame: Frame) => void>();
+    const portClient: PortClient = {
+      isConnected: () => true,
+      sendFrame: vi.fn<(frame: Frame, tabId?: number) => Promise<Frame>>().mockResolvedValue(
+        pongFrame("unreachable"),
+      ),
+      sendFrameOneWay: oneWaySpy,
+    };
+
+    const handler = createCSMessageHandler({
+      portClient,
+      readSwOptions: noopReadSwOptions,
+    });
+
+    const sendResponse = vi.fn<(response: CSResponse) => void>();
+    const cancelFrame: Frame = {
+      v: 1,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-cancel",
+      payload: { correlationId: "cid-cancel" },
+    };
+
+    const ret = handler(
+      { kind: "send-frame", frame: cancelFrame },
+      noSender,
+      sendResponse,
+    );
+
+    // Synchronous response — does NOT return true.
+    expect(ret).toBeUndefined();
+
+    // sendFrameOneWay was called with the cancel frame.
+    expect(oneWaySpy).toHaveBeenCalledOnce();
+    expect(oneWaySpy.mock.calls[0]?.[0]).toMatchObject({
+      kind: "quiz-cancel-request",
+      payload: { correlationId: "cid-cancel" },
+    });
+
+    // sendFrame (request-reply) must NOT have been called.
+    expect(portClient.sendFrame).not.toHaveBeenCalled();
+
+    // A synthetic ack was sent synchronously.
+    expect(sendResponse).toHaveBeenCalledOnce();
+    expect(sendResponse.mock.calls[0]?.[0]).toMatchObject({ kind: "frame" });
+  });
+
+  it("does NOT subscribe to progressMap for quiz-cancel-request", () => {
+    const oneWaySpy = vi.fn<(frame: Frame) => void>();
+    const portClient: PortClient = {
+      isConnected: () => true,
+      sendFrame: vi.fn<(frame: Frame, tabId?: number) => Promise<Frame>>(),
+      sendFrameOneWay: oneWaySpy,
+    };
+
+    const subscribeSpy = vi.fn();
+    const progressMap = {
+      subscribe: subscribeSpy,
+      unsubscribe: vi.fn(),
+      dispatch: vi.fn(),
+    };
+
+    const handler = createCSMessageHandler({
+      portClient,
+      readSwOptions: noopReadSwOptions,
+      progressMap,
+    });
+
+    const sendResponse = vi.fn<(response: CSResponse) => void>();
+    const cancelFrame: Frame = {
+      v: 1,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-no-sub",
+      payload: { correlationId: "cid-no-sub" },
+    };
+
+    handler(
+      { kind: "send-frame", frame: cancelFrame },
+      noSender,
+      sendResponse,
+    );
+
+    // No progressMap subscription for one-way frames.
+    expect(subscribeSpy).not.toHaveBeenCalled();
   });
 });

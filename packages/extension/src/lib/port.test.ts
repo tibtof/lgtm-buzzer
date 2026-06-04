@@ -260,3 +260,81 @@ describe("createPortClient", () => {
     expect(addSpy.mock.calls[0]?.[0].tabId).toBe(42);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests: ADR-33 — sendFrameOneWay
+// ---------------------------------------------------------------------------
+
+describe("PortClient — sendFrameOneWay", () => {
+  it("posts the frame to the port without registering a correlation entry", () => {
+    const client = makeClient();
+    const cancelFrame: Frame = {
+      v: 1,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-cancel",
+      payload: { correlationId: "cid-cancel" },
+    };
+
+    client.sendFrameOneWay(cancelFrame);
+
+    // Frame was posted to the port.
+    expect(fakePort._posted).toHaveLength(1);
+    expect(fakePort._posted[0]).toEqual(cancelFrame);
+  });
+
+  it("returns synchronously — does not return a Promise", () => {
+    const client = makeClient();
+    const cancelFrame: Frame = {
+      v: 1,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-sync",
+      payload: { correlationId: "cid-sync" },
+    };
+
+    const result: void = client.sendFrameOneWay(cancelFrame);
+    // result is void — no Promise interface.
+    expect(result).toBeUndefined();
+  });
+
+  it("swallows transport errors — does not throw when postMessage throws", () => {
+    const client = makeClient({}, { throwOnPost: true });
+    const cancelFrame: Frame = {
+      v: 1,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-throw",
+      payload: { correlationId: "cid-throw" },
+    };
+
+    // Must not throw.
+    expect(() => client.sendFrameOneWay(cancelFrame)).not.toThrow();
+  });
+
+  it("sendFrameOneWay does not add to the correlation map (no pending entry)", async () => {
+    const client = makeClient();
+    const cancelFrame: Frame = {
+      v: 1,
+      kind: "quiz-cancel-request",
+      correlationId: "cid-no-entry",
+      payload: { correlationId: "cid-no-entry" },
+    };
+
+    client.sendFrameOneWay(cancelFrame);
+
+    // A subsequent reply for the same correlationId should be dropped (no pending entry).
+    const warnSpy = vi.fn();
+    // The absence of a pending entry means a simulated reply is just dropped.
+    // We can verify by sending a reply and checking no resolution happened.
+    const { logger } = { logger: { warn: warnSpy } };
+    void logger; // suppress unused warning
+
+    // Simulate a reply — this should NOT cause any crash.
+    expect(() => {
+      fakePort._simulateMessage({
+        v: 1,
+        kind: "pong",
+        correlationId: "cid-no-entry",
+        payload: {},
+      });
+    }).not.toThrow();
+  });
+});

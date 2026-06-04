@@ -96,6 +96,16 @@ export type PortClient = {
    * @returns A promise that always resolves (never rejects) with a `Frame`.
    */
   readonly sendFrame: (frame: Frame, tabId?: number) => Promise<Frame>;
+  /**
+   * Sends `frame` to the native host without registering a correlation entry
+   * and without awaiting a reply. Best-effort: transport errors are swallowed.
+   *
+   * Introduced by ADR-33 for `quiz-cancel-request`, which is one-way (the
+   * host MUST NOT reply).
+   *
+   * @param frame - The frame to send. Must already be validated.
+   */
+  readonly sendFrameOneWay: (frame: Frame) => void;
   /** Returns `true` if a port is currently connected. */
   readonly isConnected: () => boolean;
 };
@@ -201,6 +211,19 @@ export const createPortClient = (deps: PortClientDeps): PortClient => {
 
   return {
     isConnected: () => port !== null,
+
+    sendFrameOneWay: (frame: Frame): void => {
+      // ADR-33: fire-and-forget. No correlation map entry, no timer, no Promise.
+      // Transport errors are swallowed — cancel is best-effort.
+      try {
+        const p = ensureConnected();
+        p.postMessage(frame);
+      } catch {
+        // Port connect failed or postMessage threw — log nothing here to avoid
+        // triggering the same error path as sendFrame; the caller already closed
+        // the modal and the worst case is one wasted LLM call on the host.
+      }
+    },
 
     sendFrame: (frame: Frame, tabId?: number): Promise<Frame> => {
       return new Promise<Frame>((resolve) => {
