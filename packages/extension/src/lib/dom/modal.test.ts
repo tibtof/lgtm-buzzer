@@ -1578,3 +1578,109 @@ describe("createQuizModal — PR identifier line", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// ADR-36: modal sub-step copy tests
+// ---------------------------------------------------------------------------
+
+describe("modal — ADR-36 sub-step copy", () => {
+  let dispose: () => void;
+
+  beforeEach(() => {
+    const modal = createQuizModal({ doc: document });
+    dispose = modal.start();
+  });
+
+  afterEach(() => {
+    dispose();
+    document.querySelectorAll("[data-lgtm-modal-host]").forEach((n) => n.remove());
+  });
+
+  const getShadow = (d: Document) =>
+    d.querySelector("[data-lgtm-modal-host]")?.shadowRoot ?? null;
+
+  const getSubtitle = (d: Document) =>
+    getShadow(d)?.querySelector<HTMLElement>("[data-testid='lgtm-buzzer-generation-subtitle']");
+
+  it("renders 'Thinking…' when stage='thinking'", () => {
+    fireQuizRequest(document, "req-think");
+    emitDOMEvent(document, DOM_EVENTS.quizProgress, {
+      requestId: "req-think",
+      phase: "generating-quiz",
+      elapsedMs: 500,
+      stage: "thinking",
+    });
+    expect(getSubtitle(document)?.textContent).toBe("Thinking…");
+  });
+
+  it("renders 'Writing questions…' when stage='writing' without count", () => {
+    fireQuizRequest(document, "req-write");
+    emitDOMEvent(document, DOM_EVENTS.quizProgress, {
+      requestId: "req-write",
+      phase: "generating-quiz",
+      elapsedMs: 1000,
+      stage: "writing",
+    });
+    expect(getSubtitle(document)?.textContent).toBe("Writing questions…");
+  });
+
+  it("renders 'Writing questions… (N)' when stage='writing' with questionsWritten", () => {
+    fireQuizRequest(document, "req-count");
+    emitDOMEvent(document, DOM_EVENTS.quizProgress, {
+      requestId: "req-count",
+      phase: "generating-quiz",
+      elapsedMs: 2000,
+      stage: "writing",
+      questionsWritten: 3,
+    });
+    expect(getSubtitle(document)?.textContent).toBe("Writing questions… (3)");
+  });
+
+  it("falls back to 'Generating quiz…' when no stage provided (old host / codex / copilot)", () => {
+    fireQuizRequest(document, "req-fallback");
+    emitDOMEvent(document, DOM_EVENTS.quizProgress, {
+      requestId: "req-fallback",
+      phase: "generating-quiz",
+      elapsedMs: 0,
+    });
+    expect(getSubtitle(document)?.textContent).toBe("Generating quiz…");
+  });
+
+  it("transitions from Thinking… to Writing questions… on stage change", () => {
+    fireQuizRequest(document, "req-transition");
+    emitDOMEvent(document, DOM_EVENTS.quizProgress, {
+      requestId: "req-transition",
+      phase: "generating-quiz",
+      elapsedMs: 100,
+      stage: "thinking",
+    });
+    expect(getSubtitle(document)?.textContent).toBe("Thinking…");
+
+    emitDOMEvent(document, DOM_EVENTS.quizProgress, {
+      requestId: "req-transition",
+      phase: "generating-quiz",
+      elapsedMs: 500,
+      stage: "writing",
+      questionsWritten: 1,
+    });
+    expect(getSubtitle(document)?.textContent).toBe("Writing questions… (1)");
+  });
+
+  it("resets stage state on re-enter generating (new request)", () => {
+    fireQuizRequest(document, "req-reset-1");
+    emitDOMEvent(document, DOM_EVENTS.quizProgress, {
+      requestId: "req-reset-1",
+      phase: "generating-quiz",
+      elapsedMs: 0,
+      stage: "writing",
+      questionsWritten: 5,
+    });
+    expect(getSubtitle(document)?.textContent).toBe("Writing questions… (5)");
+
+    // New request — transition to idle then generating.
+    fireQuizReady(document, "req-reset-1");
+    fireQuizRequest(document, "req-reset-2");
+    // No progress event yet — should show "Preparing your quiz…".
+    expect(getSubtitle(document)?.textContent).toBe("Preparing your quiz…");
+  });
+});

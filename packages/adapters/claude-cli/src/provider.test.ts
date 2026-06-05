@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { IO } from "monadyssey";
-import type { Diff } from "@lgtm-buzzer/core";
+import type { Diff, QuizGenerationSignal, GenerateQuizObserver } from "@lgtm-buzzer/core";
 import type { SpawnError, SpawnOutput, SpawnOptions, spawnIO as SpawnIOType } from "@lgtm-buzzer/adapter-shared";
 import type { IdGenerator } from "./ids.js";
 import type { ChoiceId, QuestionId, QuizId } from "@lgtm-buzzer/core";
@@ -34,18 +34,27 @@ const makeFakeSpawn = (
   return { spawnIO, calls };
 };
 
-/** A valid claude --output-format json response wrapping the given quiz JSON. */
+/**
+ * Build a valid `--output-format stream-json` stdout blob (ADR-36).
+ * Mimics the NDJSON event stream emitted by claude CLI ≥2.1.165.
+ */
 const makeValidStdout = (questionCount = 1): string => {
   const questions = Array.from({ length: questionCount }, (_, i) => ({
     prompt: `Question ${i + 1}?`,
     choices: ["Option A", "Option B"],
     correctChoiceIndex: 0,
   }));
-  return JSON.stringify({
+  const systemLine = JSON.stringify({ type: "system", subtype: "init" });
+  const assistantLine = JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "text", text: "Generating quiz..." }] },
+  });
+  const resultLine = JSON.stringify({
     type: "result",
     subtype: "success",
     result: JSON.stringify({ questions }),
   });
+  return [systemLine, assistantLine, resultLine].join("\n");
 };
 
 const successOutput = (stdout: string): IO<SpawnError, SpawnOutput> =>
@@ -115,17 +124,17 @@ describe("createClaudeCliProvider", () => {
     }
   });
 
-  it("case #3 — no positional prompt: fixed argv has exactly 7 elements", async () => {
+  it("case #3 — no positional prompt: fixed argv has exactly 9 elements (ADR-36: stream-json)", async () => {
     const { spawnIO, calls } = makeFakeSpawn(successOutput(makeValidStdout()));
     const provider = createClaudeCliProvider({ spawnIO, ids: makeCounterIds() });
     await provider
       .generateQuiz({ diff: asDiff("d"), questionCount: 1 })
       .unsafeRun();
 
-    expect(calls[0]?.args).toHaveLength(7);
+    expect(calls[0]?.args).toHaveLength(9);
   });
 
-  it("case #1 (argv) — fixed argv matches expected flags exactly", async () => {
+  it("case #1 (argv) — fixed argv matches expected flags exactly (ADR-36: stream-json)", async () => {
     const { spawnIO, calls } = makeFakeSpawn(successOutput(makeValidStdout()));
     const provider = createClaudeCliProvider({ spawnIO, ids: makeCounterIds() });
     await provider
@@ -135,11 +144,13 @@ describe("createClaudeCliProvider", () => {
     expect(calls[0]?.args).toEqual([
       "--print",
       "--output-format",
-      "json",
+      "stream-json",
+      "--verbose",
       "--model",
       "sonnet",
       "--permission-mode",
       "default",
+      "--no-cache-prompts",
     ]);
   });
 
@@ -181,7 +192,8 @@ describe("createClaudeCliProvider", () => {
     );
   });
 
-  it("case #6 — malformed envelope stdout → malformed-response error", async () => {
+  it("case #6 — no result line in stdout → malformed-response error (ADR-36: stream-json)", async () => {
+    // With stream-json, stdout must contain a {type:"result"} line; plain text doesn't have one.
     const { spawnIO } = makeFakeSpawn(successOutput("not json"));
     const provider = createClaudeCliProvider({ spawnIO, ids: makeCounterIds() });
     const result = await provider
@@ -192,7 +204,7 @@ describe("createClaudeCliProvider", () => {
         type: "Err",
         error: expect.objectContaining({
           kind: "malformed-response",
-          detail: "envelope-parse-failed",
+          detail: "no-result-event",
         }),
       }),
     );
@@ -300,5 +312,70 @@ describe("createClaudeCliProvider", () => {
     expect(calls[0]?.command).toBe("/usr/local/bin/claude");
     expect(calls[0]?.args).toContain("opus");
     expect(calls[0]?.args).not.toContain("sonnet");
+  });
+
+  // ---------------------------------------------------------------------------
+  // ADR-36: observer + onLine tests
+  // ---------------------------------------------------------------------------
+
+  it("case #12 — observer receives thinking signal from stream-json stdout via onLine", async () => {
+    // Build a fake spawnIO that captures the onLine callback and replays lines.
+    const signals: QuizGenerationSignal[] = [];
+    const observer: GenerateQuizObserver = {
+      onSignal: (s) => { signals.push(s); },
+    };
+
+    let capturedOnLine: ((line: string) => void) | undefined;
+    const fakeSpawnIO = (
+      _command: string,
+      _args: readonly string[],
+      _stdin?: string,
+      options?: SpawnOptions,
+    ): IO<SpawnError, SpawnOutput> => {
+      capturedOnLine = options?.onLine;
+      // Return the full valid stdout synchronously after the onLine is captured.
+      const stdout = makeValidStdout(1);
+      return IO.lift<SpawnError, SpawnOutput>(() => ({ stdout, stderr: "", exitCode: 0 }));
+    };
+
+    const provider = createClaudeCliProvider({ spawnIO: fakeSpawnIO, ids: makeCounterIds() });
+    const result = await provider
+      .generateQuiz({ diff: asDiff("d"), questionCount: 1 }, observer)
+      .unsafeRun();
+
+    expect(result.type).toBe("Ok");
+
+    // The fake spawn above resolves immediately without replaying lines, so
+    // onLine was NOT called. Now manually replay what the real CLI would emit
+    // to assert mapStreamLine→observer integration.
+    if (capturedOnLine !== undefined) {
+      capturedOnLine(JSON.stringify({ type: "system", subtype: "init" }));
+      capturedOnLine(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "..." }] } }));
+    }
+
+    expect(signals.some((s) => s.kind === "thinking")).toBe(true);
+  });
+
+  it("case #13 — observer is not called when not provided (no regression)", async () => {
+    // Ensure the provider works when no observer is passed.
+    const { spawnIO } = makeFakeSpawn(successOutput(makeValidStdout()));
+    const provider = createClaudeCliProvider({ spawnIO, ids: makeCounterIds() });
+    const result = await provider
+      .generateQuiz({ diff: asDiff("d"), questionCount: 1 })
+      .unsafeRun();
+    expect(result.type).toBe("Ok");
+  });
+
+  it("case #14 — stream-json result produces same quiz as before (correctness invariant)", async () => {
+    const { spawnIO } = makeFakeSpawn(successOutput(makeValidStdout(2)));
+    const provider = createClaudeCliProvider({ spawnIO, ids: makeCounterIds() });
+    const result = await provider
+      .generateQuiz({ diff: asDiff("d"), questionCount: 2 })
+      .unsafeRun();
+
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.questions.toArray()).toHaveLength(2);
+    }
   });
 });

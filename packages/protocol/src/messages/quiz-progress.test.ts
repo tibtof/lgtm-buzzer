@@ -3,6 +3,7 @@ import {
   QuizProgressPayloadSchema,
   QuizProgressFrameSchema,
   QuizProgressPhaseSchema,
+  QuizGenerationStageSchema,
 } from "./quiz-progress.js";
 
 describe("QuizProgressPhaseSchema", () => {
@@ -107,6 +108,98 @@ describe("QuizProgressPayloadSchema", () => {
     expect(
       QuizProgressPayloadSchema.safeParse({ phase: "parsing" }).success,
     ).toBe(false);
+  });
+
+  // ADR-36: new optional fields
+  it("accepts stage='thinking' with no questionsWritten", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "generating-quiz",
+      elapsedMs: 500,
+      stage: "thinking",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.stage).toBe("thinking");
+      expect(result.data.questionsWritten).toBeUndefined();
+    }
+  });
+
+  it("accepts stage='writing' with questionsWritten", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "generating-quiz",
+      elapsedMs: 2000,
+      stage: "writing",
+      questionsWritten: 3,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.stage).toBe("writing");
+      expect(result.data.questionsWritten).toBe(3);
+    }
+  });
+
+  it("rejects unknown stage value", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "generating-quiz",
+      elapsedMs: 0,
+      stage: "hallucinating",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects negative questionsWritten", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "generating-quiz",
+      elapsedMs: 0,
+      questionsWritten: -1,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("backward compat: old payload (no stage/questionsWritten) still parses", () => {
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "generating-quiz",
+      elapsedMs: 1000,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.stage).toBeUndefined();
+      expect(result.data.questionsWritten).toBeUndefined();
+    }
+  });
+
+  it("strips stage/questionsWritten alongside other unknown fields", () => {
+    // Extraneous unknown field is stripped.
+    const result = QuizProgressPayloadSchema.safeParse({
+      phase: "generating-quiz",
+      elapsedMs: 0,
+      stage: "thinking",
+      questionsWritten: 2,
+      unknownField: "should be stripped",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as Record<string, unknown>;
+      expect(data["unknownField"]).toBeUndefined();
+      // Known new fields are retained.
+      expect(data["stage"]).toBe("thinking");
+      expect(data["questionsWritten"]).toBe(2);
+    }
+  });
+});
+
+describe("QuizGenerationStageSchema", () => {
+  it("accepts 'thinking'", () => {
+    expect(QuizGenerationStageSchema.safeParse("thinking").success).toBe(true);
+  });
+
+  it("accepts 'writing'", () => {
+    expect(QuizGenerationStageSchema.safeParse("writing").success).toBe(true);
+  });
+
+  it("rejects unknown values", () => {
+    expect(QuizGenerationStageSchema.safeParse("running").success).toBe(false);
+    expect(QuizGenerationStageSchema.safeParse("").success).toBe(false);
   });
 });
 

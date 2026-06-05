@@ -3,12 +3,28 @@ import { IO } from "monadyssey";
 import type { SpawnError, SpawnOutput } from "./errors.js";
 
 /**
- * Options for `spawnIO`. Currently carries only `graceMs` — the window
- * between SIGTERM and SIGKILL during cancellation.
+ * Options for `spawnIO`.
+ *
+ * ADR-36: `onLine` is an NDJSON-aware line-buffered callback invoked once per
+ * complete newline-terminated line from stdout. The residual (no trailing
+ * newline) is flushed as a final call on process exit. Absent ⇒ pure
+ * buffering (unchanged behaviour for all existing callers).
+ *
+ * BINDING: `onLine` MUST NOT throw. `spawnIO` wraps each invocation in
+ * try/catch and swallows any exception so progress is always best-effort
+ * and can never break the spawn. The full buffered `SpawnOutput.stdout` is
+ * STILL returned; streaming is purely additive.
  */
 export type SpawnOptions = {
   /** Milliseconds to wait after SIGTERM before sending SIGKILL. Default: 5000. Non-finite or negative values fall back to 5000. */
   readonly graceMs?: number;
+  /**
+   * ADR-36: line-buffered stdout callback. Receives one complete line at a
+   * time (newline stripped). Residual text with no trailing newline is
+   * flushed as a final call when the process exits. MUST NOT throw —
+   * `spawnIO` wraps it in try/catch. Absent ⇒ pure buffering (unchanged).
+   */
+  readonly onLine?: (line: string) => void;
 };
 
 // ---------------------------------------------------------------------------
@@ -83,9 +99,27 @@ export const __spawnIO_testHooks: { onSpawn: (pid: number) => void } = {
 // ---------------------------------------------------------------------------
 
 /**
+ * Safely invoke `onLine` with a single complete line, swallowing any
+ * exception. Progress is best-effort and MUST NOT break the spawn.
+ */
+const safeOnLine = (onLine: ((line: string) => void) | undefined, line: string): void => {
+  if (onLine === undefined) return;
+  try {
+    onLine(line);
+  } catch {
+    // Swallow — progress callback errors must never affect spawn outcome.
+  }
+};
+
+/**
  * Run a child process and return a Promise that resolves with `SpawnOutput`
  * on success, or rejects with a sentinel-wrapped `SpawnError` on failure.
  * Never throws directly — all failures go through `Promise.reject(thrown(...))`.
+ *
+ * ADR-36: when `onLine` is provided, stdout is split on `\n` as data arrives.
+ * Complete lines are dispatched immediately; the unterminated residual is
+ * held and flushed as one final `onLine` call on process exit (before settle).
+ * The full buffered `stdout` string is still returned in `SpawnOutput`.
  */
 const runChildProcess = (
   command: string,
@@ -93,6 +127,7 @@ const runChildProcess = (
   stdin: string | undefined,
   graceMs: number,
   signal: AbortSignal,
+  onLine?: (line: string) => void,
 ): Promise<SpawnOutput> =>
   new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -105,12 +140,19 @@ const runChildProcess = (
 
     let stdoutChunks = "";
     let stderrChunks = "";
+    // ADR-36: residual buffer for incomplete lines (no trailing newline yet).
+    let lineBuffer = "";
     let settled = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
 
     const settle = (action: () => void): void => {
       if (settled) return;
       settled = true;
+      // ADR-36: flush residual line (no trailing newline) before settling.
+      if (onLine !== undefined && lineBuffer.length > 0) {
+        safeOnLine(onLine, lineBuffer);
+        lineBuffer = "";
+      }
       if (killTimer !== undefined) {
         clearTimeout(killTimer);
         killTimer = undefined;
@@ -130,8 +172,23 @@ const runChildProcess = (
     signal.addEventListener("abort", onAbort, { once: true });
 
     // Collect stdout / stderr into strings.
+    // ADR-36: when onLine is provided, also split on newlines and dispatch
+    // complete lines immediately. The lineBuffer holds partial line content
+    // across chunk boundaries; the full stdoutChunks is still accumulated.
     child.stdout.on("data", (chunk: Buffer) => {
-      stdoutChunks += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      stdoutChunks += text;
+
+      if (onLine !== undefined) {
+        // Append to residual and split on newlines.
+        lineBuffer += text;
+        const lines = lineBuffer.split("\n");
+        // All but the last element are complete lines; the last is the new residual.
+        lineBuffer = lines[lines.length - 1] ?? "";
+        for (let i = 0; i < lines.length - 1; i++) {
+          safeOnLine(onLine, lines[i]!);
+        }
+      }
     });
     child.stderr.on("data", (chunk: Buffer) => {
       stderrChunks += chunk.toString("utf8");
@@ -226,6 +283,7 @@ export const spawnIO = (
         stdin,
         clampGrace(options?.graceMs),
         signal,
+        options?.onLine,
       ),
     liftSpawnError,
   );

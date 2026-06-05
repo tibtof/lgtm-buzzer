@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ChoiceId, QuestionId, QuizId } from "@lgtm-buzzer/core";
 import type { IdGenerator } from "./ids.js";
-import { parseResponse } from "./response.js";
+import { parseResponse, selectResultText } from "./response.js";
 
 /** Deterministic counter-based IdGenerator for tests. */
 const makeCounterIds = (): IdGenerator => {
@@ -15,7 +15,24 @@ const makeCounterIds = (): IdGenerator => {
   };
 };
 
-/** Minimal valid `ClaudePrintEnvelope` wrapping a given model JSON string. */
+/**
+ * Build a stream-json stdout blob (ADR-36): a system line + optional assistant
+ * lines + terminal result line.
+ *
+ * Each argument is a NDJSON line; they are joined with newlines.
+ */
+const streamJsonStdout = (modelJson: string, extras: string[] = []): string => {
+  const systemLine = JSON.stringify({ type: "system", subtype: "init" });
+  const resultLine = JSON.stringify({ type: "result", subtype: "success", result: modelJson });
+  return [systemLine, ...extras, resultLine].join("\n");
+};
+
+/**
+ * Single-line result (backward compat): still a valid NDJSON stream with one
+ * terminal `result` line. The old `envelope()` helper shape is preserved here
+ * so tests that exercised the old `--output-format json` envelope are
+ * automatically covered under the new stream-json parser.
+ */
 const envelope = (modelJson: string): string =>
   JSON.stringify({ type: "result", subtype: "success", result: modelJson });
 
@@ -112,13 +129,13 @@ describe("parseResponse", () => {
     expect(result.fold(() => "left", () => "right")).toBe("right");
   });
 
-  it("invalid envelope JSON → Left malformed-response with detail 'envelope-parse-failed'", () => {
+  it("stdout with no result line → Left malformed-response with detail 'no-result-event'", () => {
     const result = parseResponse("not json at all", makeCounterIds());
     result.fold(
       (e) => {
         if (e.kind !== "malformed-response") throw new Error("Expected malformed-response");
         expect(e.kind).toBe("malformed-response");
-        expect(e.detail).toBe("envelope-parse-failed");
+        expect(e.detail).toBe("no-result-event");
       },
       () => {
         throw new Error("Expected Left");
@@ -126,14 +143,14 @@ describe("parseResponse", () => {
     );
   });
 
-  it("envelope JSON doesn't match ClaudePrintEnvelopeSchema → Left malformed-response (envelope-schema)", () => {
-    const badEnvelope = JSON.stringify({ type: "not-result", result: "x" });
-    const result = parseResponse(badEnvelope, makeCounterIds());
+  it("stdout with no result line (non-result JSON) → Left malformed-response 'no-result-event'", () => {
+    const noResultEnvelope = JSON.stringify({ type: "not-result", result: "x" });
+    const result = parseResponse(noResultEnvelope, makeCounterIds());
     result.fold(
       (e) => {
         if (e.kind !== "malformed-response") throw new Error("Expected malformed-response");
         expect(e.kind).toBe("malformed-response");
-        expect(e.detail).toContain("envelope-schema");
+        expect(e.detail).toBe("no-result-event");
       },
       () => {
         throw new Error("Expected Left");
@@ -195,7 +212,7 @@ describe("parseResponse", () => {
     );
   });
 
-  it("raw field is clipped to 8 KiB on envelope-parse-failed", () => {
+  it("raw field is clipped to 8 KiB when no result line present", () => {
     const huge = "x".repeat(9 * 1024);
     const result = parseResponse(huge, makeCounterIds());
     result.fold(
@@ -247,5 +264,106 @@ describe("parseResponse", () => {
         expect(qs[1]?.prompt).toBe("Q2?");
       },
     );
+  });
+
+  it("stream-json stdout (multi-line NDJSON) parses correctly", () => {
+    const modelJson = JSON.stringify({
+      questions: [{ prompt: "What changed?", choices: ["A", "B"], correctChoiceIndex: 0 }],
+    });
+    const stdout = streamJsonStdout(modelJson, [
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "thinking..." }] } }),
+    ]);
+    const result = parseResponse(stdout, makeCounterIds());
+    expect(result.fold(() => "left", (q) => q.id)).toBe("quiz-1");
+  });
+
+  it("stream-json stdout picks the LAST result line when multiple present", () => {
+    const firstModel = JSON.stringify({ questions: [{ prompt: "Q1?", choices: ["A"], correctChoiceIndex: 0 }] });
+    const lastModel = JSON.stringify({
+      questions: [
+        { prompt: "Final Q1?", choices: ["A", "B"], correctChoiceIndex: 0 },
+      ],
+    });
+    const stdout = [
+      JSON.stringify({ type: "result", result: firstModel }),
+      JSON.stringify({ type: "result", result: lastModel }),
+    ].join("\n");
+    const result = parseResponse(stdout, makeCounterIds());
+    result.fold(
+      () => { throw new Error("Expected Right"); },
+      (quiz) => {
+        expect(quiz.questions.head.prompt).toBe("Final Q1?");
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// selectResultText tests
+// ---------------------------------------------------------------------------
+
+describe("selectResultText", () => {
+  it("returns Right with model text from a valid result line", () => {
+    const modelText = "some quiz text";
+    const stdout = JSON.stringify({ type: "result", result: modelText });
+    const result = selectResultText(stdout);
+    expect(result.fold(() => "left", (t) => t)).toBe(modelText);
+  });
+
+  it("returns Right from multi-line NDJSON stream", () => {
+    const modelText = "quiz content here";
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "hi" }] } }),
+      JSON.stringify({ type: "result", result: modelText }),
+    ].join("\n");
+    const result = selectResultText(stdout);
+    expect(result.fold(() => "left", (t) => t)).toBe(modelText);
+  });
+
+  it("returns Left 'no-result-event' when no result line present", () => {
+    const stdout = JSON.stringify({ type: "system", subtype: "init" });
+    const result = selectResultText(stdout);
+    result.fold(
+      (e) => {
+        expect(e.kind).toBe("malformed-response");
+        if (e.kind === "malformed-response") expect(e.detail).toBe("no-result-event");
+      },
+      () => { throw new Error("Expected Left"); },
+    );
+  });
+
+  it("returns Left 'no-result-event' for empty stdout", () => {
+    const result = selectResultText("");
+    result.fold(
+      (e) => { expect(e.kind).toBe("malformed-response"); },
+      () => { throw new Error("Expected Left"); },
+    );
+  });
+
+  it("returns Left 'no-result-event' for stdout with only malformed JSON", () => {
+    const result = selectResultText("not json\nalso not json");
+    result.fold(
+      (e) => { expect(e.kind).toBe("malformed-response"); },
+      () => { throw new Error("Expected Left"); },
+    );
+  });
+
+  it("picks the LAST result line when multiple present", () => {
+    const stdout = [
+      JSON.stringify({ type: "result", result: "first" }),
+      JSON.stringify({ type: "result", result: "last" }),
+    ].join("\n");
+    const result = selectResultText(stdout);
+    expect(result.fold(() => "left", (t) => t)).toBe("last");
+  });
+
+  it("skips malformed lines and finds the result line", () => {
+    const stdout = [
+      "not json",
+      JSON.stringify({ type: "result", result: "found me" }),
+    ].join("\n");
+    const result = selectResultText(stdout);
+    expect(result.fold(() => "left", (t) => t)).toBe("found me");
   });
 });

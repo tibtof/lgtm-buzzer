@@ -1,11 +1,13 @@
 import { IO } from "monadyssey";
-import type { LLMProvider, LLMProviderError, GenerateQuizInput, Quiz } from "@lgtm-buzzer/core";
+import type { LLMProvider, LLMProviderError, GenerateQuizInput, GenerateQuizObserver, Quiz } from "@lgtm-buzzer/core";
 import type { SpawnError } from "@lgtm-buzzer/adapter-shared";
 import type { spawnIO as SpawnIOFn } from "@lgtm-buzzer/adapter-shared";
 import { buildPrompt } from "./prompt.js";
 import { parseResponse } from "./response.js";
 import { defaultIdGenerator } from "./ids.js";
 import type { IdGenerator } from "./ids.js";
+import { mapStreamLine, initialStreamState } from "./stream.js";
+import type { StreamState } from "./stream.js";
 
 /** Stable identifier for the claude-cli adapter. */
 export const ADAPTER_ID = "claude-cli" as const;
@@ -98,21 +100,57 @@ export const createClaudeCliProvider = (deps: ClaudeCliDeps): LLMProvider => {
   const ids = deps.ids ?? defaultIdGenerator();
 
   // Fixed argv — no diff bytes, no positional prompt, no --bare flag.
-  // Length is exactly 7 elements (invariant asserted by provider.test.ts case #3).
+  //
+  // ADR-36: switched from `--output-format json` to `--output-format
+  // stream-json --verbose`. The `--verbose` flag is required by the Claude
+  // Code CLI (≥2.1.165) to emit the full NDJSON event sequence under --print;
+  // without it only the bare result text is printed (no {type:"result"} wrapper).
+  // Verified against claude@2.1.165: the stream emits:
+  //   {"type":"system","subtype":"init",...}
+  //   {"type":"assistant","message":{"content":[{"type":"text","text":"..."}],...},...}
+  //   {"type":"result","subtype":"success","result":"<full model text>",...}
+  // The terminal "result" line carries the complete model text in its `result`
+  // field — identical in content to the old --output-format json .result field.
+  //
+  // Length is exactly 9 elements (invariant updated from 7 — provider.test.ts
+  // case #3 asserts this).
   const fixedArgs: readonly string[] = [
     "--print",
     "--output-format",
-    "json",
+    "stream-json",
+    "--verbose",
     "--model",
     model,
     "--permission-mode",
     "default",
+    "--no-cache-prompts",
   ];
 
-  const generateQuiz = (input: GenerateQuizInput): IO<LLMProviderError, Quiz> => {
+  const generateQuiz = (
+    input: GenerateQuizInput,
+    observer?: GenerateQuizObserver,
+  ): IO<LLMProviderError, Quiz> => {
     const stdin = buildPrompt(input.diff, input.questionCount);
 
-    const spawnResult = deps.spawnIO(binary, fixedArgs, stdin, { graceMs });
+    // ADR-36: wire onLine → mapStreamLine reducer → observer.onSignal when
+    // an observer is supplied. State is mutable per-call (not shared across
+    // concurrent calls — each generateQuiz call gets its own closure).
+    let streamState: StreamState = initialStreamState;
+    const onLine =
+      observer !== undefined
+        ? (line: string): void => {
+            const result = mapStreamLine(line, streamState, input.questionCount);
+            streamState = result.state;
+            if (result.signal !== undefined) {
+              observer.onSignal(result.signal);
+            }
+          }
+        : undefined;
+
+    const spawnOptions = onLine !== undefined
+      ? { graceMs, onLine }
+      : { graceMs };
+    const spawnResult = deps.spawnIO(binary, fixedArgs, stdin, spawnOptions);
 
     // Apply wall-clock timeout using io.timeout() — the monadyssey@2.0.1 API.
     // On timeout: spawnIO's AbortSignal fires (SIGTERM → SIGKILL), and the IO

@@ -6,6 +6,7 @@ import {
   SubmittedAnswerSchema,
   ErrorReasonSchema,
   QuizProgressPhaseSchema,
+  QuizGenerationStageSchema,
 } from "@lgtm-buzzer/protocol";
 
 /**
@@ -124,19 +125,27 @@ export const QuizRetryEventDetailSchema = z.object({
 export type QuizRetryEventDetail = z.infer<typeof QuizRetryEventDetailSchema>;
 
 /**
- * Detail carried by `lgtm-buzzer:quiz-progress` (SW → CS → modal, ADR-32).
+ * Detail carried by `lgtm-buzzer:quiz-progress` (SW → CS → modal, ADR-32 + ADR-36).
  *
  * Routed by `QuizFlowController.onProgressFrame` after resolving the
  * correlationId → requestId mapping. The modal subscribes to this event to
  * update its phase indicator.
  *
+ * ADR-36: `stage` and `questionsWritten` are optional new fields. Their
+ * presence signals the LLM is streaming sub-step progress (claude-cli).
+ * Their absence means coarse phase only (codex/copilot/old host).
+ *
  * BINDING (diff-only invariant): no diff bytes, PR title, or partial quiz
- * content are permitted. Only phase metadata and elapsed time.
+ * content are permitted. Only phase/stage metadata and elapsed time.
  */
 export const QuizProgressEventDetailSchema = z.object({
   requestId: z.string().min(1),
   phase: QuizProgressPhaseSchema,
   elapsedMs: z.number().int().min(0),
+  /** ADR-36: sub-step stage within generating-quiz (optional). */
+  stage: QuizGenerationStageSchema.optional(),
+  /** ADR-36: best-effort questions-written count (optional). */
+  questionsWritten: z.number().int().min(0).optional(),
 });
 
 /** The detail object for a `lgtm-buzzer:quiz-progress` custom event. */

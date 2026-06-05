@@ -18,11 +18,30 @@ export const QuizProgressPhaseSchema = z.enum([
 export type QuizProgressPhase = z.infer<typeof QuizProgressPhaseSchema>;
 
 /**
+ * Sub-step stage within the `generating-quiz` phase (ADR-36).
+ *
+ * - `"thinking"` — the LLM has received the prompt and is working.
+ * - `"writing"` — the LLM is producing visible output (assistant text seen).
+ *
+ * Only emitted by adapters that support streaming (claude-cli in v1).
+ * Codex/copilot/claude-api fall back to the coarse `generating-quiz` phase
+ * without a stage. MUST NOT carry raw stream text.
+ */
+export const QuizGenerationStageSchema = z.enum(["thinking", "writing"]);
+
+/** A sub-step stage label from the LLM streaming adapter. */
+export type QuizGenerationStage = z.infer<typeof QuizGenerationStageSchema>;
+
+/**
  * Payload of a `quiz-progress` frame.
  *
  * BINDING (diff-only invariant): this schema lists the EXACT allowed fields.
- * No `partial`, no `questionsGenerated`, no `diffPreview`, no `prTitle`.
+ * No `partial`, no `diffPreview`, no `prTitle`, no raw stream text.
  * Extra fields are stripped by zod's default passthrough=false (strip mode).
+ *
+ * ADR-36: `stage` and `questionsWritten` are the ONLY new fields. Both are
+ * optional (strip mode) so old extensions silently ignore them and old hosts
+ * produce frames that new extensions parse without the new fields.
  */
 export const QuizProgressPayloadSchema = z.object({
   phase: QuizProgressPhaseSchema,
@@ -33,6 +52,18 @@ export const QuizProgressPayloadSchema = z.object({
    * v1: always absent — the modal uses its own historical median.
    */
   expectedMs: z.number().int().min(0).optional(),
+  /**
+   * ADR-36: sub-step stage within `generating-quiz` (optional).
+   * Absent for all other phases and for adapters that cannot stream.
+   * MUST NOT carry diff bytes or raw stream text — enum only.
+   */
+  stage: QuizGenerationStageSchema.optional(),
+  /**
+   * ADR-36: best-effort count of questions written so far (optional).
+   * Monotonic, clamped [0, poolSize]. Explicitly approximate — partial
+   * JSON delimiters may skew the count. Absent when unknown.
+   */
+  questionsWritten: z.number().int().min(0).optional(),
 });
 
 /** Payload of a `quiz-progress` heartbeat frame. */

@@ -1,5 +1,5 @@
 import type { Logger } from "@lgtm-buzzer/core";
-import type { QuizProgressPhase } from "@lgtm-buzzer/protocol";
+import type { QuizProgressPhase, QuizGenerationStage } from "@lgtm-buzzer/protocol";
 import { PROTOCOL_VERSION } from "@lgtm-buzzer/protocol";
 import type { FrameWriter } from "./framing/writer.js";
 
@@ -43,6 +43,29 @@ export type ProgressEmitter = {
     correlationId: string | null,
     phase: QuizProgressPhase,
   ) => () => void;
+
+  /**
+   * ADR-36: emit a sub-step stage frame for the `generating-quiz` phase.
+   *
+   * Writes a `quiz-progress` frame with `phase: "generating-quiz"`, the
+   * computed `elapsedMs`, and the `stage` / optional `questionsWritten`
+   * fields. Absorbs `WriteError` — a failed sub-step frame MUST NOT fail the
+   * request fiber.
+   *
+   * The caller (dispatcher) is responsible for throttling invocations.
+   *
+   * BINDING: `detail` MUST contain only `stage` (enum) and optionally
+   * `questionsWritten` (integer). No raw stream text. ADR-36 §7.
+   *
+   * @param correlationId - The correlationId of the originating quiz-request.
+   * @param startedAt - The timestamp (ms) when the generate step started.
+   * @param detail - Stage and optional question count.
+   */
+  readonly emitGenerationStage: (
+    correlationId: string | null,
+    startedAt: number,
+    detail: { readonly stage: QuizGenerationStage; readonly questionsWritten?: number },
+  ) => Promise<void>;
 };
 
 // ---------------------------------------------------------------------------
@@ -85,6 +108,34 @@ export const createProgressEmitter = (deps: ProgressEmitterDeps): ProgressEmitte
     }
   };
 
+  const emitGenerationStage = async (
+    correlationId: string | null,
+    startedAt: number,
+    detail: { readonly stage: QuizGenerationStage; readonly questionsWritten?: number },
+  ): Promise<void> => {
+    const frame = {
+      v: PROTOCOL_VERSION,
+      kind: "quiz-progress" as const,
+      correlationId,
+      payload: {
+        phase: "generating-quiz" as const,
+        elapsedMs: Math.max(0, Math.round(now() - startedAt)),
+        stage: detail.stage,
+        ...(detail.questionsWritten !== undefined
+          ? { questionsWritten: detail.questionsWritten }
+          : {}),
+      },
+    };
+
+    const result = await write(frame).unsafeRun();
+    if (result.type === "Err") {
+      logger.warn("quiz-progress generation-stage write failed — sub-step frame missed", {
+        kind: result.error.kind,
+        stage: detail.stage,
+      });
+    }
+  };
+
   return {
     emit: (correlationId, phase): Promise<void> => {
       return emit(correlationId, phase, now());
@@ -103,5 +154,7 @@ export const createProgressEmitter = (deps: ProgressEmitterDeps): ProgressEmitte
         clearInterval(handle);
       };
     },
+
+    emitGenerationStage,
   };
 };

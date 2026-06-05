@@ -11,6 +11,8 @@ import type {
   ChoiceId,
   QuizId,
   Diff,
+  GenerateQuizObserver,
+  QuizGenerationSignal,
 } from "@lgtm-buzzer/core";
 import { pickCorrectAnswers, scoreSubmission, decidePassed } from "@lgtm-buzzer/core";
 import type { Logger } from "@lgtm-buzzer/core";
@@ -204,6 +206,112 @@ const safeWrite = (write: FrameWriter, frame: Frame, logger: Logger): IO<never, 
     },
     (): IO<never, void> => IO.pure(undefined),
   );
+
+// ---------------------------------------------------------------------------
+// ADR-36: throttled generation observer factory
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a `GenerateQuizObserver` that maps `QuizGenerationSignal` values to
+ * `quiz-progress` sub-step frames via `ProgressEmitter.emitGenerationStage`.
+ *
+ * Throttle rules (ADR-36 §4, binding):
+ * - Always emit immediately on **stage change** (`thinking` → `writing`).
+ * - Otherwise emit at most once per 1000 ms, carrying the latest
+ *   `questionsWritten`. A trailing emit fires when `flush()` is called at
+ *   generation end (so the final count is always sent).
+ * - NEVER per-line/per-token emission.
+ *
+ * SECURITY (ADR-36 §7): the emitter payload MUST contain only stage
+ * (enum) and questionsWritten (integer). Raw stream/prompt/diff text MUST
+ * NOT appear. Enforced by the typed `QuizGenerationSignal` (no text field)
+ * and `ProgressEmitter.emitGenerationStage` (typed params only).
+ *
+ * @param correlationId - The quiz-request's correlationId.
+ * @param startedAt - Timestamp when the generating step started (for elapsedMs).
+ * @param progress - The progress emitter to use.
+ * @param now - Clock function (injected for testability).
+ * @returns `{ observer, flush }`. Call `flush()` after generation completes.
+ */
+export const makeGenerationObserver = (
+  correlationId: string | null,
+  startedAt: number,
+  progress: ProgressEmitter,
+  now: () => number,
+): { readonly observer: GenerateQuizObserver; readonly flush: () => Promise<void> } => {
+  const THROTTLE_MS = 1000;
+
+  let lastEmitMs = 0;
+  let lastStage: QuizGenerationSignal["kind"] | null = null;
+  let pendingSignal: QuizGenerationSignal | null = null;
+  let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const doEmit = async (signal: QuizGenerationSignal): Promise<void> => {
+    lastEmitMs = now();
+    lastStage = signal.kind;
+    pendingSignal = null;
+    if (signal.kind === "writing") {
+      const detail: { stage: "writing"; questionsWritten?: number } =
+        signal.questionsWritten !== undefined
+          ? { stage: "writing", questionsWritten: signal.questionsWritten }
+          : { stage: "writing" };
+      await progress.emitGenerationStage(correlationId, startedAt, detail);
+    } else {
+      await progress.emitGenerationStage(correlationId, startedAt, { stage: "thinking" });
+    }
+  };
+
+  const scheduleTrailing = (signal: QuizGenerationSignal): void => {
+    if (throttleTimer !== null) clearTimeout(throttleTimer);
+    pendingSignal = signal;
+    throttleTimer = setTimeout(() => {
+      throttleTimer = null;
+      if (pendingSignal !== null) {
+        const s = pendingSignal;
+        pendingSignal = null;
+        void doEmit(s);
+      }
+    }, THROTTLE_MS);
+  };
+
+  const onSignal = (signal: QuizGenerationSignal): void => {
+    const isStageChange = signal.kind !== lastStage;
+    if (isStageChange) {
+      // Cancel any pending trailing emit — the stage change takes priority.
+      if (throttleTimer !== null) {
+        clearTimeout(throttleTimer);
+        throttleTimer = null;
+        pendingSignal = null;
+      }
+      void doEmit(signal);
+      return;
+    }
+
+    const sinceLastEmit = now() - lastEmitMs;
+    if (sinceLastEmit >= THROTTLE_MS) {
+      // Throttle window elapsed — emit immediately.
+      void doEmit(signal);
+    } else {
+      // Within throttle window — schedule trailing.
+      scheduleTrailing(signal);
+    }
+  };
+
+  const flush = async (): Promise<void> => {
+    if (throttleTimer !== null) {
+      clearTimeout(throttleTimer);
+      throttleTimer = null;
+    }
+    if (pendingSignal !== null) {
+      await doEmit(pendingSignal);
+    }
+  };
+
+  return {
+    observer: { onSignal },
+    flush,
+  };
+};
 
 // ---------------------------------------------------------------------------
 // list-adapters-request handler
@@ -510,8 +618,28 @@ const runPoolPath = (
             return progress?.startHeartbeat(correlationId, "generating-quiz") ?? (() => {});
           }),
           // use: run the LLM call (stop function held for release phase).
-          (): IO<DispatcherError, Quiz> =>
-            llm.generateQuiz({ diff, questionCount: questionPoolSize }).mapErr((e): DispatcherError => e),
+          // ADR-36: construct a throttled observer (if progress emitter is available).
+          (): IO<DispatcherError, Quiz> => {
+            if (progress !== undefined) {
+              const startedAt = deps.progress ? Date.now() : 0;
+              const { observer, flush } = makeGenerationObserver(
+                correlationId,
+                startedAt,
+                progress,
+                Date.now,
+              );
+              return llm
+                .generateQuiz({ diff, questionCount: questionPoolSize }, observer)
+                .mapErr((e): DispatcherError => e)
+                .flatMap((quiz): IO<DispatcherError, Quiz> =>
+                  IO.lift<DispatcherError, Quiz>(async () => {
+                    await flush();
+                    return quiz;
+                  }),
+                );
+            }
+            return llm.generateQuiz({ diff, questionCount: questionPoolSize }).mapErr((e): DispatcherError => e);
+          },
           (stop): IO<never, void> => IO.lift<never, void>(() => { stop(); }),
         );
 
@@ -597,8 +725,28 @@ const runLegacyPath = (
       return progress?.startHeartbeat(correlationId, "generating-quiz") ?? (() => {});
     }),
     // use: run the LLM call (stop function held for release phase).
-    (): IO<DispatcherError, Quiz> =>
-      llm.generateQuiz({ diff, questionCount }).mapErr((e): DispatcherError => e),
+    // ADR-36: construct a throttled observer when progress is available.
+    (): IO<DispatcherError, Quiz> => {
+      if (progress !== undefined) {
+        const startedAt = Date.now();
+        const { observer, flush } = makeGenerationObserver(
+          correlationId,
+          startedAt,
+          progress,
+          Date.now,
+        );
+        return llm
+          .generateQuiz({ diff, questionCount }, observer)
+          .mapErr((e): DispatcherError => e)
+          .flatMap((quiz): IO<DispatcherError, Quiz> =>
+            IO.lift<DispatcherError, Quiz>(async () => {
+              await flush();
+              return quiz;
+            }),
+          );
+      }
+      return llm.generateQuiz({ diff, questionCount }).mapErr((e): DispatcherError => e);
+    },
     (stop): IO<never, void> => IO.lift<never, void>(() => { stop(); }),
   ).flatMap((quiz): IO<DispatcherError, void> => {
     const answerKey = pickCorrectAnswers(quiz);

@@ -14876,3 +14876,508 @@ ADR-34's unverified-assumption convention.
   resolved); ADO Server on-prem auth variants.
 
 ---
+
+## ADR-36 (2026-06-05): Streaming LLM output for live sub-step progress (spawnIO onChunk + stream-json + quiz-progress sub-steps)
+**Date**: 2026-06-05
+**Issue**: #141
+**Status**: Accepted
+
+### Context
+
+The only long phase in a quiz-request is `generating-quiz` (the LLM call,
+~100s on a multi-file diff). ADR-32 added a 5s `quiz-progress` heartbeat
+that shows the *phase*, but since fetch/parse/cache are near-instant, the
+modal sits on a static "Generating quiz…" + a ticking timer for the entire
+generation. Heartbeats arrive, but there is no sub-progress *within* the
+LLM call, so it reads as hung (observed live on Battleship PR #82:
+"Generating quiz from the diff… 72s", no movement beyond the timer).
+
+Today the claude-cli adapter runs `claude --print --output-format json`
+(ADR-14) and `spawnIO` (ADR-9) buffers all of stdout, handing the adapter
+one opaque blob at the end. ADR-9 explicitly scoped streaming OUT of
+`spawnIO` ("stdout/stderr buffered in full"; "the adapter that needs it
+builds a different primitive"). **This issue is that adapter.** We design
+the streaming primitive ADR-9 deferred, extend the `quiz-progress` payload
+ADR-32 introduced, and preserve the host fiber cancellation ADR-33 wired
+(Esc → quiz-cancel-request → fiber.cancel → SIGTERM → SIGKILL).
+
+Constraints carried in unchanged:
+- **Diff-only invariant** (CLAUDE.md §Key differentiator): streaming
+  changes how we *read* output, never what we *send*. `GenerateQuizInput`
+  stays `{ diff, questionCount }`.
+- **Cancellation** (ADR-33): Esc must still abort mid-stream.
+- **No secrets in progress** (ADR-32 §Diff-only invariant): the
+  stream-json echoes the prompt (which contains the diff); the progress
+  emitter must extract ONLY structural signals, never raw stream text.
+
+### Decision
+
+#### 1. The streaming spawn primitive — option (a): extend `spawnIO` with `onLine`
+
+We extend the existing `spawnIO` with an optional **line-buffered**
+callback in `SpawnOptions`, rather than building a sibling
+`spawnStreamIO`. Rationale:
+
+- One primitive, one cancellation machinery. `runChildProcess` already
+  owns the `child.stdout.on("data")` handler and the
+  SIGTERM→graceMs→SIGKILL abort path threaded through `IO.cancellable`'s
+  `AbortSignal`. A sibling would duplicate and inevitably drift from that
+  machinery — the exact failure mode ADR-9 called a release-blocker.
+- The full buffered `SpawnOutput.stdout` is **still returned** on success.
+  The adapter's existing parser (`parseResponse`) keeps consuming the
+  complete output; streaming is purely additive. Adapters that pass no
+  `onLine` are byte-for-byte unchanged (the current buffering path).
+
+**Line-buffering policy (binding).** claude `--output-format stream-json`
+emits NDJSON: one JSON object per newline-terminated line. `spawnIO`
+maintains a residual buffer across `data` chunks, splits on `\n`, and
+invokes `onLine(line)` once per **complete** line (the trailing `\n`
+stripped, the unterminated remainder held for the next chunk). On child
+exit, any non-empty residual is flushed as a final `onLine` call. This
+gives the adapter whole JSON events, never half-objects, and shields it
+from TCP/pipe chunk boundaries. We choose `onLine` over a raw `onChunk`
+precisely because the consumer wants events, not bytes; a raw-byte
+callback would push line reassembly into every adapter.
+
+**Callback execution & cancellation semantics (binding).**
+- `onLine` runs synchronously inside the Node `data` handler, i.e. inside
+  the Promise that `IO.cancellable` wraps. It is on the same call stack as
+  the existing buffer-append. It MUST be cheap and MUST NOT throw — see
+  the error contract below.
+- Cancellation is unchanged and composes with `IO.cancellable` verbatim:
+  on abort the child gets SIGTERM (then SIGKILL after `graceMs`). Any
+  `onLine` calls already dispatched before abort have fired; no further
+  lines arrive once the stream closes. Cancellation is *structural*
+  between lines (the consumer checks nothing — the stream simply stops)
+  and *cooperative at the syscall* (the child is signalled). There is no
+  new cancellation surface.
+- **`onLine` MUST NOT throw.** A throwing callback would escape the
+  Promise executor and bypass the typed-error discipline. `spawnIO`
+  wraps each `onLine` invocation in a try/catch that swallows and (in
+  dev) logs — progress is a best-effort side channel and MUST NEVER fail
+  the spawn. This mirrors the progress-emitter's existing
+  "swallow WriteError" stance (ADR-32).
+
+`onLine` receives **only** stdout lines. stderr stays fully buffered into
+`SpawnOutput.stderr` as today (no streaming consumer needs it).
+
+#### 2. claude-cli streaming format
+
+The quiz-generation invocation changes from
+`--output-format json` to `--output-format stream-json --verbose`
+(`--verbose` is required by the claude CLI to emit the full NDJSON event
+sequence under `--print`; the dev agent verifies the exact flag against
+the installed CLI version and adjusts if the surface differs — documented,
+not assumed). The fixed-argv length invariant in `provider.test.ts`
+(currently asserts 7 elements) updates accordingly.
+
+**Expected NDJSON event shape** (one object per line):
+```
+{ "type": "system",    "subtype": "init", ... }
+{ "type": "assistant", "message": { "content": [ { "type": "text", "text": "…" } ], ... } }
+{ "type": "assistant", "message": { ... } }          // possibly several
+{ "type": "result",    "subtype": "success", "result": "<full model text>" }
+```
+
+**Final-JSON reconstruction (binding).** The adapter does NOT reconstruct
+the quiz by concatenating assistant deltas. The terminal `result` event
+carries the complete model text in its `result` field — identical in shape
+to today's `--output-format json` envelope (ADR-14 §3,
+`ClaudePrintEnvelopeSchema`). The adapter:
+
+1. Streams lines to a progress mapper (signals only — see §below).
+2. On spawn success, parses the **full buffered `SpawnOutput.stdout`**
+   (NDJSON) by scanning for the last line whose `type === "result"`,
+   extracts its `result` string, and feeds that to the existing
+   `parseQuizFromText` pipeline. This keeps the parser source-of-truth
+   the full output, not the streamed signals — streaming cannot corrupt
+   parsing.
+
+This is captured in a new `StreamJsonResultSchema` (the per-line
+discriminated union) plus a `selectResultText(stdout): Either<…, string>`
+that finds the terminal `result` line. `parseResponse` gains a
+stream-json branch; the legacy single-object `--output-format json`
+branch is removed (the adapter now only ever runs stream-json).
+
+**Progress precision — coarse stages + best-effort count, count clearly
+labelled approximate.** From the NDJSON stream we reliably detect:
+- `system/init` arrived → still preparing (no stage emitted; the existing
+  immediate `generating-quiz` emit covers this).
+- first `assistant` event arrived → stage `"thinking"` → `"writing"`.
+  Concretely: emit `stage: "thinking"` on `generating-quiz` start; flip to
+  `stage: "writing"` on the first `assistant` event that carries non-empty
+  text content.
+- `questionsWritten` (best-effort, MAY be approximate): the mapper keeps a
+  running concatenation of assistant **text** content and counts
+  occurrences of the question-object delimiter the prompt's JSON schema
+  uses (the `"prompt":` key — one per question object). This is a
+  monotonic, clamped `[0, poolSize]` counter. It is explicitly best-effort:
+  partial JSON, the model emitting the key inside a string, or reordering
+  can skew it. We claim "approximate progress", not an exact count, and the
+  modal copy degrades gracefully when the count is absent or stalls.
+
+  We deliberately do NOT attempt incremental strict JSON parsing of the
+  partial model output (fragile, and a parse error mid-stream must never
+  affect the real parse, which always runs on the complete buffer).
+
+#### 3. `quiz-progress` payload extension (protocol)
+
+`QuizProgressPayloadSchema` gains two OPTIONAL fields, added in strip mode
+(zod default), so old hosts/extensions ignore them and the four coarse
+phases keep working unchanged. Envelope stays `v: 1`:
+
+```ts
+export const QuizGenerationStageSchema = z.enum(["thinking", "writing"]);
+export type QuizGenerationStage = z.infer<typeof QuizGenerationStageSchema>;
+
+export const QuizProgressPayloadSchema = z.object({
+  phase: QuizProgressPhaseSchema,
+  elapsedMs: z.number().int().min(0),
+  expectedMs: z.number().int().min(0).optional(),
+  // NEW — generating-quiz only; absent for all other phases and for
+  // adapters that cannot stream (codex/copilot/claude-api).
+  stage: QuizGenerationStageSchema.optional(),
+  // NEW — best-effort, MAY be approximate; clamped [0, poolSize].
+  questionsWritten: z.number().int().min(0).optional(),
+});
+```
+
+The schema's BINDING comment is extended: still NO `partial`, NO
+`diffPreview`, NO `prTitle`, NO raw stream text — `stage` and
+`questionsWritten` are the ONLY new fields, both pure structural metadata.
+The `QuizProgressEventDetailSchema` in
+`packages/extension/src/lib/dom/dom-events.ts` mirrors the two new optional
+fields so they survive the SW→CS→modal DOM-event hop.
+
+**Backward compatibility.** Optional + strip mode ⇒ an old extension
+parsing a new host's frame drops the fields and renders the coarse phase;
+a new extension parsing an old host's frame sees `undefined` and falls back
+to "Generating quiz…". No version bump.
+
+#### 4. Host dispatcher streaming wiring + throttle
+
+The `ProgressEmitter` (ADR-32) gains a richer emit path. New method:
+
+```ts
+readonly emitGenerationStage: (
+  correlationId: string | null,
+  detail: { stage: QuizGenerationStage; questionsWritten?: number },
+) => Promise<void>;
+```
+
+It writes a `quiz-progress` frame with `phase: "generating-quiz"`,
+computed `elapsedMs`, and the new `stage` / `questionsWritten` fields.
+Like `emit`, it absorbs `WriteError` (best-effort side channel).
+
+**Stream → frame mapping lives in the host, not the adapter.** The
+adapter's job is to surface *typed generation signals*, not to know about
+frames. We add an optional `onProgress` callback to the LLM call path so
+`core` stays pure and the adapter stays frame-agnostic:
+
+- New port-level optional input on `GenerateQuizInput`? **No** — that would
+  put an effectful callback on a pure-core port. Instead we add the
+  callback to a NEW optional second parameter of `generateQuiz` typed in
+  `core` as a pure function value:
+
+```ts
+// packages/core/src/ports/llm-provider.ts
+export type QuizGenerationSignal =
+  | { readonly kind: "thinking" }
+  | { readonly kind: "writing"; readonly questionsWritten?: number };
+
+export type GenerateQuizObserver = {
+  readonly onSignal: (signal: QuizGenerationSignal) => void;
+};
+
+export type LLMProvider = {
+  readonly id: string;
+  readonly generateQuiz: (
+    input: GenerateQuizInput,
+    observer?: GenerateQuizObserver,
+  ) => IO<LLMProviderError, Quiz>;
+};
+```
+
+`QuizGenerationSignal` is a pure discriminated union (no I/O); `onSignal`
+is a plain function the host supplies. Core stays free of `node:*`,
+`chrome.*`, frames, and effects — it only declares the *shape* of the
+signal. Adapters that cannot stream simply never call `onSignal`
+(`observer` is optional; existing adapters compile unchanged).
+
+The claude-cli adapter, when given an `observer`, wires `spawnIO`'s
+`onLine` → a small pure `mapStreamLine(line, state)` reducer →
+`observer.onSignal(...)`. The dispatcher constructs the `observer` so each
+signal calls `progress.emitGenerationStage(...)`.
+
+**Throttle (binding).** The progress emitter coalesces; it MUST NOT emit
+per-line/per-token (that would flood the native-messaging pipe). The
+throttle rule:
+- Always emit immediately on **stage change** (`thinking` → `writing`).
+- Otherwise emit at most once per **1000 ms**, carrying the latest
+  `questionsWritten`. A trailing emit fires when generation completes if
+  the last count was suppressed.
+
+Implemented as a tiny time-gated wrapper inside the dispatcher's
+observer-construction (uses the injected `now()` clock — no global state).
+The existing 5s heartbeat (ADR-32) and the sub-step frames **coexist**:
+the heartbeat keeps proving liveness on the slow `generating-quiz` phase;
+the sub-step frames augment it with `stage`/`count`. Both are
+`phase: "generating-quiz"` frames; the modal's last-write-wins on the
+subtitle.
+
+#### 5. Modal rendering
+
+`phaseCopy` is extended to accept the optional sub-step detail. In
+`generating-quiz`:
+- `stage: "thinking"` → "Thinking…"
+- `stage: "writing"` with `questionsWritten = N` and a known pool size →
+  "Writing questions… (N/poolSize)"; with no count → "Writing questions…"
+- no `stage` (codex/copilot/claude-api or old host) → today's
+  "Generating quiz…" (unchanged fallback).
+
+The pool size for the "N/poolSize" copy is the value the modal already
+knows from the request (the configured `questionPoolSize`); if unknown,
+render "Writing questions… (N)". `onQuizProgress` carries the two new
+optional fields through; `currentStage` / `questionsWritten` join
+`currentPhase` as factory-scoped state, reset on every
+generating-state entry/exit exactly where `currentPhase` is reset today
+(modal.ts lines ~1395–1408, ~1666).
+
+The 10s-silence subtitle fallback and the first-heartbeat ETA-bar switch
+(ADR-32) are **preserved**: sub-step frames are `quiz-progress` frames, so
+they refresh `lastHeartbeatMs` on every arrival, keeping the spinner copy
+alive. No change to the silence timer.
+
+#### 6. Per-adapter scope
+
+- **claude-cli**: FULL streaming (primary target — the adapter the user
+  hit). Everything above applies.
+- **codex-cli / copilot-cli**: COARSE fallback only in v1 — they keep
+  their current buffered invocation, never call `observer.onSignal`, and
+  the modal shows today's "Generating quiz…". Their `--output-format`
+  streaming support differs/absent; investigating + wiring them is
+  deferred to a follow-up. No regression: the `observer` is optional and
+  unused.
+- **claude-api**: Anthropic Messages API SSE (`stream: true`) is a
+  DIFFERENT transport (HTTP SSE via `monadyssey-fetch`, not CLI NDJSON
+  over `spawnIO`/`onLine`). Scoped to a FOLLOW-UP. The `core` port shape
+  (`observer.onSignal` with `QuizGenerationSignal`) is transport-agnostic,
+  so the claude-api adapter can adopt it later without a protocol change.
+
+#### 7. Security — no stream text in progress (hard constraint)
+
+The stream-json echoes the prompt, which contains the diff. The progress
+path MUST NEVER forward raw stream text into a `quiz-progress` payload —
+only `stage` (enum) and `questionsWritten` (clamped integer). Enforcement,
+layered:
+- The pure `mapStreamLine` reducer emits only `QuizGenerationSignal`
+  (enum + integer); it has no field that can carry text.
+- `QuizProgressPayloadSchema` strip mode drops anything not in the allow-
+  list; a future field carrying text would have to be added deliberately
+  and would fail review.
+- A **canary test** feeds a stream containing a recognisable diff
+  sentinel (e.g. `SECRET_DIFF_CANARY`) through the adapter→emitter→frame
+  path and asserts NO emitted frame's serialized JSON contains the
+  sentinel. This is the diff-only invariant's cousin and is reviewer-
+  enforced.
+
+#### Affected workspaces
+
+- `protocol` ← (extend `QuizProgressPayloadSchema` + new
+  `QuizGenerationStageSchema`). Zero-dep zone respected (zod only).
+- `core` ← `protocol`. Extend `LLMProvider` port with optional `observer`
+  param + new pure `QuizGenerationSignal` / `GenerateQuizObserver` types.
+  Stays pure: no effects, no frames, just a function-value contract.
+- `adapters/_shared` ← `core`, `protocol`. Add `onLine` to `SpawnOptions`
+  + line-buffering in `runChildProcess`. No new runtime dep.
+- `adapters/claude-cli` ← `core`, `protocol`, `_shared`. stream-json argv,
+  `mapStreamLine` reducer, `selectResultText`, observer wiring.
+- `host` ← everything except `extension`. `emitGenerationStage` on the
+  emitter, throttled observer construction in the dispatcher's generate
+  steps (both `runPoolPath` and `runLegacyPath`).
+- `extension` ← `core`, `protocol`. Extend `QuizProgressEventDetailSchema`,
+  `onProgressFrame` forwarding, modal copy. MUST NOT import host/adapters
+  (unchanged).
+
+Dependency arrows reaffirmed — every new edge points down the allowed
+graph (`protocol ← core ← adapters ← host`, `protocol ← core ←
+extension`). No `core`→`adapters`/`host` edge is introduced; the streaming
+signal crosses the boundary as a pure callback the host injects.
+
+#### Types (summary, per workspace)
+
+- `protocol`: `QuizGenerationStageSchema`, `QuizGenerationStage`; two new
+  optional fields on `QuizProgressPayloadSchema`.
+- `core`: `QuizGenerationSignal` (DU), `GenerateQuizObserver`; updated
+  `LLMProvider.generateQuiz` signature.
+- `adapters/_shared`: `onLine?: (line: string) => void` on `SpawnOptions`.
+- `adapters/claude-cli`: `StreamJsonLineSchema` (per-line DU),
+  `mapStreamLine(line, state) → { state, signal? }`,
+  `selectResultText(stdout) → Either<LLMProviderError, string>`.
+- `host`: `emitGenerationStage` on `ProgressEmitter`; an internal
+  throttling observer factory `makeGenerationObserver(correlationId, now,
+  emit)`.
+- `extension`: two optional fields on `QuizProgressEventDetailSchema`;
+  `currentStage` / `questionsWritten` modal state.
+
+#### Functions and methods (signatures)
+
+```ts
+// adapters/_shared/src/spawn-io.ts
+export type SpawnOptions = {
+  readonly graceMs?: number;
+  /** Line-buffered stdout callback. Receives one NDJSON line at a time
+   *  (newline stripped); residual flushed on exit. MUST NOT throw —
+   *  spawnIO wraps it in try/catch. Absent ⇒ pure buffering (unchanged). */
+  readonly onLine?: (line: string) => void;
+};
+
+// adapters/claude-cli/src/response.ts
+export const selectResultText: (stdout: string) => Either<LLMProviderError, string>;
+
+// adapters/claude-cli/src/stream.ts (new)
+export type StreamState = {
+  readonly stage: "thinking" | "writing";
+  readonly accumulated: string;
+  readonly questionsWritten: number;
+};
+export const initialStreamState: StreamState;
+export const mapStreamLine: (
+  line: string,
+  state: StreamState,
+  poolSize: number,
+) => { readonly state: StreamState; readonly signal?: QuizGenerationSignal };
+
+// host/src/progress-emitter.ts
+emitGenerationStage(correlationId, { stage, questionsWritten? }): Promise<void>;
+```
+
+#### File layout
+
+- `packages/protocol/src/messages/quiz-progress.ts` — MODIFY (new schema + fields).
+- `packages/core/src/ports/llm-provider.ts` — MODIFY (signal types + observer param).
+- `packages/adapters/_shared/src/spawn-io.ts` — MODIFY (onLine + line buffering).
+- `packages/adapters/_shared/src/spawn-io.test.ts` — MODIFY (onLine + flush + no-throw + cancel-mid-stream tests).
+- `packages/adapters/claude-cli/src/provider.ts` — MODIFY (stream-json argv, observer wiring).
+- `packages/adapters/claude-cli/src/response.ts` — MODIFY (selectResultText, stream-json branch).
+- `packages/adapters/claude-cli/src/stream.ts` — NEW (mapStreamLine reducer).
+- `packages/adapters/claude-cli/src/stream.test.ts` — NEW (reducer unit tests + canary).
+- `packages/host/src/progress-emitter.ts` — MODIFY (emitGenerationStage).
+- `packages/host/src/dispatcher.ts` — MODIFY (throttled observer in both generate paths).
+- `packages/host/src/dispatcher.test.ts` — MODIFY (throttle + canary assertions).
+- `packages/extension/src/lib/dom/dom-events.ts` — MODIFY (event detail fields).
+- `packages/extension/src/lib/dom/quiz-flow.ts` — MODIFY (forward new fields).
+- `packages/extension/src/lib/dom/modal.ts` — MODIFY (sub-step copy + state).
+- `packages/extension/src/lib/dom/modal.test.ts` — MODIFY (Thinking/Writing copy assertions).
+
+#### Sequence
+
+1. Content script: Approve clicked → SW → host receives `quiz-request`
+   (unchanged through ADR-33).
+2. Dispatcher resolves adapters, fetches diff (`fetching-diff` heartbeat),
+   reaches the generate step (`runPoolPath`/`runLegacyPath`).
+3. Dispatcher emits the immediate `generating-quiz` frame + starts the 5s
+   heartbeat (ADR-32, unchanged) and constructs a throttled `observer`
+   bound to the correlationId.
+4. Dispatcher calls `llm.generateQuiz({ diff, questionCount }, observer)`.
+5. claude-cli adapter spawns `claude --print --output-format stream-json
+   --verbose` with `onLine` wired to `mapStreamLine` → `observer.onSignal`.
+6. As NDJSON lines arrive: `system/init` (no signal) → first `assistant`
+   text → `signal { kind: "thinking" }` then `{ kind: "writing",
+   questionsWritten }` as `"prompt":` occurrences accrue.
+7. Each signal hits the throttled emitter: stage-change emits immediately;
+   count updates coalesce to ≤1/sec → `quiz-progress` frame with
+   `stage`/`questionsWritten`.
+8. SW routes the frame via ProgressMap → CS `onProgressFrame` validates
+   `QuizProgressPayloadSchema` → DOM event → modal `onQuizProgress` →
+   subtitle "Thinking…" / "Writing questions… (N/poolSize)".
+9. Child exits; `spawnIO` flushes residual line, resolves `SpawnOutput`
+   with the FULL buffered stdout.
+10. Adapter runs `selectResultText(stdout)` → `parseQuizFromText` → `Quiz`
+    (parser sees the complete output, immune to streaming).
+11. Dispatcher stores answer key, writes `quiz-response`; heartbeat stop
+    fires in the bracket release; modal transitions to `ready`.
+12. Cancellation (Esc) at any point in 5–10: quiz-cancel-request →
+    `fiber.cancel()` → `spawnIO` AbortSignal → SIGTERM → (graceMs) SIGKILL
+    → `Cancelled` outcome → ADR-33 cancelled error frame. No further
+    `onLine`/signals after the stream closes.
+
+#### Error cases (Result/IO, not throws)
+
+- **stream-json flag unsupported by installed CLI** → process exits
+  non-zero or emits no `result` line. `spawn-failed`/`process-failed`
+  map to `LLMProviderError.subprocess` (unchanged ADR-14 §7). The dev
+  verifies flags before merge.
+- **No terminal `result` line in stdout** → `selectResultText` returns
+  `Left(malformed-response { detail: "no-result-event" })`. Surfaces as
+  the existing malformed-response error frame.
+- **Malformed individual NDJSON line** mid-stream → `mapStreamLine`
+  ignores it (returns unchanged state, no signal). Never affects the real
+  parse, which runs on the full buffer at the end. Progress degrades, the
+  quiz does not.
+- **`onLine` callback throws** → swallowed by `spawnIO`'s try/catch;
+  spawn unaffected. (Invariant: progress is best-effort.)
+- **WriteError on a sub-step frame** → absorbed by the emitter (logged
+  warn), request unaffected (ADR-32 stance, unchanged).
+- **Cancellation mid-stream** → `Cancelled` runtime outcome (ADR-33),
+  child terminated. Not an `Err`.
+
+All of the above are expected failures handled via `Either`/`IO` channels;
+the only `throw` remains the ADR-14 invariant guard in `mapSpawnError`.
+
+#### Test strategy
+
+- **Unit (`_shared`)**: `onLine` fires per complete line; partial-line
+  residual held then flushed on exit; no-throw isolation (a throwing
+  `onLine` does not fail the spawn); **cancel-mid-stream** asserts the
+  child is dead AND no `onLine` fires after abort.
+- **Unit (`claude-cli` stream.ts)**: `mapStreamLine` stage transitions
+  (init→thinking→writing), best-effort count monotonic + clamped to
+  poolSize, malformed line ignored. `selectResultText` picks the terminal
+  `result`, errors when absent.
+- **Canary (`claude-cli` + `host`)**: a stream embedding a diff sentinel
+  produces NO emitted frame whose JSON contains the sentinel. Reviewer-
+  enforced (security §7).
+- **Unit (`host`)**: throttle — N rapid signals within 1s coalesce to ≤2
+  frames; stage-change always emits immediately; trailing emit on
+  completion. Coexistence with the 5s heartbeat.
+- **Unit (`extension` modal)**: `stage:"thinking"` → "Thinking…";
+  `stage:"writing"` + count → "Writing questions… (N/poolSize)"; no stage
+  → "Generating quiz…" fallback; 10s-silence fallback still fires; ETA-bar
+  switch preserved.
+- **Protocol**: backward-compat — old payload (no new fields) still parses;
+  new fields optional + stripped when extraneous.
+- **e2e gap (manual)**: a real claude-cli generation showing
+  Thinking→Writing transitions is not deterministically reproducible in
+  CI (depends on the live model). Falls back to manual verification on a
+  real PR, per the acceptance criteria. The deterministic parts (reducer,
+  throttle, canary, copy) are all covered above.
+
+### Consequences
+
+- **One primitive, preserved cancellation.** Extending `spawnIO` rather
+  than forking it keeps the single, audited SIGTERM→SIGKILL path — the
+  thing ADR-9 flagged as release-critical. The cost is a slightly larger
+  `SpawnOptions` surface and a residual-buffer loop in `runChildProcess`.
+- **Parser unchanged in spirit.** The quiz is still parsed from the
+  complete output (the terminal `result` line), so streaming cannot
+  corrupt correctness; signals are advisory only.
+- **Core stays pure.** The streaming signal crosses the boundary as a
+  pure callback the host injects; `core` gains a discriminated union and
+  an optional function-value param, no effects, no frames, no Node/DOM.
+- **Best-effort count is honest.** We claim "approximate progress", not an
+  exact question count. If the heuristic drifts, the UX still improves
+  (Thinking → Writing) and never blocks or misleads on correctness.
+- **Security boundary held.** `stage`/`questionsWritten` are pure
+  metadata; no raw stream text can reach a frame (typed signal + strip
+  mode + canary). This is the diff-only invariant's cousin and is treated
+  with the same care.
+- **Graceful degradation, no regression.** Optional everywhere — codex/
+  copilot/claude-api and old extensions/hosts keep today's behavior.
+  claude-api SSE and codex/copilot streaming are clean follow-ups behind
+  the same transport-agnostic `core` port.
+- **Future**: per-token rendering and streaming question *text* to the
+  modal remain deliberately out of scope (the latter would leak answer
+  context — a gate-integrity hazard).
+
+---

@@ -904,11 +904,16 @@ export const createQuizFlowController = (deps: QuizFlowDeps): QuizFlowController
         return;
       }
 
-      // ADR-32: emit the progress DOM event so the modal can update its phase indicator.
+      // ADR-32 + ADR-36: emit the progress DOM event so the modal can update
+      // its phase indicator. Forward stage/questionsWritten when present.
       emitDOMEvent(doc, DOM_EVENTS.quizProgress, {
         requestId,
         phase: parsed.data.phase,
         elapsedMs: parsed.data.elapsedMs,
+        ...(parsed.data.stage !== undefined ? { stage: parsed.data.stage } : {}),
+        ...(parsed.data.questionsWritten !== undefined
+          ? { questionsWritten: parsed.data.questionsWritten }
+          : {}),
       });
     },
   };
