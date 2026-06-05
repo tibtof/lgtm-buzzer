@@ -21,15 +21,32 @@ export type ResolverError = {
 };
 
 /**
+ * HTTP authorization scheme implied by the credential's source.
+ *
+ * - `"basic"`  — the secret is used as an HTTP Basic password (ADO PAT,
+ *                GitHub PAT). The adapter encodes `base64(":" + secret)`.
+ * - `"bearer"` — the secret is an OAuth bearer token (ADO AAD token from
+ *                `az account get-access-token`). The adapter sends
+ *                `Authorization: Bearer <secret>` verbatim.
+ *
+ * Defaults to `"basic"` for every resolver except the ADO `az` path,
+ * preserving ADR-29 construction semantics for github / claude-api.
+ */
+export type CredentialScheme = "basic" | "bearer";
+
+/**
  * Outcome of a successful resolution.
  *
  * `secret` is the resolved token / API key, or `undefined` for adapters
  * whose auth lives outside the resolver (CLI-managed login).
+ * `scheme` is the HTTP auth scheme the secret's source implies. Default `"basic"`.
  * `detail` is a short human-readable step label ("via GITHUB_TOKEN env",
  * "via gh CLI", "uses CLI's own login"). NEVER includes the secret bytes.
  */
 export type ResolvedCredential = {
   readonly secret: string | undefined;
+  /** Auth scheme the secret's source implies. Default `"basic"`. */
+  readonly scheme: CredentialScheme;
   readonly detail: string;
 };
 
@@ -145,7 +162,7 @@ const tryCli = (
 
 /** Resolve a no-op adapter (CLI-managed auth). Always succeeds. */
 const resolveCliManaged = (): IO<ResolverError, ResolvedCredential> =>
-  IO.pure<ResolvedCredential>({ secret: undefined, detail: "uses CLI's own login" });
+  IO.pure<ResolvedCredential>({ secret: undefined, scheme: "basic", detail: "uses CLI's own login" });
 
 /** Resolve `github` credentials: GITHUB_TOKEN → GH_TOKEN → gh auth token CLI. */
 const resolveGitHub = (
@@ -160,6 +177,7 @@ const resolveGitHub = (
   if (envHit !== undefined) {
     return IO.pure<ResolvedCredential>({
       secret: envHit.hit,
+      scheme: "basic",
       detail: `via ${envHit.via}`,
     });
   }
@@ -179,7 +197,7 @@ const resolveGitHub = (
       });
     },
     (result): IO<ResolverError, ResolvedCredential> =>
-      IO.pure<ResolvedCredential>({ secret: result.hit, detail: `via ${result.via}` }),
+      IO.pure<ResolvedCredential>({ secret: result.hit, scheme: "basic", detail: `via ${result.via}` }),
   );
 };
 
@@ -191,16 +209,17 @@ const resolveAdo = (
 ): IO<ResolverError, ResolvedCredential> => {
   const attempted = ["AZURE_DEVOPS_EXT_PAT env", "az CLI access token"];
 
-  // Step 1: env var
+  // Step 1: env var — PAT, use Basic auth scheme
   const envHit = tryEnv(env, ["AZURE_DEVOPS_EXT_PAT"]);
   if (envHit !== undefined) {
     return IO.pure<ResolvedCredential>({
       secret: envHit.hit,
+      scheme: "basic",
       detail: `via ${envHit.via}`,
     });
   }
 
-  // Step 2: az account get-access-token
+  // Step 2: az account get-access-token — AAD bearer token, use Bearer auth scheme
   const azArgs = [
     "account",
     "get-access-token",
@@ -226,7 +245,7 @@ const resolveAdo = (
       });
     },
     (result): IO<ResolverError, ResolvedCredential> =>
-      IO.pure<ResolvedCredential>({ secret: result.hit, detail: `via ${result.via}` }),
+      IO.pure<ResolvedCredential>({ secret: result.hit, scheme: "bearer", detail: `via ${result.via}` }),
   );
 };
 
@@ -240,6 +259,7 @@ const resolveClaudeApi = (
   if (envHit !== undefined) {
     return IO.pure<ResolvedCredential>({
       secret: envHit.hit,
+      scheme: "basic",
       detail: `via ${envHit.via}`,
     });
   }

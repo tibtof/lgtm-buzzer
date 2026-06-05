@@ -10,6 +10,49 @@ synthetic, hand-authored fixtures. No live ADO instance was available during
 development. See "Pending live validation" below for the exact list of
 unverified assumptions.
 
+## Authentication
+
+Two authentication paths are supported (ADR-35):
+
+### AAD / `az login` (recommended for AAD-backed orgs)
+
+Requires the [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/) to be
+installed and logged in:
+
+```bash
+az login
+```
+
+At runtime the host runs `az account get-access-token --resource 499b84ac-…`
+to obtain a short-lived AAD OAuth token and sends it as
+`Authorization: Bearer <token>`. No secret is stored on disk.
+
+This is the recommended path for AAD-backed Azure DevOps organisations. It
+avoids storing a PAT on disk and is automatically refreshed by the `az` CLI.
+
+### PAT / `AZURE_DEVOPS_EXT_PAT` (non-AAD orgs)
+
+Personal Access Tokens are sent as `Authorization: Basic base64(":" + pat)`.
+
+Because Chrome spawns the native host with a minimal environment that does
+**not** include the user's shell variables, `AZURE_DEVOPS_EXT_PAT` must be
+set **before** running the installer so it is baked into the wrapper script:
+
+```bash
+LGTM_BUZZER_EXTENSION_ID=<your-id> AZURE_DEVOPS_EXT_PAT=<your-pat> \
+  node packages/host/dist/install-manifest.js
+```
+
+The PAT is written in plaintext into `host-wrapper.sh` (the same per-user
+directory and trust surface as the wrapper itself). This is the opt-in
+tradeoff for non-AAD orgs — the `az login` path above avoids on-disk secret
+material entirely. Re-running the installer without the env var removes the
+line (the wrapper is rewritten wholesale each run).
+
+**Security note**: the PAT is never logged and never included in error
+payloads. The wrapper file is `mode 0755` in the user's own directory,
+matching the trust surface of the existing wrapper.
+
 ## How it works
 
 ADO exposes no single endpoint that returns a unified-diff string (unlike

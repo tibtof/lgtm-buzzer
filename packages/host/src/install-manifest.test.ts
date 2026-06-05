@@ -8,7 +8,7 @@ import {
   renderManifestTemplate,
   renderNodeWrapper,
 } from "./install-manifest.js";
-import type { BuildManifestInput } from "./install-manifest.js";
+import type { BuildManifestInput, PassThroughEnvVar } from "./install-manifest.js";
 
 const baseInput: BuildManifestInput = {
   platform: "darwin",
@@ -304,6 +304,118 @@ describe("renderNodeWrapper", () => {
     expect(script).toContain("USER='tibtof'");
     expect(script).toContain("LOGNAME='tibtof'");
     expect(script).toContain("SHELL='/bin/zsh'");
+    expect(script).toMatch(/export PATH USER LOGNAME SHELL/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderNodeWrapper — passThroughEnv (ADR-35, Fix 2)
+// ---------------------------------------------------------------------------
+
+describe("renderNodeWrapper — passThroughEnv (ADR-35)", () => {
+  const BASE_INPUT = {
+    nodePath: "/usr/local/bin/node",
+    jsEntryPath: "/abs/cli.js",
+    capturedPath: "/usr/bin:/bin",
+    capturedUser: "test",
+    capturedShell: "/bin/sh",
+  } as const;
+
+  it("passThroughEnv present → wrapper contains NAME='value' and export NAME", () => {
+    const passThroughEnv: readonly PassThroughEnvVar[] = [
+      { name: "AZURE_DEVOPS_EXT_PAT", value: "my_ado_pat_abc123" },
+    ];
+    const script = renderNodeWrapper({ ...BASE_INPUT, passThroughEnv });
+    expect(script).toContain("AZURE_DEVOPS_EXT_PAT='my_ado_pat_abc123'");
+    expect(script).toContain("export AZURE_DEVOPS_EXT_PAT");
+  });
+
+  it("passThroughEnv absent → no AZURE_DEVOPS_EXT_PAT line at all", () => {
+    const script = renderNodeWrapper({ ...BASE_INPUT });
+    expect(script).not.toContain("AZURE_DEVOPS_EXT_PAT");
+  });
+
+  it("passThroughEnv empty array → no AZURE_DEVOPS_EXT_PAT line at all", () => {
+    const script = renderNodeWrapper({ ...BASE_INPUT, passThroughEnv: [] });
+    expect(script).not.toContain("AZURE_DEVOPS_EXT_PAT");
+  });
+
+  it("entry with empty value is silently skipped — no empty export line", () => {
+    const passThroughEnv: readonly PassThroughEnvVar[] = [
+      { name: "AZURE_DEVOPS_EXT_PAT", value: "" },
+    ];
+    const script = renderNodeWrapper({ ...BASE_INPUT, passThroughEnv });
+    expect(script).not.toContain("AZURE_DEVOPS_EXT_PAT");
+    // Specifically: no 'export AZURE_DEVOPS_EXT_PAT=' shadow line
+    expect(script).not.toMatch(/export AZURE_DEVOPS_EXT_PAT/);
+  });
+
+  it("value containing a single quote is single-quote-escaped", () => {
+    // A PAT value like "abc'def" must be escaped as 'abc'\''def'
+    const passThroughEnv: readonly PassThroughEnvVar[] = [
+      { name: "AZURE_DEVOPS_EXT_PAT", value: "abc'def" },
+    ];
+    const script = renderNodeWrapper({ ...BASE_INPUT, passThroughEnv });
+    // The escaped form of "abc'def" in single-quoted shell is 'abc'\''def'
+    expect(script).toContain("AZURE_DEVOPS_EXT_PAT='abc'\\''def'");
+    expect(script).toContain("export AZURE_DEVOPS_EXT_PAT");
+  });
+
+  it("value with special shell metacharacters is safely quoted", () => {
+    const passThroughEnv: readonly PassThroughEnvVar[] = [
+      { name: "AZURE_DEVOPS_EXT_PAT", value: "tok$en&value;here" },
+    ];
+    const script = renderNodeWrapper({ ...BASE_INPUT, passThroughEnv });
+    expect(script).toContain("AZURE_DEVOPS_EXT_PAT='tok$en&value;here'");
+  });
+
+  it("CANARY: PAT value appears exactly once in the wrapper (no duplication into comments)", () => {
+    const PAT = "UNIQUE_CANARY_PAT_abc123xyz";
+    const passThroughEnv: readonly PassThroughEnvVar[] = [
+      { name: "AZURE_DEVOPS_EXT_PAT", value: PAT },
+    ];
+    const script = renderNodeWrapper({ ...BASE_INPUT, passThroughEnv });
+    // The PAT value must appear exactly once — in the assignment line.
+    const occurrences = (script.match(new RegExp(PAT, "g")) ?? []).length;
+    expect(occurrences).toBe(1);
+  });
+
+  it("invalid env var name throws (programmer error guard)", () => {
+    const passThroughEnv: readonly PassThroughEnvVar[] = [
+      { name: "lowercase_name", value: "value" },
+    ];
+    expect(() => renderNodeWrapper({ ...BASE_INPUT, passThroughEnv })).toThrow(
+      "invalid env var name",
+    );
+  });
+
+  it("invalid env var name with injection characters throws", () => {
+    const passThroughEnv: readonly PassThroughEnvVar[] = [
+      { name: "NAME; rm -rf /", value: "value" },
+    ];
+    expect(() => renderNodeWrapper({ ...BASE_INPUT, passThroughEnv })).toThrow(
+      "invalid env var name",
+    );
+  });
+
+  it("multiple pass-through entries are all emitted", () => {
+    const passThroughEnv: readonly PassThroughEnvVar[] = [
+      { name: "AZURE_DEVOPS_EXT_PAT", value: "pat_value" },
+      { name: "MY_OTHER_SECRET", value: "other_value" },
+    ];
+    const script = renderNodeWrapper({ ...BASE_INPUT, passThroughEnv });
+    expect(script).toContain("AZURE_DEVOPS_EXT_PAT='pat_value'");
+    expect(script).toContain("export AZURE_DEVOPS_EXT_PAT");
+    expect(script).toContain("MY_OTHER_SECRET='other_value'");
+    expect(script).toContain("export MY_OTHER_SECRET");
+  });
+
+  it("existing export PATH USER LOGNAME SHELL line is not modified", () => {
+    const passThroughEnv: readonly PassThroughEnvVar[] = [
+      { name: "AZURE_DEVOPS_EXT_PAT", value: "pat" },
+    ];
+    const script = renderNodeWrapper({ ...BASE_INPUT, passThroughEnv });
+    // The core identity exports must still be present and unchanged.
     expect(script).toMatch(/export PATH USER LOGNAME SHELL/);
   });
 });

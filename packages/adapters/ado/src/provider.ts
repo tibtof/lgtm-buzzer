@@ -30,6 +30,7 @@ import type { VCSProvider, VCSProviderError, Diff, PRIdentifier } from "@lgtm-bu
 import { renderFileDiff, renderUnifiedDiff } from "@lgtm-buzzer/adapter-shared";
 import type { DiffFile } from "@lgtm-buzzer/adapter-shared";
 import { createAdoHttpClient } from "./http.js";
+import type { AdoAuthScheme } from "./http.js";
 import { mapHttpError } from "./errors.js";
 import {
   buildIterationsUrl,
@@ -90,8 +91,14 @@ const containsNul = (content: string): boolean =>
  * (ADR-15) with ADO-specific values.
  */
 export type AdoAdapterConfig = {
-  /** Required PAT. Never logged or included in error payloads. */
+  /** Required credential (PAT or AAD bearer token). Never logged or included in error payloads. */
   readonly token: string;
+  /**
+   * Auth scheme for the credential. Default `"basic"` (PAT).
+   * Use `"bearer"` when the token was obtained via `az account get-access-token`
+   * (an AAD OAuth token, not a PAT).
+   */
+  readonly authScheme?: AdoAuthScheme;
   /** API base URL. Default: `"https://dev.azure.com"`. */
   readonly baseUrl?: string;
   /** Wall-clock timeout in milliseconds. Default: `30_000`. */
@@ -306,13 +313,16 @@ export const createAdoVcsProvider = (deps: AdoAdapterDeps): VCSProvider => {
   const timeoutMs = config.timeoutMs ?? 30_000;
   const userAgent = config.userAgent ?? undefined;
 
+  const authScheme = config.authScheme;
   const client =
     deps.httpClient ??
-    createAdoHttpClient(
-      userAgent !== undefined
-        ? { token: config.token, baseUrl, timeoutMs, userAgent }
-        : { token: config.token, baseUrl, timeoutMs },
-    );
+    (authScheme !== undefined
+      ? userAgent !== undefined
+        ? createAdoHttpClient({ token: config.token, authScheme, baseUrl, timeoutMs, userAgent })
+        : createAdoHttpClient({ token: config.token, authScheme, baseUrl, timeoutMs })
+      : userAgent !== undefined
+        ? createAdoHttpClient({ token: config.token, baseUrl, timeoutMs, userAgent })
+        : createAdoHttpClient({ token: config.token, baseUrl, timeoutMs }));
 
   const fetchDiff = (input: PRIdentifier): IO<VCSProviderError, Diff> => {
     // Guard: only ADO PRs are handled by this adapter.
