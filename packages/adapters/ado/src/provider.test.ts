@@ -818,4 +818,185 @@ describe("createAdoVcsProvider", () => {
       expect(result.value).toBe("");
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Live-API shape: delete entry with item.path null
+  // -------------------------------------------------------------------------
+  it("live-API delete entry (item.path null, originalPath set) → diff headed by originalPath", async () => {
+    // Verified real delete shape from Hackathon-2021/Battleship PR #82:
+    // item.path is explicitly null; originalPath carries the removed file's path.
+    const deletedFilePath = "/server-webflux/src/main/resources/shapes/square.txt";
+    const changesWithDelete = JSON.stringify({
+      changeEntries: [
+        {
+          changeTrackingId: 13,
+          originalPath: deletedFilePath,
+          changeId: 13,
+          item: { originalObjectId: "AE82abc", path: null },
+          changeType: "delete",
+        },
+      ],
+    });
+
+    const { client, calls } = makeFakeClient([
+      { match: (u) => u.includes("/iterations?"), io: okIO(ITERATIONS_RESPONSE) },
+      { match: (u) => u.includes("/changes"), io: okIO(changesWithDelete) },
+      {
+        match: (u) => u.includes("/blobs/AE82abc"),
+        io: okIO("line1\nline2\n"),
+      },
+    ]);
+    const provider = createAdoVcsProvider({ config: { token: "tok" }, httpClient: client });
+
+    const result = await provider.fetchDiff(adoPR()).unsafeRun();
+
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      // The diff must reference the original path (without leading slash).
+      expect(result.value).toContain("server-webflux/src/main/resources/shapes/square.txt");
+      // Must look like a real unified diff.
+      expect(result.value).toContain("diff --git");
+    }
+
+    // The old-side blob was fetched (delete = old content → empty).
+    const blobCalls = calls.filter((c) => c.uri.includes("/blobs/"));
+    expect(blobCalls).toHaveLength(1);
+    expect(blobCalls[0]?.uri).toContain("AE82abc");
+  });
+
+  it("live-API delete entry: no new-side blob URL is called", async () => {
+    const changesWithDelete = JSON.stringify({
+      changeEntries: [
+        {
+          changeType: "delete",
+          item: { path: null, originalObjectId: "oldSideBlob" },
+          originalPath: "/src/deleted.ts",
+        },
+      ],
+    });
+
+    const { client, calls } = makeFakeClient([
+      { match: (u) => u.includes("/iterations?"), io: okIO(ITERATIONS_RESPONSE) },
+      { match: (u) => u.includes("/changes"), io: okIO(changesWithDelete) },
+      { match: (u) => u.includes("/blobs/oldSideBlob"), io: okIO("old content\n") },
+    ]);
+    const provider = createAdoVcsProvider({ config: { token: "tok" }, httpClient: client });
+
+    await provider.fetchDiff(adoPR()).unsafeRun();
+
+    // Only the old-side blob should be fetched; no new-side blob exists for a delete.
+    const blobCalls = calls.filter((c) => c.uri.includes("/blobs/"));
+    expect(blobCalls).toHaveLength(1);
+    expect(blobCalls[0]?.uri).toContain("oldSideBlob");
+  });
+
+  // -------------------------------------------------------------------------
+  // NUL-byte binary detection (Fix C — primary live-API binary path)
+  // -------------------------------------------------------------------------
+  it("NUL-byte in new-side blob content → binary stub emitted, not line diff", async () => {
+    // contentMetadata is absent (live-API norm). Binary detection MUST use NUL heuristic.
+    const changesNoBinaryMeta = JSON.stringify({
+      changeEntries: [
+        {
+          changeType: "edit",
+          item: {
+            path: "/assets/photo.jpg",
+            objectId: "newBinBlob",
+            originalObjectId: "oldBinBlob",
+            // No contentMetadata — live-API norm
+          },
+        },
+      ],
+    });
+
+    const binaryContent = "JPEG\xff\xfe\0some binary data";
+
+    const { client } = makeFakeClient([
+      { match: (u) => u.includes("/iterations?"), io: okIO(ITERATIONS_RESPONSE) },
+      { match: (u) => u.includes("/changes"), io: okIO(changesNoBinaryMeta) },
+      { match: (u) => u.includes("/blobs/oldBinBlob"), io: okIO("normal text\n") },
+      { match: (u) => u.includes("/blobs/newBinBlob"), io: okIO(binaryContent) },
+    ]);
+    const provider = createAdoVcsProvider({ config: { token: "tok" }, httpClient: client });
+
+    const result = await provider.fetchDiff(adoPR()).unsafeRun();
+
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      // Must emit binary stub, not line-by-line diff.
+      expect(result.value).toContain(
+        "Binary files a/assets/photo.jpg and b/assets/photo.jpg differ",
+      );
+      // Must NOT contain the raw binary content in the diff.
+      expect(result.value).not.toContain("JPEG");
+    }
+  });
+
+  it("NUL-byte in old-side blob content → binary stub emitted", async () => {
+    const changesNoBinaryMeta = JSON.stringify({
+      changeEntries: [
+        {
+          changeType: "edit",
+          item: {
+            path: "/lib/native.so",
+            objectId: "newSoBlob",
+            originalObjectId: "oldSoBlob",
+          },
+        },
+      ],
+    });
+
+    // Old side has NUL byte.
+    const oldBinaryContent = "ELF\0binary data here";
+
+    const { client } = makeFakeClient([
+      { match: (u) => u.includes("/iterations?"), io: okIO(ITERATIONS_RESPONSE) },
+      { match: (u) => u.includes("/changes"), io: okIO(changesNoBinaryMeta) },
+      { match: (u) => u.includes("/blobs/oldSoBlob"), io: okIO(oldBinaryContent) },
+      { match: (u) => u.includes("/blobs/newSoBlob"), io: okIO("also binary\0x") },
+    ]);
+    const provider = createAdoVcsProvider({ config: { token: "tok" }, httpClient: client });
+
+    const result = await provider.fetchDiff(adoPR()).unsafeRun();
+
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value).toContain(
+        "Binary files a/lib/native.so and b/lib/native.so differ",
+      );
+    }
+  });
+
+  it("text blobs without NUL bytes do NOT trigger binary stub", async () => {
+    const changesNoBinaryMeta = JSON.stringify({
+      changeEntries: [
+        {
+          changeType: "edit",
+          item: {
+            path: "/src/service.ts",
+            objectId: "newTextBlob",
+            originalObjectId: "oldTextBlob",
+          },
+        },
+      ],
+    });
+
+    const { client } = makeFakeClient([
+      { match: (u) => u.includes("/iterations?"), io: okIO(ITERATIONS_RESPONSE) },
+      { match: (u) => u.includes("/changes"), io: okIO(changesNoBinaryMeta) },
+      { match: (u) => u.includes("/blobs/oldTextBlob"), io: okIO("const x = 1;\n") },
+      { match: (u) => u.includes("/blobs/newTextBlob"), io: okIO("const x = 2;\n") },
+    ]);
+    const provider = createAdoVcsProvider({ config: { token: "tok" }, httpClient: client });
+
+    const result = await provider.fetchDiff(adoPR()).unsafeRun();
+
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      // Must NOT emit binary stub; must contain actual diff hunks.
+      expect(result.value).not.toContain("Binary files");
+      expect(result.value).toContain("@@");
+      expect(result.value).toContain("src/service.ts");
+    }
+  });
 });

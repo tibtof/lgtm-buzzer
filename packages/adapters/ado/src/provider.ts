@@ -20,8 +20,11 @@
  *   repositories/{repo}/blobs/{objectId}. No PR metadata, threads, comments.
  * - Every JSON response is zod-validated at the I/O boundary.
  *
- * Status: IMPLEMENTED, PENDING LIVE-INSTANCE VALIDATION (ADR-34 §Constraint).
- * See README for the list of unverified ADO API assumptions.
+ * Status: IMPLEMENTED, VALIDATED against live ADO REST 7.1 instance
+ * (org: Hackathon-2021, project/repo: Battleship, PR #82, 2026-06-05).
+ * Key findings applied: `item.path` is explicitly null on delete entries
+ * (not absent); `contentMetadata` is absent live — binary detection uses
+ * the NUL-byte heuristic exclusively.
  */
 
 import { IO } from "monadyssey";
@@ -301,7 +304,7 @@ const processFilesSequentially = (
  * 4. Incremental 2 MiB cap applied after each file's section.
  * 5. Brand final string as `Diff`.
  *
- * Status: IMPLEMENTED, PENDING LIVE-INSTANCE VALIDATION.
+ * Status: IMPLEMENTED, VALIDATED (live ADO 7.1, Hackathon-2021/Battleship PR #82).
  *
  * @param deps - Injected dependencies (`config` required, `httpClient` optional).
  * @returns A fully wired `VCSProvider`.
