@@ -105,15 +105,23 @@ export const createClaudeCliProvider = (deps: ClaudeCliDeps): LLMProvider => {
   // stream-json --verbose`. The `--verbose` flag is required by the Claude
   // Code CLI (≥2.1.165) to emit the full NDJSON event sequence under --print;
   // without it only the bare result text is printed (no {type:"result"} wrapper).
-  // Verified against claude@2.1.165: the stream emits:
+  //
+  // Flag set verified against claude@2.1.165 via live run:
+  //   echo hi | claude --print --output-format stream-json --verbose \
+  //                    --model sonnet --permission-mode default
+  // Exit 0. Stream emits:
   //   {"type":"system","subtype":"init",...}
   //   {"type":"assistant","message":{"content":[{"type":"text","text":"..."}],...},...}
   //   {"type":"result","subtype":"success","result":"<full model text>",...}
   // The terminal "result" line carries the complete model text in its `result`
   // field — identical in content to the old --output-format json .result field.
   //
-  // Length is exactly 9 elements (invariant updated from 7 — provider.test.ts
-  // case #3 asserts this).
+  // --no-cache-prompts is NOT a recognised flag in claude@2.1.165 and causes
+  // exit 1 with "unknown option '--no-cache-prompts'". It has been removed.
+  // Prompt caching does not affect correctness here (we parse the final result
+  // line regardless), so there is no substitute flag required.
+  //
+  // Length is exactly 8 elements (invariant — provider.test.ts case #3 asserts this).
   const fixedArgs: readonly string[] = [
     "--print",
     "--output-format",
@@ -123,7 +131,6 @@ export const createClaudeCliProvider = (deps: ClaudeCliDeps): LLMProvider => {
     model,
     "--permission-mode",
     "default",
-    "--no-cache-prompts",
   ];
 
   const generateQuiz = (

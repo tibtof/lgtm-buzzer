@@ -124,14 +124,14 @@ describe("createClaudeCliProvider", () => {
     }
   });
 
-  it("case #3 — no positional prompt: fixed argv has exactly 9 elements (ADR-36: stream-json)", async () => {
+  it("case #3 — no positional prompt: fixed argv has exactly 8 elements (ADR-36: stream-json)", async () => {
     const { spawnIO, calls } = makeFakeSpawn(successOutput(makeValidStdout()));
     const provider = createClaudeCliProvider({ spawnIO, ids: makeCounterIds() });
     await provider
       .generateQuiz({ diff: asDiff("d"), questionCount: 1 })
       .unsafeRun();
 
-    expect(calls[0]?.args).toHaveLength(9);
+    expect(calls[0]?.args).toHaveLength(8);
   });
 
   it("case #1 (argv) — fixed argv matches expected flags exactly (ADR-36: stream-json)", async () => {
@@ -150,7 +150,6 @@ describe("createClaudeCliProvider", () => {
       "sonnet",
       "--permission-mode",
       "default",
-      "--no-cache-prompts",
     ]);
   });
 
