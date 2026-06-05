@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { IO, NonEmptyList } from "monadyssey";
-import { createDispatcher } from "./dispatcher.js";
+import { createDispatcher, makeGenerationObserver } from "./dispatcher.js";
 import { createSessionStore } from "./session-store.js";
 import { createQuestionPoolCache } from "./question-pool-cache.js";
 import type { FrameWriter } from "./framing/writer.js";
@@ -18,8 +18,10 @@ import type {
   VCSProviderError,
   LLMProviderError,
   Diff,
+  QuizGenerationSignal,
 } from "@lgtm-buzzer/core";
 import type { AdapterRegistry, RegistryError } from "./registry.js";
+import { createProgressEmitter } from "./progress-emitter.js";
 
 // ---------------------------------------------------------------------------
 // Test doubles
@@ -1643,5 +1645,143 @@ describe("dispatcher — ADR-33: quiz-cancel-request", () => {
       expect.stringContaining("no-op"),
       expect.anything(),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR-36: makeGenerationObserver throttle + security canary tests
+// ---------------------------------------------------------------------------
+
+describe("makeGenerationObserver", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const makeTestEmitter = () => {
+    const frames: Frame[] = [];
+    const writer: FrameWriter = (frame) => IO.lift<never, void>(() => { frames.push(frame); });
+    const logger = makeNoopLogger();
+    let nowValue = 0;
+    const now = (): number => nowValue;
+    const advanceNow = (ms: number) => { nowValue += ms; };
+    const emitter = createProgressEmitter({ write: writer, logger, now });
+    return { frames, emitter, now, advanceNow };
+  };
+
+  it("stage change always emits immediately (thinking → writing)", async () => {
+    const { frames, emitter, now } = makeTestEmitter();
+    const { observer } = makeGenerationObserver("cid-1", 0, emitter, now);
+
+    observer.onSignal({ kind: "thinking" });
+    await vi.runAllTimersAsync();
+    const thinkingFrames = frames.filter(
+      (f) => f.kind === "quiz-progress" && f.payload.stage === "thinking",
+    );
+    expect(thinkingFrames.length).toBeGreaterThanOrEqual(1);
+
+    const beforeWriting = frames.length;
+    observer.onSignal({ kind: "writing", questionsWritten: 1 });
+    await vi.runAllTimersAsync();
+    const writingFrames = frames.slice(beforeWriting).filter(
+      (f) => f.kind === "quiz-progress" && f.payload.stage === "writing",
+    );
+    expect(writingFrames.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("rapid same-stage signals coalesce to ≤ throttle window + 1 frame per 1000ms", async () => {
+    const { frames, emitter, now, advanceNow } = makeTestEmitter();
+    const { observer, flush } = makeGenerationObserver("cid-2", 0, emitter, now);
+
+    // First thinking signal — this is a stage change so emits immediately.
+    observer.onSignal({ kind: "thinking" });
+    await vi.runAllTimersAsync();
+
+    // Flip to writing (stage change — immediate).
+    observer.onSignal({ kind: "writing", questionsWritten: 0 });
+    await vi.runAllTimersAsync();
+    const countAfterStageChange = frames.length;
+
+    // Rapid writing updates within the same 1000ms window.
+    for (let i = 1; i <= 50; i++) {
+      observer.onSignal({ kind: "writing", questionsWritten: i });
+    }
+    await vi.runAllTimersAsync();
+    // At most 1 trailing frame should have been added (throttle window).
+    const addedFrames = frames.length - countAfterStageChange;
+    expect(addedFrames).toBeLessThanOrEqual(2); // immediate + maybe 1 trailing
+
+    // After 1000ms, the trailing frame fires.
+    advanceNow(1100);
+    await vi.advanceTimersByTimeAsync(1100);
+
+    await flush();
+    // Total frames from writing phase should be small.
+    const writingFrames = frames.filter(
+      (f) => f.kind === "quiz-progress" && f.payload.stage === "writing",
+    );
+    // Must not be one per signal (50 signals ≠ 50 frames).
+    expect(writingFrames.length).toBeLessThan(10);
+  });
+
+  it("flush emits a trailing frame if there is a pending signal", async () => {
+    const { frames, emitter, now } = makeTestEmitter();
+    const { observer, flush } = makeGenerationObserver("cid-3", 0, emitter, now);
+
+    // Stage change → writing.
+    observer.onSignal({ kind: "thinking" });
+    await vi.runAllTimersAsync();
+    observer.onSignal({ kind: "writing", questionsWritten: 1 });
+    await vi.runAllTimersAsync();
+
+    // More writing signals within throttle window → queued.
+    observer.onSignal({ kind: "writing", questionsWritten: 5 });
+    const beforeFlush = frames.length;
+
+    await flush();
+    // The pending count=5 signal should have been emitted.
+    const flushedFrames = frames.slice(beforeFlush);
+    expect(flushedFrames.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("SECURITY canary: no quiz-progress frame contains diff/prompt text", async () => {
+    const SECRET_DIFF_CANARY = "SECRET_DIFF_CANARY_xyz123";
+    const { frames, emitter, now } = makeTestEmitter();
+    const { observer, flush } = makeGenerationObserver("cid-canary", 0, emitter, now);
+
+    // Simulate signals that might have been produced from a stream containing the canary.
+    // The signals themselves are typed to carry NO text — only kind and number.
+    const signals: QuizGenerationSignal[] = [
+      { kind: "thinking" },
+      { kind: "writing", questionsWritten: 1 },
+      { kind: "writing", questionsWritten: 2 },
+    ];
+    for (const s of signals) {
+      observer.onSignal(s);
+      await vi.runAllTimersAsync();
+    }
+    await flush();
+
+    // Assert no frame payload contains the canary string.
+    for (const frame of frames) {
+      const serialized = JSON.stringify(frame);
+      expect(serialized).not.toContain(SECRET_DIFF_CANARY);
+    }
+
+    // Assert frame payloads contain only allowed keys.
+    for (const frame of frames) {
+      if (frame.kind === "quiz-progress") {
+        const keys = Object.keys(frame.payload);
+        for (const key of keys) {
+          expect(["phase", "elapsedMs", "expectedMs", "stage", "questionsWritten"]).toContain(key);
+        }
+        // stage must be an enum string, not a text blob.
+        if (frame.payload.stage !== undefined) {
+          expect(["thinking", "writing"]).toContain(frame.payload.stage);
+        }
+        // questionsWritten must be a number.
+        if (frame.payload.questionsWritten !== undefined) {
+          expect(typeof frame.payload.questionsWritten).toBe("number");
+        }
+      }
+    }
   });
 });

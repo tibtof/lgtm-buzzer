@@ -122,9 +122,11 @@ export {
   QuizProgressPhaseSchema,
   QuizProgressPayloadSchema,
   QuizProgressFrameSchema,
+  QuizGenerationStageSchema,
   type QuizProgressPhase,
   type QuizProgressPayload,
   type QuizProgressFrame,
+  type QuizGenerationStage,
 } from "./messages/quiz-progress.js";
 
 export {

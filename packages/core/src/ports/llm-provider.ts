@@ -17,6 +17,36 @@ export type GenerateQuizInput = {
 };
 
 /**
+ * A pure discriminated union describing a sub-step signal from the LLM
+ * generation process (ADR-36).
+ *
+ * `thinking` — the LLM has received the prompt and is working on it.
+ * `writing`  — the LLM has begun emitting visible text; `questionsWritten`
+ *              is a best-effort, monotonically increasing, clamped count of
+ *              `"prompt":` delimiters seen in the accumulated assistant text
+ *              (explicitly approximate).
+ *
+ * BINDING: this type MUST NOT carry any raw stream text, diff bytes, or
+ * prompt content. Only structural metadata (stage enum + clamped integer).
+ */
+export type QuizGenerationSignal =
+  | { readonly kind: "thinking" }
+  | { readonly kind: "writing"; readonly questionsWritten?: number };
+
+/**
+ * An observer injected into `generateQuiz` to receive streaming sub-step
+ * signals from adapters that support it (ADR-36).
+ *
+ * `onSignal` is a plain function value — no I/O types. Core stays pure:
+ * the callback is declared here, injected by the host, and implemented as
+ * a side-effectful frame emitter outside core. Adapters that cannot stream
+ * simply never call `onSignal`; the `observer` param is optional.
+ */
+export type GenerateQuizObserver = {
+  readonly onSignal: (signal: QuizGenerationSignal) => void;
+};
+
+/**
  * Port contract for LLM-backed quiz generation.
  *
  * `generateQuiz` receives only `GenerateQuizInput` — a diff and a question
@@ -33,8 +63,15 @@ export type GenerateQuizInput = {
  * completeness and forward-compat with a future monadyssey that surfaces
  * cancellation via `Err`. Adapters MUST NOT construct `cancelled` from a
  * `SpawnError.cancelled` — that code path is unreachable at this version.
+ *
+ * ADR-36: an optional `observer` may be supplied. When present, streaming
+ * adapters (claude-cli) will call `observer.onSignal(signal)` for each
+ * sub-step. Non-streaming adapters ignore it entirely (no regression).
  */
 export type LLMProvider = {
   readonly id: string;
-  readonly generateQuiz: (input: GenerateQuizInput) => IO<LLMProviderError, Quiz>;
+  readonly generateQuiz: (
+    input: GenerateQuizInput,
+    observer?: GenerateQuizObserver,
+  ) => IO<LLMProviderError, Quiz>;
 };

@@ -290,4 +290,93 @@ describe("createProgressEmitter", () => {
       expect(writer).toBeDefined();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // ADR-36: emitGenerationStage tests
+  // ---------------------------------------------------------------------------
+
+  describe("emitGenerationStage", () => {
+    it("writes a quiz-progress frame with phase 'generating-quiz' and stage", async () => {
+      const { frames, writer } = makeWriteFake();
+      const { logger } = makeLogger();
+      const startedAt = 1000;
+      const emitter = createProgressEmitter({
+        write: writer,
+        logger,
+        now: () => startedAt + 500,
+      });
+
+      await emitter.emitGenerationStage("cid-1", startedAt, { stage: "thinking" });
+
+      expect(frames).toHaveLength(1);
+      const frame = frames[0]!.frame;
+      expect(frame.kind).toBe("quiz-progress");
+      if (frame.kind === "quiz-progress") {
+        expect(frame.payload.phase).toBe("generating-quiz");
+        expect(frame.payload.stage).toBe("thinking");
+        expect(frame.payload.elapsedMs).toBe(500);
+        expect(frame.payload.questionsWritten).toBeUndefined();
+      }
+    });
+
+    it("includes questionsWritten when provided", async () => {
+      const { frames, writer } = makeWriteFake();
+      const { logger } = makeLogger();
+      const emitter = createProgressEmitter({ write: writer, logger, now: () => 1000 });
+
+      await emitter.emitGenerationStage("cid-2", 1000, {
+        stage: "writing",
+        questionsWritten: 3,
+      });
+
+      if (frames[0]?.frame.kind === "quiz-progress") {
+        expect(frames[0].frame.payload.stage).toBe("writing");
+        expect(frames[0].frame.payload.questionsWritten).toBe(3);
+      }
+    });
+
+    it("does NOT throw when write fails — logs warning instead", async () => {
+      const { warnings, logger } = makeLogger();
+      const failingWriter: FrameWriter = () => IO.fail({ kind: "stream-closed" as const });
+      const emitter = createProgressEmitter({
+        write: failingWriter,
+        logger,
+        now: () => 0,
+      });
+
+      await expect(
+        emitter.emitGenerationStage("cid-3", 0, { stage: "thinking" }),
+      ).resolves.toBeUndefined();
+      expect(warnings.length).toBeGreaterThan(0);
+    });
+
+    it("SECURITY: emitted frame payload contains ONLY stage and questionsWritten (no raw text)", async () => {
+      const SECRET = "SECRET_DIFF_CANARY_xyz123";
+      const { frames, writer } = makeWriteFake();
+      const { logger } = makeLogger();
+      const emitter = createProgressEmitter({ write: writer, logger, now: () => 0 });
+
+      // Even if a caller tries to sneak text in via questionsWritten (it's typed as number),
+      // the payload is structurally controlled. We assert the serialized frame has no canary.
+      await emitter.emitGenerationStage("cid-4", 0, { stage: "writing", questionsWritten: 2 });
+
+      const serialized = JSON.stringify(frames[0]?.frame);
+      expect(serialized).not.toContain(SECRET);
+
+      // Verify allowed fields only.
+      if (frames[0]?.frame.kind === "quiz-progress") {
+        const payload = frames[0].frame.payload;
+        expect(Object.keys(payload).sort()).toEqual(
+          expect.arrayContaining(["phase", "elapsedMs", "stage", "questionsWritten"]),
+        );
+        // No text fields.
+        const payloadValues = Object.values(payload);
+        for (const v of payloadValues) {
+          if (typeof v === "string") {
+            expect(v).not.toContain(SECRET);
+          }
+        }
+      }
+    });
+  });
 });

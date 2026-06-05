@@ -24,8 +24,9 @@ import {
   emitDOMEvent,
   addDOMEventListener,
   type DOMEventLogger,
+  type QuizProgressEventDetail,
 } from "./dom-events.js";
-import type { QuizProgressPhase } from "@lgtm-buzzer/protocol";
+import type { QuizProgressPhase, QuizGenerationStage } from "@lgtm-buzzer/protocol";
 import type { PRIdentifier } from "@lgtm-buzzer/core";
 import { classifyError, errorClassToUI } from "./error-classes.js";
 import { createFocusTrap } from "./focus-trap.js";
@@ -882,15 +883,38 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
   // ADR-32: current phase from heartbeat. Used to update the subtitle text.
   let currentPhase: QuizProgressPhase | null = null;
 
+  // ADR-36: sub-step stage and question count from streaming adapter.
+  // Null when the current phase has no stage (codex/copilot/old host).
+  let currentStage: QuizGenerationStage | null = null;
+  let currentQuestionsWritten: number | null = null;
+
   // ---------------------------------------------------------------------------
   // ADR-32: phase-copy helper
   // ---------------------------------------------------------------------------
 
-  /** Returns human-readable copy for the current heartbeat phase. */
-  const phaseCopy = (phase: QuizProgressPhase): string => {
+  /**
+   * Returns human-readable copy for the current heartbeat phase.
+   *
+   * ADR-36: for `generating-quiz`, when a `stage` is present the copy reflects
+   * the LLM sub-step. `questionsWritten` is shown when known (approximate).
+   * No stage → today's "Generating quiz…" fallback (codex/copilot/old host).
+   */
+  const phaseCopy = (
+    phase: QuizProgressPhase,
+    stage?: QuizGenerationStage | null,
+    questionsWritten?: number | null,
+  ): string => {
     switch (phase) {
       case "fetching-diff":    return "Fetching diff…";
-      case "generating-quiz":  return "Generating quiz…";
+      case "generating-quiz":
+        if (stage === "thinking") return "Thinking…";
+        if (stage === "writing") {
+          if (questionsWritten !== null && questionsWritten !== undefined && questionsWritten > 0) {
+            return `Writing questions… (${questionsWritten})`;
+          }
+          return "Writing questions…";
+        }
+        return "Generating quiz…";
       case "parsing":          return "Parsing response…";
       case "caching":          return "Almost ready…";
     }
@@ -1047,8 +1071,10 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
     switch (state.kind) {
       case "generating": {
         const { requestId } = state;
-        // ADR-32: show phase copy when we have a heartbeat; otherwise static text.
-        subtitle.textContent = currentPhase !== null ? phaseCopy(currentPhase) : "Preparing your quiz…";
+        // ADR-32 + ADR-36: show phase/stage copy when we have a heartbeat; otherwise static text.
+        subtitle.textContent = currentPhase !== null
+          ? phaseCopy(currentPhase, currentStage, currentQuestionsWritten)
+          : "Preparing your quiz…";
         subtitle.setAttribute("data-testid", "lgtm-buzzer-generation-subtitle");
         content.appendChild(renderGenerating(doc));
 
@@ -1087,6 +1113,9 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
           timerEl.setAttribute("datetime", `PT${seconds}S`);
 
           // ADR-32: after 10s of no heartbeat, revert subtitle to static text.
+          // Sub-step frames (ADR-36) also update lastHeartbeatMs so this fallback
+          // stays alive as long as any quiz-progress frame (heartbeat or sub-step)
+          // has arrived within the last 10s.
           if (lastHeartbeatMs !== null && Date.now() - lastHeartbeatMs > 10_000) {
             subtitle.textContent = "Preparing your quiz…";
           }
@@ -1394,18 +1423,24 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
       cachedPassRate = null;
       lastHeartbeatMs = null;
       currentPhase = null;
+      currentStage = null;
+      currentQuestionsWritten = null;
     }
 
     // Leaving generating: clear heartbeat state.
     if (prev.kind === "generating" && next.kind !== "generating") {
       lastHeartbeatMs = null;
       currentPhase = null;
+      currentStage = null;
+      currentQuestionsWritten = null;
     }
 
     // Entering generating: reset heartbeat state for fresh generation.
     if (next.kind === "generating") {
       lastHeartbeatMs = null;
       currentPhase = null;
+      currentStage = null;
+      currentQuestionsWritten = null;
     }
 
     state = next;
@@ -1528,11 +1563,7 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
    *
    * In any other state: ignored (no-op).
    */
-  const onQuizProgress = (detail: {
-    requestId: string;
-    phase: QuizProgressPhase;
-    elapsedMs: number;
-  }): void => {
+  const onQuizProgress = (detail: QuizProgressEventDetail): void => {
     if (state.kind !== "generating") return;
     // Only handle progress for the active request.
     if (state.requestId !== detail.requestId) return;
@@ -1546,11 +1577,14 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
 
     lastHeartbeatMs = Date.now();
     currentPhase = detail.phase;
+    // ADR-36: update sub-step stage when present; keep last known stage if absent.
+    if (detail.stage !== undefined) currentStage = detail.stage;
+    if (detail.questionsWritten !== undefined) currentQuestionsWritten = detail.questionsWritten;
 
     // Update the subtitle text directly (avoid a full re-render).
     const subtitleEl = shadow?.querySelector<HTMLElement>("[data-testid='lgtm-buzzer-generation-subtitle']");
     if (subtitleEl !== null && subtitleEl !== undefined) {
-      subtitleEl.textContent = phaseCopy(detail.phase);
+      subtitleEl.textContent = phaseCopy(detail.phase, currentStage, currentQuestionsWritten);
     }
   };
 
@@ -1665,6 +1699,8 @@ export const createQuizModal = (deps: QuizModalDeps): QuizModal => {
         cachedPassRate = null;
         lastHeartbeatMs = null;
         currentPhase = null;
+        currentStage = null;
+        currentQuestionsWritten = null;
       };
     },
   };

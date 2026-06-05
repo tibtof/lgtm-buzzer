@@ -256,4 +256,157 @@ describe("spawnIO", () => {
     // 5s budget: real subprocess spawn under full-suite CPU contention can exceed a tight budget; this asserts correctness, not latency.
     5000,
   );
+
+  // ---------------------------------------------------------------------------
+  // ADR-36: onLine tests
+  // ---------------------------------------------------------------------------
+
+  it(
+    "9. onLine: fires once per complete newline-terminated line in order",
+    async () => {
+      const lines: string[] = [];
+      const result = await spawnIO(
+        NODE,
+        ["-e", "process.stdout.write('line1\\nline2\\nline3\\n')"],
+        undefined,
+        { onLine: (l) => { lines.push(l); } },
+      ).unsafeRun();
+
+      expect(result.type).toBe("Ok");
+      expect(lines).toEqual(["line1", "line2", "line3"]);
+    },
+    5000,
+  );
+
+  it(
+    "10. onLine: residual line (no trailing newline) flushed on process exit",
+    async () => {
+      const lines: string[] = [];
+      const result = await spawnIO(
+        NODE,
+        ["-e", "process.stdout.write('line1\\nresidue_no_newline')"],
+        undefined,
+        { onLine: (l) => { lines.push(l); } },
+      ).unsafeRun();
+
+      expect(result.type).toBe("Ok");
+      expect(lines).toEqual(["line1", "residue_no_newline"]);
+    },
+    5000,
+  );
+
+  it(
+    "11. onLine: full stdout still returned in SpawnOutput (streaming is additive)",
+    async () => {
+      const lines: string[] = [];
+      const result = await spawnIO(
+        NODE,
+        ["-e", "process.stdout.write('a\\nb\\n')"],
+        undefined,
+        { onLine: (l) => { lines.push(l); } },
+      ).unsafeRun();
+
+      expect(result.type).toBe("Ok");
+      if (result.type === "Ok") {
+        // Full buffered stdout is preserved.
+        expect(result.value.stdout).toBe("a\nb\n");
+      }
+      // onLine also fired.
+      expect(lines).toEqual(["a", "b"]);
+    },
+    5000,
+  );
+
+  it(
+    "12. onLine: a throwing callback does not fail the spawn",
+    async () => {
+      let callCount = 0;
+      const result = await spawnIO(
+        NODE,
+        ["-e", "process.stdout.write('ok\\n')"],
+        undefined,
+        {
+          onLine: () => {
+            callCount++;
+            throw new Error("callback throws intentionally");
+          },
+        },
+      ).unsafeRun();
+
+      // Spawn must succeed despite the throwing callback.
+      expect(result.type).toBe("Ok");
+      // The callback was called (throw was swallowed).
+      expect(callCount).toBeGreaterThanOrEqual(1);
+    },
+    5000,
+  );
+
+  it(
+    "13. onLine: cancellation still kills the child mid-stream; no onLine fires after abort",
+    async () => {
+      // Script: emit one line per second indefinitely.
+      // We cancel after catching the first line.
+      const receivedLines: string[] = [];
+      let capturedPid: number | undefined;
+      __spawnIO_testHooks.onSpawn = (pid) => { capturedPid = pid; };
+
+      try {
+        // Emit a line each 50ms so the test doesn't take too long.
+        const io = spawnIO(
+          NODE,
+          [
+            "-e",
+            "const fn = () => { process.stdout.write('tick\\n'); setTimeout(fn, 50); }; fn();",
+          ],
+          undefined,
+          {
+            graceMs: 200,
+            onLine: (l) => { receivedLines.push(l); },
+          },
+        );
+
+        const fiberResult = await io.fork().unsafeRun();
+        expect(fiberResult.type).toBe("Ok");
+        if (fiberResult.type !== "Ok") return;
+        const fiber = fiberResult.value;
+
+        // Wait until at least one line arrives.
+        const deadline = Date.now() + 3000;
+        while (receivedLines.length === 0 && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        expect(receivedLines.length).toBeGreaterThanOrEqual(1);
+
+        // Record how many lines arrived before cancel.
+        const countBeforeCancel = receivedLines.length;
+
+        await fiber.cancel();
+        const joined = await fiber.join();
+        expect(joined.type).toBe("Cancelled");
+
+        // Wait a moment, then verify no new lines arrived after cancel.
+        await new Promise((r) => setTimeout(r, 200));
+        expect(receivedLines.length).toBe(countBeforeCancel);
+
+        // PID must be dead.
+        expect(capturedPid).toBeDefined();
+        let pidGone = false;
+        try {
+          process.kill(capturedPid!, 0);
+        } catch (e: unknown) {
+          if (
+            typeof e === "object" &&
+            e !== null &&
+            (e as NodeJS.ErrnoException).code === "ESRCH"
+          ) {
+            pidGone = true;
+          }
+        }
+        expect(pidGone).toBe(true);
+      } finally {
+        __spawnIO_testHooks.onSpawn = () => {};
+      }
+    },
+    5000,
+  );
 });

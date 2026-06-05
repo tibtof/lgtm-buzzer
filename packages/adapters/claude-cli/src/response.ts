@@ -14,61 +14,85 @@ import type { IdGenerator } from "./ids.js";
 export { LlmQuestionSchema, LlmQuizSchema };
 
 /**
- * Schema for the outer JSON envelope that `claude --output-format json`
- * always wraps around the model's response.
+ * Schema for one NDJSON line in the `claude --output-format stream-json`
+ * output (ADR-36). We only care about the `result` line for quiz parsing;
+ * all other lines are handled by the streaming reducer in stream.ts.
  */
-export const ClaudePrintEnvelopeSchema = z.object({
+export const StreamJsonResultLineSchema = z.object({
   type: z.literal("result"),
-  subtype: z
-    .enum(["success", "error_max_turns", "error_during_execution"])
-    .optional(),
   result: z.string().min(1),
 });
 
 /**
- * Pure function that parses the raw stdout from a `claude --output-format json`
- * run into a `Quiz` domain object.
+ * Extract the complete model text from a `--output-format stream-json` stdout
+ * blob (ADR-36 §2).
  *
- * Implements the 7-step pipeline from ADR-14 §Decision 3:
- * 1. Parse stdout as JSON → `ClaudePrintEnvelopeSchema`. Fail → `malformed-response`.
- * 2. Extract `envelope.result`.
- * 3–7. Delegated to `parseQuizFromText` from `@lgtm-buzzer/adapter-shared`.
+ * The strategy: scan the full buffered stdout for the LAST line whose
+ * `type === "result"` and return its `result` field. This is identical in
+ * content to what `--output-format json` returned in the old `.result` field.
+ * The parser (`parseQuizFromText`) remains unchanged — it always sees the
+ * complete model text.
  *
- * The `raw` field in error payloads is the LLM's response clipped to 8 KiB.
- * It MUST NOT contain diff bytes (the diff is never present in stdout).
+ * BINDING: This function reads the complete buffered stdout, not the streaming
+ * incremental data. Streaming cannot corrupt the parse.
  *
- * @param stdout - The full stdout captured from the claude CLI process.
+ * @param stdout - The full buffered stdout from the claude CLI process.
+ * @returns `Right<string>` (the model text) or `Left<LLMProviderError>`.
+ */
+export const selectResultText = (stdout: string): Either<LLMProviderError, string> => {
+  const lines = stdout.split("\n");
+  let lastResultText: string | undefined;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === "") continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const parsed = StreamJsonResultLineSchema.safeParse(obj);
+    if (parsed.success) {
+      lastResultText = parsed.data.result;
+    }
+  }
+
+  if (lastResultText === undefined) {
+    return Left.pure<LLMProviderError>({
+      kind: "malformed-response",
+      detail: "no-result-event",
+      raw: clipRaw(stdout),
+    });
+  }
+
+  return Right.pure(lastResultText);
+};
+
+/**
+ * Parse the raw stdout from a `claude --output-format stream-json` run into
+ * a `Quiz` domain object (ADR-36).
+ *
+ * Pipeline:
+ * 1. `selectResultText(stdout)` — find the terminal `{type:"result"}` line
+ *    and extract its `result` field. Fail → `malformed-response { detail: "no-result-event" }`.
+ * 2. `parseQuizFromText(modelText, ids)` — existing 7-step pipeline.
+ *
+ * The `raw` field in error payloads is clipped to 8 KiB and MUST NOT
+ * contain diff bytes (the diff is in stdin only, never in stdout).
+ *
+ * @param stdout - The full buffered stdout captured from the claude CLI process.
  * @param ids - Injected ID factory; use `defaultIdGenerator()` in production.
- * @returns `Right<Quiz>` on success, `Left<LLMProviderError>` on any parse failure.
+ * @returns `Right<Quiz>` on success, `Left<LLMProviderError>` on any failure.
  */
 export const parseResponse = (
   stdout: string,
   ids: IdGenerator,
 ): Either<LLMProviderError, Quiz> => {
-  // Step 1: parse outer envelope
-  let envelopeRaw: unknown;
-  try {
-    envelopeRaw = JSON.parse(stdout);
-  } catch {
-    return Left.pure<LLMProviderError>({
-      kind: "malformed-response",
-      detail: "envelope-parse-failed",
-      raw: clipRaw(stdout),
-    });
-  }
-
-  const envelopeResult = ClaudePrintEnvelopeSchema.safeParse(envelopeRaw);
-  if (!envelopeResult.success) {
-    return Left.pure<LLMProviderError>({
-      kind: "malformed-response",
-      detail: `envelope-schema: ${envelopeResult.error.issues.map((i) => i.message).join("; ")}`,
-      raw: clipRaw(stdout),
-    });
-  }
-
-  // Step 2: extract model text; steps 3–7 handled by shared helper
-  const modelText = envelopeResult.data.result;
-  return parseQuizFromText(modelText, ids);
+  return selectResultText(stdout).fold(
+    (err) => Left.pure<LLMProviderError>(err),
+    (modelText) => parseQuizFromText(modelText, ids),
+  );
 };
 
 // Ensure Right and Left imports are not unused (used via parseQuizFromText delegate).
