@@ -184,6 +184,27 @@ const resolveHostBinaryPath = (): string => {
 };
 
 /**
+ * A single name/value env var to bake into the wrapper's export block.
+ *
+ * Captured at install time and re-exported in `host-wrapper.sh` so the host
+ * sees the value under Chrome's minimal-environment spawn. ONLY emitted when
+ * `value` is non-empty (no `export NAME=''` shadow lines).
+ */
+export type PassThroughEnvVar = {
+  /**
+   * Env var name. MUST match `/^[A-Z_][A-Z0-9_]*$/` (validated by
+   * `renderNodeWrapper`). The name list is a hard-coded constant, never user
+   * input — a bad name is a programmer error → `throw`.
+   */
+  readonly name: string;
+  /** Captured value. Single-quote-escaped before emission. */
+  readonly value: string;
+};
+
+/** Regex for valid POSIX env var names (all-caps). */
+const VALID_ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+
+/**
  * Renders the POSIX shell wrapper that exec's `node` with an absolute path
  * to the host JS entry. Exported for tests.
  *
@@ -204,8 +225,16 @@ const resolveHostBinaryPath = (): string => {
  * Single-quote-escaped paths protect against spaces and shell metacharacters
  * (notably `~/Library/Application Support/...` style macOS paths).
  *
+ * Pass-through env vars (e.g. `AZURE_DEVOPS_EXT_PAT`) are baked into the
+ * wrapper ONLY when non-empty. Empty/absent entries produce NO export line,
+ * so a value the user later exports into a re-launched host environment is
+ * not shadowed by an empty bake.
+ *
  * @returns A small POSIX shell script as a string, ready to write to disk
  *   and `chmod +x`.
+ * @throws {Error} if any `passThroughEnv` name does not match
+ *   `/^[A-Z_][A-Z0-9_]*$/` (programmer error — the list is a hard-coded
+ *   constant, never user input).
  */
 export const renderNodeWrapper = (input: {
   readonly nodePath: string;
@@ -231,8 +260,35 @@ export const renderNodeWrapper = (input: {
    * include it.
    */
   readonly capturedShell: string;
+  /**
+   * Optional list of env vars to bake verbatim into the wrapper. Each entry
+   * is emitted as `NAME='<escaped value>'` + `export NAME`. Entries whose
+   * `value` is empty are silently skipped — no empty export line is emitted.
+   *
+   * Today the only entry populated is `AZURE_DEVOPS_EXT_PAT` (Fix 2,
+   * ADR-35), but the param is general so future env secrets need no
+   * signature change.
+   */
+  readonly passThroughEnv?: readonly PassThroughEnvVar[];
 }): string => {
   const escape = (p: string): string => `'${p.replace(/'/g, `'\\''`)}'`;
+
+  // Validate and render the pass-through env block.
+  const passThroughBlock = (input.passThroughEnv ?? [])
+    .filter((entry) => entry.value.length > 0)
+    .map((entry) => {
+      if (!VALID_ENV_NAME.test(entry.name)) {
+        throw new Error(
+          `renderNodeWrapper: invalid env var name "${entry.name}" — must match /^[A-Z_][A-Z0-9_]*$/`,
+        );
+      }
+      return `${entry.name}=${escape(entry.value)}\nexport ${entry.name}`;
+    })
+    .join("\n");
+
+  const passThroughSection =
+    passThroughBlock.length > 0 ? `\n# Pass-through env vars baked in at install time.\n${passThroughBlock}\n` : "";
+
   // Strategy: bake the user's install-time PATH into the wrapper verbatim.
   // It already reflects whatever shell init they have (homebrew, nvm, pyenv,
   // mise, asdf, custom ~/.local/bin entries — anything they normally use).
@@ -251,7 +307,7 @@ USER=${escape(input.capturedUser)}
 LOGNAME=${escape(input.capturedUser)}
 SHELL=${escape(input.capturedShell)}
 export PATH USER LOGNAME SHELL
-
+${passThroughSection}
 NODE=${escape(input.nodePath)}
 if [ ! -x "$NODE" ]; then
   # Captured node binary is gone (nvm upgrade, profile move…). Fall back to
@@ -310,6 +366,17 @@ export const main = (): void => {
   const capturedUser =
     process.env["USER"] ?? process.env["LOGNAME"] ?? "";
   const capturedShell = process.env["SHELL"] ?? "/bin/sh";
+
+  // Allow-list of env vars to bake into the wrapper for pass-through under
+  // Chrome's minimal-environment spawn. Today only AZURE_DEVOPS_EXT_PAT:
+  // Chrome strips it, so the ADO PAT path is unreachable without this.
+  // Only bake when non-empty; omit entirely when unset (no empty shadow line).
+  const PASS_THROUGH_ENV_NAMES = ["AZURE_DEVOPS_EXT_PAT"] as const;
+  const passThroughEnv = PASS_THROUGH_ENV_NAMES.flatMap((name) => {
+    const value = process.env[name];
+    return value !== undefined && value.length > 0 ? [{ name, value }] : [];
+  });
+
   const distDir = path.dirname(hostBinaryPath);
   const wrapperPath = path.join(distDir, "host-wrapper.sh");
   fs.writeFileSync(
@@ -320,6 +387,7 @@ export const main = (): void => {
       capturedPath,
       capturedUser,
       capturedShell,
+      passThroughEnv,
     }),
     { mode: 0o755 },
   );

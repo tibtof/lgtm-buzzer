@@ -186,24 +186,26 @@ describe("resolver — github", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolver — ado", () => {
-  it("AZURE_DEVOPS_EXT_PAT env hit → Right", async () => {
+  it("AZURE_DEVOPS_EXT_PAT env hit → Right with scheme: 'basic'", async () => {
     const { spawnIO } = makeFakeSpawnIO({ outcome: "fail", kind: "spawn-failed" });
     const resolver = makeResolver({ AZURE_DEVOPS_EXT_PAT: "azp_xxx" }, spawnIO);
     const result = await resolver.resolve("ado").unsafeRun();
     expect(result.type).toBe("Ok");
     if (result.type === "Ok") {
       expect(result.value.secret).toBe("azp_xxx");
+      expect(result.value.scheme).toBe("basic");
       expect(result.value.detail).toContain("AZURE_DEVOPS_EXT_PAT");
     }
   });
 
-  it("env miss + az CLI exit-0 → Right (via az CLI)", async () => {
+  it("env miss + az CLI exit-0 → Right with scheme: 'bearer'", async () => {
     const { spawnIO, calls } = makeFakeSpawnIO({ outcome: "ok", stdout: "aztoken\n" });
     const resolver = makeResolver({}, spawnIO);
     const result = await resolver.resolve("ado").unsafeRun();
     expect(result.type).toBe("Ok");
     if (result.type === "Ok") {
       expect(result.value.secret).toBe("aztoken");
+      expect(result.value.scheme).toBe("bearer");
       expect(result.value.detail).toContain("az CLI");
     }
     expect(calls[0]!.command).toBe("az");
@@ -340,6 +342,73 @@ describe("resolver — wall-clock timeout (regression: graceMs is not a wall-clo
       expect(result.error.adapterId).toBe("ado");
       expect(result.error.hint).toContain("timed out after");
       expect(result.error.hint).toContain(`${timeoutMs}ms`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR-35: scheme per resolver source (BINDING)
+// ---------------------------------------------------------------------------
+
+describe("resolver — ADR-35 scheme per source (BINDING)", () => {
+  it("github GITHUB_TOKEN env → scheme: 'basic'", async () => {
+    const { spawnIO } = makeFakeSpawnIO({ outcome: "fail", kind: "spawn-failed" });
+    const resolver = makeResolver({ GITHUB_TOKEN: "ghp_tok" }, spawnIO);
+    const result = await resolver.resolve("github").unsafeRun();
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.scheme).toBe("basic");
+    }
+  });
+
+  it("github gh CLI hit → scheme: 'basic'", async () => {
+    const { spawnIO } = makeFakeSpawnIO({ outcome: "ok", stdout: "ghp_cli\n" });
+    const resolver = makeResolver({}, spawnIO);
+    const result = await resolver.resolve("github").unsafeRun();
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.scheme).toBe("basic");
+    }
+  });
+
+  it("claude-api ANTHROPIC_API_KEY env → scheme: 'basic'", async () => {
+    const { spawnIO } = makeFakeSpawnIO({ outcome: "fail", kind: "spawn-failed" });
+    const resolver = makeResolver({ ANTHROPIC_API_KEY: "sk-ant" }, spawnIO);
+    const result = await resolver.resolve("claude-api").unsafeRun();
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.scheme).toBe("basic");
+    }
+  });
+
+  it("claude-cli (CLI-managed) → scheme: 'basic', secret: undefined", async () => {
+    const { spawnIO } = makeFakeSpawnIO({ outcome: "fail", kind: "spawn-failed" });
+    const resolver = makeResolver({}, spawnIO);
+    const result = await resolver.resolve("claude-cli").unsafeRun();
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.scheme).toBe("basic");
+      expect(result.value.secret).toBeUndefined();
+    }
+  });
+
+  it("ado AZURE_DEVOPS_EXT_PAT env → scheme: 'basic'", async () => {
+    const { spawnIO } = makeFakeSpawnIO({ outcome: "fail", kind: "spawn-failed" });
+    const resolver = makeResolver({ AZURE_DEVOPS_EXT_PAT: "pat_abc" }, spawnIO);
+    const result = await resolver.resolve("ado").unsafeRun();
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.scheme).toBe("basic");
+    }
+  });
+
+  it("ado az CLI hit → scheme: 'bearer'", async () => {
+    const { spawnIO } = makeFakeSpawnIO({ outcome: "ok", stdout: "eyJhbGciOiJSUzI1NiJ9\n" });
+    const resolver = makeResolver({}, spawnIO);
+    const result = await resolver.resolve("ado").unsafeRun();
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.scheme).toBe("bearer");
     }
   });
 });

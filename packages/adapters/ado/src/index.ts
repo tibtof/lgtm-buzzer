@@ -25,8 +25,8 @@ export {
 } from "./url.js";
 export type { AdoPR } from "./url.js";
 export { mapHttpError } from "./errors.js";
-export { createAdoHttpClient } from "./http.js";
-export type { HttpClientConfig } from "./http.js";
+export { createAdoHttpClient, buildAuthHeader } from "./http.js";
+export type { AdoAuthScheme, HttpClientConfig } from "./http.js";
 export { toDiffFiles } from "./changes.js";
 export type { PlannedFile } from "./changes.js";
 export {

@@ -171,7 +171,8 @@ export const createDefaultAdapterRegistry = (
           }),
         (cred): IO<RegistryError, VCSProvider> => {
           const token = cred.secret ?? "";
-          return IO.pure(createAdoVcsProvider({ config: { token } }));
+          const authScheme = cred.scheme === "bearer" ? "bearer" : "basic";
+          return IO.pure(createAdoVcsProvider({ config: { token, authScheme } }));
         },
       ),
   };

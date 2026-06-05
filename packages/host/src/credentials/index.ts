@@ -8,6 +8,7 @@
 export {
   createDefaultCredentialResolver,
   type CredentialResolver,
+  type CredentialScheme,
   type ResolverError,
   type ResolvedCredential,
 } from "./resolver.js";

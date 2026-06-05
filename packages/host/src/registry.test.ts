@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { IO } from "monadyssey";
 import { createDefaultAdapterRegistry } from "./registry.js";
-import type { CredentialResolver, ResolvedCredential, ResolverError } from "./credentials/index.js";
+import type { CredentialResolver, CredentialScheme, ResolvedCredential, ResolverError } from "./credentials/index.js";
 import type { SpawnError, SpawnOutput, SpawnOptions } from "@lgtm-buzzer/adapter-shared";
 
 // ---------------------------------------------------------------------------
@@ -29,12 +29,14 @@ const fakeSpawnIO = (
 const makeFakeResolver = (
   results: Readonly<Record<string, "ok" | "miss">>,
   secretFor: (adapterId: string) => string | undefined = (id) => `secret-for-${id}`,
+  schemeFor: (adapterId: string) => CredentialScheme = () => "basic",
 ): CredentialResolver => ({
   resolve: (adapterId: string): IO<ResolverError, ResolvedCredential> => {
     const outcome = results[adapterId] ?? "miss";
     if (outcome === "ok") {
       return IO.pure<ResolvedCredential>({
         secret: secretFor(adapterId),
+        scheme: schemeFor(adapterId),
         detail: `via test-resolver for ${adapterId}`,
       });
     }
@@ -97,7 +99,7 @@ describe("registry.buildLlm — happy paths", () => {
     const resolver: CredentialResolver = {
       resolve: (id) => {
         resolveCalls.push(id);
-        return IO.pure<ResolvedCredential>({ secret: undefined, detail: "cli" });
+        return IO.pure<ResolvedCredential>({ secret: undefined, scheme: "basic", detail: "cli" });
       },
     };
     const registry = createDefaultAdapterRegistry({ spawnIO: fakeSpawnIO, resolver });
@@ -136,7 +138,7 @@ describe("registry.buildLlm — happy paths", () => {
     let capturedApiKey: string | undefined;
     const resolver: CredentialResolver = {
       resolve: () =>
-        IO.pure<ResolvedCredential>({ secret: "sk-test-key", detail: "via ANTHROPIC_API_KEY env" }),
+        IO.pure<ResolvedCredential>({ secret: "sk-test-key", scheme: "basic", detail: "via ANTHROPIC_API_KEY env" }),
     };
     const registry = createDefaultAdapterRegistry({ spawnIO: fakeSpawnIO, resolver });
     const result = await registry.buildLlm("claude-api").unsafeRun();
@@ -277,6 +279,57 @@ describe("registry — per-request freshness", () => {
     expect(b.type).toBe("Ok");
     if (a.type === "Ok" && b.type === "Ok") {
       expect(a.value).not.toBe(b.value);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR-35: ado factory threads scheme from resolver → adapter config
+// ---------------------------------------------------------------------------
+
+describe("registry.buildVcs('ado') — ADR-35 scheme pass-through (BINDING)", () => {
+  it("resolver scheme 'basic' → ado factory constructs successfully", async () => {
+    const resolver = makeFakeResolver(
+      { ado: "ok" },
+      () => "pat_token",
+      () => "basic",
+    );
+    const registry = createDefaultAdapterRegistry({ spawnIO: fakeSpawnIO, resolver });
+    const result = await registry.buildVcs("ado").unsafeRun();
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.id).toBe("ado");
+    }
+  });
+
+  it("resolver scheme 'bearer' → ado factory constructs successfully", async () => {
+    const resolver = makeFakeResolver(
+      { ado: "ok" },
+      () => "aad_bearer_token",
+      () => "bearer",
+    );
+    const registry = createDefaultAdapterRegistry({ spawnIO: fakeSpawnIO, resolver });
+    const result = await registry.buildVcs("ado").unsafeRun();
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.id).toBe("ado");
+    }
+  });
+
+  it("github factory is unaffected by ado scheme change — uses 'basic' unchanged", async () => {
+    // Confirm that the github factory construction is byte-identical to before:
+    // it reads cred.secret and calls createGithubVcsProvider({ config: { token } })
+    // with no authScheme involved.
+    const resolver = makeFakeResolver(
+      { github: "ok" },
+      () => "github_pat",
+      () => "basic",
+    );
+    const registry = createDefaultAdapterRegistry({ spawnIO: fakeSpawnIO, resolver });
+    const result = await registry.buildVcs("github").unsafeRun();
+    expect(result.type).toBe("Ok");
+    if (result.type === "Ok") {
+      expect(result.value.id).toBe("github");
     }
   });
 });
