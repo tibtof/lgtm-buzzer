@@ -14462,3 +14462,417 @@ it's a follow-up PR that lands once the prompt + judge are merged.
   typecheck:tests).
 
 ---
+
+## ADR-35 (2026-06-05): ADO auth scheme detection (Basic for PAT, Bearer for AAD) + env-var pass-through in the host wrapper
+**Date**: 2026-06-05
+**Issue**: #137
+**Status**: Accepted
+
+### Context
+
+Live-instance validation prep for the ADO adapter (ADR-34) surfaced two
+authentication bugs that together make ADO approval impossible for the
+two real-world setups we support. Both are verified in the code.
+
+**Bug 1 — AAD `az login` path always 401s (PRIMARY blocker).**
+`packages/host/src/credentials/resolver.ts` `resolveAdo` resolves the ADO
+credential from one of two sources:
+
+1. `AZURE_DEVOPS_EXT_PAT` env var — a **PAT**.
+2. `az account get-access-token --resource
+   499b84ac-1321-427f-aa17-267ca6975798` — an **AAD OAuth bearer token**,
+   NOT a PAT.
+
+`packages/adapters/ado/src/http.ts` then ALWAYS encodes the resolved
+secret as Basic auth (`Authorization: Basic base64(":" + secret)`), which
+is the PAT scheme. Azure DevOps requires AAD tokens via
+`Authorization: Bearer <token>` and PATs via Basic. So the `az` path — a
+bearer token sent as Basic — returns 401. The reporting user's org is
+AAD-backed and uses `az login`, so this is their hard blocker. The
+resolver already *knows* which source produced the secret (it picks the
+chain step), but that knowledge is discarded before the adapter sees it:
+`ResolvedCredential` carries only `{ secret, detail }`, and the registry
+constructs the adapter with `{ config: { token } }` regardless of source.
+
+**Bug 2 — PAT env path is dead under Chrome (SECONDARY).**
+Chrome spawns the native host with a minimal environment. The
+install-manifest wrapper (`packages/host/src/install-manifest.ts`
+`renderNodeWrapper`) only bakes `PATH/USER/LOGNAME/SHELL` from the
+installer's environment. So `process.env.AZURE_DEVOPS_EXT_PAT` is
+`undefined` at host runtime even if the user exported it in their shell,
+which makes the PAT env path unreachable under Chrome. GitHub sidesteps
+this because `gh auth token` is a CLI that reads its own stored creds; ADO
+PATs have no equivalent CLI, so the only delivery channel for a PAT is the
+env var — which Chrome strips.
+
+This ADR amends **ADR-29 §Per-adapter resolver chain / §credentials** (the
+`ResolvedCredential` shape) and **ADR-34's auth assumption** (that ADO
+auth is always Basic-with-PAT).
+
+### Decision
+
+Two coordinated fixes, scoped so Fix 1 (required, unblocks the user) can
+ship without Fix 2 (secondary, for PAT/non-AAD orgs).
+
+- **Fix 1 — scheme-aware credential.** Tag every resolved ADO credential
+  with the auth scheme its source implies (`basic` for the PAT env var,
+  `bearer` for the `az` AAD token). Thread that tag resolver → registry →
+  adapter factory → HTTP header construction so `http.ts` emits the
+  correct `Authorization` header per scheme.
+- **Fix 2 — env-var pass-through in the wrapper.** Generalise the install
+  wrapper to capture a small, fixed allow-list of pass-through env vars
+  (today only `AZURE_DEVOPS_EXT_PAT`) at install time and re-export them
+  in `host-wrapper.sh`, but ONLY when set in the installer's environment,
+  so the host sees the user's PAT under Chrome's minimal spawn.
+
+#### Affected workspaces
+
+- `packages/host/` — `ResolvedCredential` grows a `scheme` field
+  (resolver.ts); `resolveAdo` tags each source; the registry's `ado`
+  factory passes `authScheme` into the adapter config; `install-manifest.ts`
+  `renderNodeWrapper` gains a pass-through-env mechanism. Host-only.
+- `packages/adapters/ado/` — `AdoAdapterConfig` and `HttpClientConfig`
+  grow an `authScheme` field; `http.ts` builds Basic OR Bearer header
+  accordingly. Adapter-only.
+- `packages/core/` — **no changes.** `ResolvedCredential` lives in `host`,
+  not `core`; the scheme tag is a host-internal + adapter-config concern.
+  `VCSProvider` is unchanged.
+- `packages/protocol/` — **no changes.** Nothing new crosses the wire; the
+  scheme is derived host-side and never leaves the host process.
+- `packages/extension/` — **no changes.**
+
+**Dependency arrows reaffirmed** (unchanged by this ADR):
+
+```
+protocol  ← core  ← adapters  ← host
+protocol  ← core  ← extension
+```
+
+The scheme tag flows host → adapter via the adapter's existing `config`
+object — exactly the channel ADR-29 already uses for the resolved secret.
+No new import edges. The resolver stays host-only (it reads `process.env`
+and spawns `az`); ADR-29 §"Why the resolver is not a `core` port" still
+holds.
+
+#### Types
+
+##### `packages/host/src/credentials/resolver.ts` (modified)
+
+`ResolvedCredential` gains a `scheme` discriminant. The scheme is
+**general** (any adapter may set it), but only `ado` currently varies it;
+every other resolver defaults to `"basic"` so existing construction is
+unaffected. We use `"basic" | "bearer"` rather than an ADO-specific name
+because the HTTP-header distinction (Basic vs Bearer) is itself general,
+and a future adapter that needs Bearer auth can reuse the tag without
+another ADR.
+
+```ts
+/**
+ * HTTP authorization scheme implied by the credential's source.
+ *
+ * - `"basic"`  — the secret is used as an HTTP Basic password (ADO PAT,
+ *                GitHub PAT). The adapter encodes `base64(":" + secret)`.
+ * - `"bearer"` — the secret is an OAuth bearer token (ADO AAD token from
+ *                `az account get-access-token`). The adapter sends
+ *                `Authorization: Bearer <secret>` verbatim.
+ *
+ * Defaults to `"basic"` for every resolver except the ADO `az` path,
+ * preserving ADR-29 construction semantics for github / claude-api.
+ */
+export type CredentialScheme = "basic" | "bearer";
+
+export type ResolvedCredential = {
+  readonly secret: string | undefined;
+  /** Auth scheme the secret's source implies. Default `"basic"`. */
+  readonly scheme: CredentialScheme;
+  readonly detail: string;
+};
+```
+
+Per-source tagging in `resolveAdo`:
+
+| Source | `scheme` | `detail` (unchanged) |
+|---|---|---|
+| `AZURE_DEVOPS_EXT_PAT` env | `"basic"` | `via AZURE_DEVOPS_EXT_PAT env` |
+| `az account get-access-token` | `"bearer"` | `via az CLI` |
+
+`resolveGitHub`, `resolveClaudeApi`, `resolveCliManaged` all set
+`scheme: "basic"` (the CLI-managed no-op secret is `undefined`, so the
+scheme is moot, but `"basic"` keeps the field total — no optionality, no
+`exactOptionalPropertyTypes` friction).
+
+##### `packages/adapters/ado/src/http.ts` (modified)
+
+`HttpClientConfig` and the adapter's `AdoAdapterConfig` (provider.ts) gain
+an optional `authScheme`, defaulting to `"basic"` for backward-compat with
+PAT-only construction:
+
+```ts
+/** ADO auth scheme. `"basic"` = PAT, `"bearer"` = AAD token. Default `"basic"`. */
+export type AdoAuthScheme = "basic" | "bearer";
+
+export type HttpClientConfig = {
+  readonly token: string;
+  /** Auth scheme. Default `"basic"` (PAT). `"bearer"` for AAD tokens. */
+  readonly authScheme?: AdoAuthScheme;
+  readonly baseUrl?: string;
+  readonly timeoutMs?: number;
+  readonly userAgent?: string;
+};
+```
+
+##### `packages/host/src/install-manifest.ts` (modified)
+
+`renderNodeWrapper` gains a `passThroughEnv` input — an ordered list of
+`{ name, value }` pairs captured at install time. Kept general (a list,
+not an ADO-specific field) so future env secrets need no signature change,
+but the only entry populated today is `AZURE_DEVOPS_EXT_PAT`.
+
+```ts
+/** A single name/value env var to bake into the wrapper's export block. */
+export type PassThroughEnvVar = {
+  /** Env var name. MUST match /^[A-Z_][A-Z0-9_]*$/ (validated by caller). */
+  readonly name: string;
+  /** Captured value. Single-quote-escaped before emission. */
+  readonly value: string;
+};
+
+// renderNodeWrapper input gains:
+//   readonly passThroughEnv?: readonly PassThroughEnvVar[];
+```
+
+#### Functions and methods
+
+**`resolveAdo`** (host, modified) — the two `IO.pure<ResolvedCredential>`
+returns add `scheme`:
+- env hit → `{ secret, scheme: "basic", detail }`
+- `az` hit → `{ secret, scheme: "bearer", detail }`
+
+**`encodeAdoPat` stays** (Basic path). Add a pure header selector in
+`http.ts`:
+
+```ts
+/**
+ * Build the ADO `Authorization` header value for a given scheme.
+ * Basic → `Basic base64(":" + secret)`. Bearer → `Bearer <secret>`.
+ * The secret is never logged; this function only returns the header value.
+ */
+const buildAuthHeader = (token: string, scheme: AdoAuthScheme): string =>
+  scheme === "bearer" ? `Bearer ${token}` : `Basic ${encodeAdoPat(token)}`;
+```
+
+`createAdoHttpClient` reads `config.authScheme ?? "basic"` and sets
+`Authorization: buildAuthHeader(config.token, scheme)`.
+`createAdoVcsProvider` threads `config.authScheme` into the
+`createAdoHttpClient(...)` call (both the `userAgent`-present and
+`-absent` branches).
+
+**Registry `ado` factory** (host, modified) — passes the scheme through:
+
+```ts
+(cred): IO<RegistryError, VCSProvider> => {
+  const token = cred.secret ?? "";
+  return IO.pure(
+    createAdoVcsProvider({
+      config: { token, authScheme: cred.scheme === "bearer" ? "bearer" : "basic" },
+    }),
+  );
+}
+```
+
+(The `github` factory is left untouched — it constructs
+`{ config: { token } }` with no `authScheme`, defaulting to Basic, which
+is GitHub's PAT scheme; GitHub's own adapter auth is out of scope.)
+
+**`renderNodeWrapper`** (host, modified) — after the existing
+`PATH/USER/LOGNAME/SHELL` block, emit one `export`-prefixed line per
+populated `passThroughEnv` entry:
+
+```sh
+AZURE_DEVOPS_EXT_PAT='<escaped value>'
+export AZURE_DEVOPS_EXT_PAT
+```
+
+Emitted ONLY when the entry is present. An unset var produces NO line
+(not `export AZURE_DEVOPS_EXT_PAT=''`), so a value the user later exports
+into a re-launched host environment is not shadowed by an empty bake.
+Names are validated against `/^[A-Z_][A-Z0-9_]*$/` (invariant — caller
+controls the list; a bad name is a programmer error → `throw`); values are
+single-quote-escaped with the existing `escape` helper.
+
+**`main`** (host, modified) — capture the pass-through allow-list:
+
+```ts
+const PASS_THROUGH_ENV_NAMES = ["AZURE_DEVOPS_EXT_PAT"] as const;
+
+const passThroughEnv = PASS_THROUGH_ENV_NAMES.flatMap((name) => {
+  const value = process.env[name];
+  return value !== undefined && value.length > 0
+    ? [{ name, value }]
+    : [];
+});
+```
+
+…and pass `passThroughEnv` into `renderNodeWrapper`. Empty array → no
+extra lines, identical wrapper output to today.
+
+#### File layout
+
+Modified files only (no new files):
+
+- `packages/host/src/credentials/resolver.ts` — add `CredentialScheme`,
+  add `scheme` to `ResolvedCredential`, tag all resolver return sites.
+- `packages/host/src/credentials/resolver.test.ts` — assert scheme per
+  source.
+- `packages/host/src/credentials/index.ts` — re-export `CredentialScheme`.
+- `packages/host/src/registry.ts` — `ado` factory passes `authScheme`.
+- `packages/host/src/install-manifest.ts` — `PassThroughEnvVar`,
+  `renderNodeWrapper` env block, `main` capture.
+- `packages/host/src/install-manifest.test.ts` — wrapper capture/omit +
+  escaping + no-duplicate canary.
+- `packages/adapters/ado/src/http.ts` — `AdoAuthScheme`, `authScheme` on
+  `HttpClientConfig`, `buildAuthHeader`, scheme-aware header.
+- `packages/adapters/ado/src/http.test.ts` — Basic vs Bearer header +
+  no-log canary on both paths.
+- `packages/adapters/ado/src/provider.ts` — `authScheme` on
+  `AdoAdapterConfig`, threaded into `createAdoHttpClient`.
+- `packages/adapters/ado/src/index.ts` — export `AdoAuthScheme`.
+- `packages/adapters/ado/README.md` — flip the "ADO auth = Basic/PAT"
+  assumption to "Basic for PAT, Bearer for AAD"; note the live-validation
+  status.
+
+#### Sequence
+
+ADO quiz path, post-fix, AAD (`az login`) org:
+
+1. SW sends `quiz-request` (or options page sends `check-auth-request`);
+   host dispatches to the registry's `buildVcs("ado")`.
+2. Registry calls `resolver.resolve("ado")`.
+3. `resolveAdo` finds no `AZURE_DEVOPS_EXT_PAT`, spawns
+   `az account get-access-token …`, gets an AAD bearer token, returns
+   `{ secret: <token>, scheme: "bearer", detail: "via az CLI" }`.
+4. Registry `ado` factory reads `cred.scheme === "bearer"` and calls
+   `createAdoVcsProvider({ config: { token, authScheme: "bearer" } })`.
+5. `createAdoVcsProvider` → `createAdoHttpClient({ token, authScheme:
+   "bearer", … })` sets `Authorization: Bearer <token>`.
+6. `fetchDiff` runs the five ADR-34 legs with the Bearer header → ADO
+   returns 200, not 401.
+
+PAT path under Chrome (non-AAD org), post-Fix-2:
+
+1. User runs `LGTM_BUZZER_EXTENSION_ID=… AZURE_DEVOPS_EXT_PAT=<pat>
+   node …/install-manifest.js`.
+2. `main` captures `AZURE_DEVOPS_EXT_PAT` into `passThroughEnv`;
+   `renderNodeWrapper` bakes `AZURE_DEVOPS_EXT_PAT='<pat>'; export …` into
+   `host-wrapper.sh`.
+3. Chrome later spawns the wrapper; the host now sees
+   `process.env.AZURE_DEVOPS_EXT_PAT`.
+4. `resolveAdo` env step hits → `{ secret, scheme: "basic", detail }`.
+5. Registry → adapter with `authScheme: "basic"` → Basic header → 200.
+
+#### Error cases
+
+- **No PAT env AND `az` not installed / logged out** → `resolveAdo`
+  returns `Left<ResolverError>` exactly as today (`missing-credential`,
+  hint unchanged). No new error variant.
+- **`az` returns a token but the org rejects it (still 401)** → surfaces
+  as the existing `VCSProviderError` `transport`/`auth` mapping in
+  `errors.ts`; the scheme fix removes the *systematic* 401, not
+  org-policy rejections. No `throw`; expected failure → `Result`/IO error
+  channel.
+- **Malformed `passThroughEnv` name** (e.g. lowercase, injection attempt)
+  → `throw` in `renderNodeWrapper` (invariant: the name list is a
+  hard-coded constant, never user input). This is an assertion, not an
+  expected runtime failure.
+- **PAT value containing a single quote / shell metachar** → handled by
+  the existing `escape` helper (`'` → `'\''`); the canary test asserts no
+  unescaped quote and no duplicated value reaches the wrapper or any log.
+- **PAT env unset at install time** → no wrapper line emitted; not an
+  error, just the pre-Fix-2 behaviour for that var.
+
+#### Security considerations
+
+- **Plaintext PAT in `host-wrapper.sh` (Fix 2 tradeoff — documented and
+  binding).** Baking `AZURE_DEVOPS_EXT_PAT` writes the PAT in plaintext
+  into `host-wrapper.sh`. This is the **same trust surface as the manifest
+  itself**: a per-user file in the user's own dir (`mode 0755`, same as
+  today's wrapper). It is **opt-in**: the line is baked ONLY if the env
+  var is set when the user runs `install-manifest`. The alternative
+  (`az login`, Fix 1) avoids on-disk secret material entirely and is the
+  recommended path for AAD orgs; the README MUST present `az login` first
+  and the baked-PAT path second with this caveat. Re-running the installer
+  with the var unset removes the line (the wrapper is rewritten wholesale
+  each run). This does not regress relative to today — today the only way
+  to use a PAT under Chrome is impossible, so any opt-in mechanism is a
+  strict improvement, and the chosen one matches the existing wrapper's
+  trust model rather than introducing a new secret store.
+- **No-log guarantee preserved.** The PAT/token is never logged in either
+  header path: `buildAuthHeader` only returns the header value, the secret
+  never enters `detail`/`attempted`/`hint` (ADR-29 invariant), and the
+  ADO error payloads already clip+exclude auth (ADR-34). Canary tests on
+  both header paths assert the secret bytes never appear in any thrown or
+  logged string.
+- **Bearer token scope unchanged.** The `az` resource GUID
+  (`499b84ac-…`) is Azure DevOps' well-known scope (ADR-29); we change
+  only how the resulting token is *transmitted* (Bearer vs Basic), not
+  what is requested.
+
+#### Diff-only invariant
+
+Untouched. Neither fix feeds any PR-derived text into the prompt path.
+Credentials were never diff-derived and remain off the prompt path
+(ADR-29). The ADO `fetchDiff` legs (ADR-34) still fetch only
+iterations/changes/blobs — the auth-header change does not alter which
+endpoints are called.
+
+#### Test strategy
+
+Unit / contract (no live ADO instance — consistent with ADR-34):
+
+- **resolver.test.ts** — env source → `scheme: "basic"`; `az` source →
+  `scheme: "bearer"`; github/claude-api → `scheme: "basic"`; CLI-managed
+  no-op → `scheme: "basic"`, `secret: undefined`.
+- **http.test.ts** — `authScheme: "basic"` (and default/absent) →
+  `Authorization: Basic base64(":"+token)`; `authScheme: "bearer"` →
+  `Authorization: Bearer <token>`. PAT-not-in-logs canary extended to
+  cover BOTH header paths.
+- **provider.test.ts** — `createAdoVcsProvider` threads `authScheme` into
+  the constructed client (assert via injected/inspected client or header
+  on a captured request).
+- **registry.test.ts** (if present) — `ado` factory maps
+  `cred.scheme: "bearer"` → adapter config `authScheme: "bearer"`, and
+  `basic` → `basic`.
+- **install-manifest.test.ts** —
+  (a) `passThroughEnv` present → wrapper contains
+  `AZURE_DEVOPS_EXT_PAT='…'` and `export AZURE_DEVOPS_EXT_PAT`;
+  (b) empty/absent → NO `AZURE_DEVOPS_EXT_PAT` line at all (no
+  `export …=''`);
+  (c) value with `'` is single-quote-escaped (`'\''`) and the raw value
+  appears exactly once (no duplication into comments/logs);
+  (d) `main` capture: var set in `process.env` → baked; unset → omitted.
+
+No e2e gap beyond the existing ADR-34 "pending live-instance validation"
+caveat: the Bearer path's real 401→200 flip can only be confirmed against
+a live AAD-backed org, which we still lack. That single manual
+verification is recorded as a follow-up in the adapter README, mirroring
+ADR-34's unverified-assumption convention.
+
+### Consequences
+
+- Unblocks AAD/`az login` ADO orgs (the reporting user) — the primary
+  goal — with a host-internal, wire-invisible change.
+- `ResolvedCredential` is now a 3-field type; the `scheme` default
+  (`"basic"`) keeps every non-ADO resolver and the GitHub adapter
+  byte-identical in behaviour.
+- The pass-through-env mechanism is general (a list), so a future adapter
+  needing an env secret under Chrome adds a name to
+  `PASS_THROUGH_ENV_NAMES` with no signature change — but it inherits the
+  plaintext-on-disk tradeoff and must justify it.
+- Trade-off accepted: Fix 2 writes a secret to disk. Mitigated by opt-in
+  semantics, matching the existing wrapper trust model, and steering AAD
+  users to `az login` (Fix 1) which needs no on-disk secret.
+- Out of scope (unchanged): GitHub / claude-api / CLI adapter auth;
+  extension-side credential storage (ADR-29 removed it; stays host-
+  resolved); ADO Server on-prem auth variants.
+
+---
