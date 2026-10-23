@@ -20,8 +20,8 @@
     "monadyssey": "2.0.1"
   },
   "devDependencies": {
-    "@playwright/test": "^1.60.0",
+    "@playwright/test": "^1.64.1",
     "jsdom": "^26.1.0",
-    "wxt": "^0.20.26"
+    "wxt": "^0.20.27"
   }
 }
