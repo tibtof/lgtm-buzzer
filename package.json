@@ -38,7 +38,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.9.9",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.2",
     "eslint": "^10.13.0",
     "prettier": "^3.9.10",
     "typescript": "^6.0.3",
