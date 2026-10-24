@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Root manifest covers every npm workspace. Lockfiles must stay
+  # npm 10 compatible (CI runs Node 22 + npm 10, see #103); regenerate
+  # with that toolchain before merging a Dependabot PR.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
