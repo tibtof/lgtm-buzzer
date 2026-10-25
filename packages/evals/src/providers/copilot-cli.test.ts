@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { IO } from "monadyssey";
 import type { SpawnError } from "@lgtm-buzzer/adapter-shared";
 
@@ -29,10 +29,6 @@ const VALID_QUIZ_JSON = JSON.stringify({
       explanation: "The route handler responds to POST requests.",
     },
   ],
-});
-
-afterEach(() => {
-  vi.clearAllMocks();
 });
 
 describe("copilot-cli provider — diff-only invariant (LEAK_CANARY)", () => {

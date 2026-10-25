@@ -65,7 +65,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  vi.clearAllMocks();
   delete process.env["ANTHROPIC_API_KEY"];
 });
 
