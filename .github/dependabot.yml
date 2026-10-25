@@ -10,6 +10,16 @@ updates:
     groups:
       npm-minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # TypeScript 7 (native port) ships no stable JS API and
+      # typescript-eslint peers typescript <6.1.0. Drop once
+      # typescript-eslint supports 7.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      # promptfoo 0.x minors can change the custom-provider contract
+      # (ADR-26). Bump by hand after an evals run with a judge.
+      - dependency-name: promptfoo
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
