@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { IO } from "monadyssey";
 import type { SpawnError } from "@lgtm-buzzer/adapter-shared";
 
@@ -41,10 +41,6 @@ const VALID_QUIZ_JSON = JSON.stringify({
       },
     ],
   }),
-});
-
-afterEach(() => {
-  vi.clearAllMocks();
 });
 
 describe("claude-cli provider — diff-only invariant (LEAK_CANARY)", () => {
