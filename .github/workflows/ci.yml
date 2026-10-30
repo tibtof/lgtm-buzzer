@@ -18,7 +18,10 @@ permissions:
 jobs:
   unit-and-build:
     name: unit + build + lint + typecheck:tests
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-latest (26.04) `npm ci` fails in the postinstall of
+    # @playwright/browser-chromium 1.60 (via promptfoo 0.103, held by
+    # ADR-26), which rejects ubuntu26.04. Unpin after the promptfoo bump.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -48,7 +51,8 @@ jobs:
 
   e2e:
     name: extension e2e (xvfb + chromium)
-    runs-on: ubuntu-latest
+    # Pinned to 24.04, see unit-and-build.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
