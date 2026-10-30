@@ -38,7 +38,9 @@ jobs:
       github.event_name == 'schedule' ||
       (github.event_name == 'pull_request' &&
        contains(github.event.pull_request.labels.*.name, 'run-evals'))
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: promptfoo 0.103's @playwright/browser-chromium 1.60
+    # postinstall rejects ubuntu26.04 (see ci.yml). Unpin with the bump.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
