@@ -24,6 +24,6 @@
   },
   "devDependencies": {
     "promptfoo": "^0.103.6",
-    "vitest": "^5.0.5"
+    "vitest": "^5.1.0"
   }
 }
